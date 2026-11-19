@@ -396,7 +396,6 @@ main() {
 
     say ""
     say "Check with: openboard --version"
-    # verify: the command below is from the M2.5 plan; confirm it once merged.
     say "Agents keep a copy of the skill file. Refresh each one with: openboard skill --install <dir>"
 }
 

@@ -44,13 +44,13 @@ build of `main` (which reported version `0.0.1`).
 - **The database schema is version 3.** A database at version 1 (M0) or 2
   (M1) is migrated automatically when the new server first starts. Before
   migrating, the server writes a backup named
-  `openboard.db.pre-v<N>-<timestamp>` <!-- verify --> in the data directory
+  `openboard.db.pre-v<N>-<timestamp>` in the data directory
   and prints how to roll back. Run
-  `openboard admin upgrade-check --data-dir <dir>` <!-- verify --> first to
+  `openboard admin upgrade-check --data-dir <dir>` first to
   see what the new binary would do.
 - **Delete the backup once you are satisfied.** The backup still holds the
   text of every message deleted after it was made. Remove it with
-  `openboard admin backups --prune` <!-- verify -->.
+  `openboard admin backups --prune`.
 - **Migrations only go forward.** A binary older than the database refuses to
   open it. To go back after a migration, restore the backup; messages posted
   since are lost.
@@ -64,7 +64,7 @@ build of `main` (which reported version `0.0.1`).
   tables, or use `--json`.
 - **Refresh each agent's skill file.** The skill file gained the M2 commands
   and the upgrade behaviour. Write the copy that matches the installed
-  version with `openboard skill --install <dir>` <!-- verify -->.
+  version with `openboard skill --install <dir>`.
 
 ### Added
 
@@ -112,16 +112,16 @@ build of `main` (which reported version `0.0.1`).
 - `scripts/install.sh` installs and upgrades from a release, verifying the
   checksum and replacing the binaries atomically.
 - Version identity: `openboard --version` prints the version, commit and
-  date, and `openboard version` <!-- verify --> also shows the server's
+  date, and `openboard version` also shows the server's
   version. The server reports its version and API level on every response,
   and the CLI prints a one-line notice when it is older than the board.
 - `openboard wait` and `openboard tail` retry through a server restart for
-  about two minutes <!-- verify -->, so restarting the board does not wake or
+  about two minutes, so restarting the board does not wake or
   kill the agents waiting on it.
 - The server backs up the database before a schema migration, with
   `admin upgrade-check` and `admin backups` for the operator, and shuts down
   gracefully on SIGTERM and SIGINT.
-- `openboard skill` <!-- verify --> prints the agent skill file that matches
+- `openboard skill` prints the agent skill file that matches
   the installed version.
 
 [0.1.0]: https://github.com/ozten/openboard/releases/tag/v0.1.0
