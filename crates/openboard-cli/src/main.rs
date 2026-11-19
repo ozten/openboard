@@ -18,11 +18,14 @@ use openboard_server::ServeError;
 use serde::Serialize;
 use tokio::sync::watch;
 
+mod about;
 mod admin;
 mod cli;
 mod client;
+mod compat;
 mod error;
 mod logins;
+mod reconnect;
 mod render;
 mod session;
 mod sse;
@@ -33,18 +36,41 @@ use cli::{AdminCommand, Cli, Command, Global, ReadArgs, ServeArgs, TailArgs, Wai
 use client::Client;
 use error::{codes, Failure, Resume, EXIT_FAILURE, EXIT_USAGE};
 use logins::{Secret, Store};
+use reconnect::Outage;
 use target::{Origin, Target, Wanted};
 
 /// The event stream sends a keep-alive every 15 seconds. This much silence
 /// means the connection is dead.
 const STREAM_SILENCE: Duration = Duration::from_secs(45);
-/// Failed reconnects in a row before `tail` gives up (about a minute).
-const MAX_RECONNECTS: u32 = 8;
+/// How long `post` and `reply` with `--key` keep retrying a board that
+/// cannot be reached. Short: someone is usually waiting on the answer.
+const KEYED_POST_RECONNECT: Duration = Duration::from_secs(30);
+
+/// `openboard --version --json` is `openboard --json version`: the same
+/// document, with the board's version when it can be reached. Plain
+/// `--version` stays clap's, one line that asks nothing of the board.
+fn version_as_command(args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    let options: Vec<&std::ffi::OsString> =
+        args.iter().skip(1).take_while(|arg| *arg != "--").collect();
+    let asks_version = options
+        .iter()
+        .any(|arg| *arg == "--version" || *arg == "-V");
+    let wants_json = options.iter().any(|arg| *arg == "--json");
+    if !(asks_version && wants_json) {
+        return args;
+    }
+    let mut rewritten: Vec<std::ffi::OsString> = args
+        .into_iter()
+        .filter(|arg| arg != "--version" && arg != "-V")
+        .collect();
+    rewritten.push("version".into());
+    rewritten
+}
 
 fn main() {
     // Before anything builds an HTTP client or a TLS configuration.
     tls::install_provider();
-    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let args = version_as_command(std::env::args_os().collect());
     let cli = match Cli::try_parse_from(&args) {
         Ok(cli) => cli,
         Err(error) => {
@@ -406,6 +432,8 @@ async fn dispatch(cli: Cli, text: Option<String>) -> Result<(), Failure> {
         | Command::Admin(_)
         | Command::Join(_)
         | Command::Logins
+        | Command::Version
+        | Command::Skill(_)
         | Command::Logout(cli::LogoutArgs { local_only: true }) => {
             let command = async {
                 match &cli.command {
@@ -413,6 +441,8 @@ async fn dispatch(cli: Cli, text: Option<String>) -> Result<(), Failure> {
                     Command::Admin(command) => admin::run(global.json, command).await,
                     Command::Join(_) => session::join(global, &text.unwrap_or_default()).await,
                     Command::Logins => session::logins(global.json),
+                    Command::Version => about::version(global).await,
+                    Command::Skill(args) => about::skill(global.json, args),
                     _ => session::forget(global),
                 }
             };
@@ -490,6 +520,8 @@ async fn dispatch(cli: Cli, text: Option<String>) -> Result<(), Failure> {
             | Command::Admin(_)
             | Command::Invite(_)
             | Command::Join(_)
+            | Command::Version
+            | Command::Skill(_)
             | Command::Logins => Ok(()),
         }
     };
@@ -588,12 +620,16 @@ async fn serve(
             fingerprint: server.fingerprint(),
         })?)?;
     } else if let Some(fingerprint) = server.fingerprint() {
+        let dir = shell_quote(&data_dir);
         write_stdout(&format!(
             "network board listening on {url} (data in {data_dir})\n\
              mode: network (TLS 1.3, a token on every request)\n\
              certificate fingerprint: {fingerprint}\n\
-             invite an agent from this host with: openboard invite <name> --data-dir {}",
-            shell_quote(&data_dir)
+             invite an agent from this host with: openboard invite <name> --data-dir {dir}\n\
+             people use the web page at {url}/ ; sign a person in with: openboard invite \
+             <email> --data-dir {dir}\n\
+             version: openboard {}",
+            openboard_api::build::DESCRIBE,
         ))?;
     } else {
         write_stdout(&format!("listening on {url} (data in {data_dir})"))?;
@@ -719,23 +755,119 @@ async fn verify_log(json: bool, data_dir: std::path::PathBuf) -> Result<(), Fail
     }
 }
 
+/// `post` and `reply`.
+///
+/// Without an idempotency key nothing is retried: when the answer is lost,
+/// the post may have landed, and only the caller can decide whether to send
+/// it again. With one, a repeat is stored once, so a board that cannot be
+/// reached or fails is retried for [`KEYED_POST_RECONNECT`], which rides out
+/// a restart.
 async fn post(ctx: &Ctx<'_>, request: &PostMessageRequest) -> Result<(), Failure> {
-    let response = ctx.client.post_message(request).await.map_err(|failure| {
-        // A lost answer leaves the caller unsure whether the post landed.
-        let transport = [
-            codes::CONNECTION_FAILED,
-            codes::REQUEST_TIMEOUT,
-            codes::REQUEST_FAILED,
-        ]
-        .contains(&failure.code.as_str());
-        match (&request.idempotency_key, transport, failure.next.clone()) {
-            (Some(_), true, Some(next)) => {
-                failure.next(format!("{next}; retrying with the same --key is safe"))
+    let keyed = request.idempotency_key.is_some();
+    let mut outage = Outage::new(KEYED_POST_RECONNECT).arm(keyed);
+    let response = loop {
+        match ctx.client.post_message(request).await {
+            Ok(response) => {
+                outage.recovered();
+                break response;
             }
-            _ => failure,
+            Err(failure) => {
+                if let Err(failure) = retry(&mut outage, failure, None).await {
+                    // A lost answer leaves the caller unsure whether the
+                    // post landed.
+                    return Err(
+                        match (keyed, reconnect::transient(&failure), &failure.next) {
+                            (true, true, Some(next)) => {
+                                let next = format!("{next}; retrying with the same --key is safe");
+                                failure.next(next)
+                            }
+                            _ => failure,
+                        },
+                    );
+                }
+            }
         }
-    })?;
+    };
     ctx.print(&response, || render::posted(&response))
+}
+
+/// What to do after a failed request in a command that may continue:
+/// wait as long as a `rate_limited` answer asks, or ride out an outage.
+/// Hands the failure back when neither applies.
+async fn retry(
+    outage: &mut Outage,
+    failure: Failure,
+    deadline: Option<Instant>,
+) -> Result<(), Failure> {
+    match slow_down(failure, deadline).await {
+        Ok(()) => Ok(()),
+        Err(failure) => outage.ride(failure, deadline).await,
+    }
+}
+
+/// `--type` names this CLI does not know, which only the board can judge.
+///
+/// They are sent as they are. When the board accepts them, it is a newer
+/// board that knows them, and the CLI says on stderr that it passed them
+/// on. When it refuses them, they were most likely a typo, and the failure
+/// becomes a usage error that lists the names this CLI knows.
+struct TypeCheck {
+    unknown: Vec<String>,
+    settled: bool,
+}
+
+impl TypeCheck {
+    fn new(names: &[String]) -> Self {
+        let unknown = cli::unknown_types(names);
+        Self {
+            settled: unknown.is_empty(),
+            unknown,
+        }
+    }
+
+    /// The board answered a request with the filter.
+    fn accepted(&mut self, client: &Client) {
+        if self.settled {
+            return;
+        }
+        self.settled = true;
+        let board = client
+            .server()
+            .map_or_else(|| "the board".to_owned(), |info| info.describe());
+        eprintln!(
+            "openboard: warning: event type {} is not one this openboard ({}, API level {}) \
+             knows; {board} accepted it, so it is passed on",
+            self.names(),
+            openboard_api::build::VERSION,
+            openboard_api::API_LEVEL,
+        );
+    }
+
+    /// The board refused a request with the filter.
+    fn refused(&self, failure: Failure) -> Failure {
+        if self.settled || failure.code != openboard_api::codes::INVALID_REQUEST {
+            return failure;
+        }
+        let mut usage = Failure::usage(format!(
+            "unknown event type {}: the board does not know it either ({})",
+            self.names(),
+            failure.message
+        ))
+        .next(format!(
+            "check the spelling: {}; `openboard version` shows the board's API level",
+            cli::type_names_help()
+        ));
+        usage.status = failure.status;
+        usage
+    }
+
+    fn names(&self) -> String {
+        self.unknown
+            .iter()
+            .map(|name| format!("`{}`", render::safe(name)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 /// A message ID from the command line. An empty one would address another
@@ -818,25 +950,40 @@ async fn react(ctx: &Ctx<'_>, args: &cli::ReactArgs, add: bool) -> Result<(), Fa
     ctx.print(&message, || render::reacted(&message, name, add))
 }
 
+/// Who the caller is on the board, so that `read` can tell the caller's own
+/// messages from everyone else's: one request per command, beside the
+/// read itself, and only for human output.
+///
+/// On a local board without a profile everyone is the same actor, so no
+/// message is the caller's own in a sense worth saying. A failure only
+/// means every message gets the usual label.
+async fn reader_actor(ctx: &Ctx<'_>) -> Option<String> {
+    let distinct = ctx.target.is_network() || ctx.global.profile().is_some();
+    if ctx.json() || !distinct {
+        return None;
+    }
+    ctx.client.whoami().await.ok().map(|me| me.actor.id)
+}
+
 async fn read(ctx: &Ctx<'_>, args: &ReadArgs) -> Result<(), Failure> {
     if let Some(id) = &args.thread {
-        let thread = ctx.client.thread(id).await?;
-        return ctx.print(&thread, || render::thread(&thread));
+        let (thread, me) = tokio::join!(ctx.client.thread(id), reader_actor(ctx));
+        let thread = thread?;
+        return ctx.print(&thread, || render::thread(&thread, me.as_deref()));
     }
     let channel = args.channel.clone().unwrap_or_default();
-    let list = ctx
-        .client
-        .threads(&ThreadsQuery {
-            channel: channel.clone(),
-            limit: args.limit,
-            cursor: args.cursor.clone(),
-            label: args.label.clone(),
-            ..ThreadsQuery::default()
-        })
-        .await?;
+    let query = ThreadsQuery {
+        channel: channel.clone(),
+        limit: args.limit,
+        cursor: args.cursor.clone(),
+        label: args.label.clone(),
+        ..ThreadsQuery::default()
+    };
+    let (list, me) = tokio::join!(ctx.client.threads(&query), reader_actor(ctx));
+    let list = list?;
     let label = args.label.as_deref().map(shell_quote);
     ctx.print(&list, || {
-        render::thread_list(&list, &channel, label.as_deref())
+        render::thread_list(&list, &channel, label.as_deref(), me.as_deref())
     })
 }
 
@@ -869,6 +1016,8 @@ async fn wait(ctx: &Ctx<'_>, args: &WaitArgs) -> Result<(), Failure> {
     let deadline = Instant::now() + args.timeout;
     let timeout_flag =
         (args.timeout != Duration::from_secs(30 * 60)).then(|| cli::format_duration(args.timeout));
+    let reconnect_flag =
+        (args.reconnect != default_reconnect()).then(|| cli::format_duration(args.reconnect));
     let types = args.types_filter();
     let mentions_self = args.mentions_me.then_some(true);
     // A resume command repeats --type only when one was given: the default
@@ -880,8 +1029,13 @@ async fn wait(ctx: &Ctx<'_>, args: &WaitArgs) -> Result<(), Failure> {
         ("--type", type_flag),
         ("--mentions-me", args.mentions_me.then_some("")),
         ("--timeout", timeout_flag.as_deref()),
+        ("--reconnect", reconnect_flag.as_deref()),
         ("--include-self", args.include_self.then_some("")),
     ];
+    let mut types_check = TypeCheck::new(&args.types);
+    // A wait that continues from a cursor rides out an outage from the
+    // start; one from now first needs the board to answer once.
+    let mut outage = Outage::new(args.reconnect).arm(args.after.is_some());
 
     let mut after = args.after.clone();
     if after.is_none() {
@@ -900,10 +1054,16 @@ async fn wait(ctx: &Ctx<'_>, args: &WaitArgs) -> Result<(), Failure> {
         };
         let now = loop {
             match ctx.client.events(&query).await {
-                Err(failure) => slow_down(failure, Some(deadline)).await?,
-                Ok(now) => break now,
+                Ok(now) => {
+                    outage.recovered();
+                    break now;
+                }
+                Err(failure) => {
+                    retry(&mut outage, types_check.refused(failure), Some(deadline)).await?;
+                }
             }
         };
+        types_check.accepted(&ctx.client);
         ctx.set_resume("wait", &now.cursor, &flags);
         after = Some(now.cursor);
     }
@@ -912,10 +1072,16 @@ async fn wait(ctx: &Ctx<'_>, args: &WaitArgs) -> Result<(), Failure> {
         // longer wait is a chain of requests, each passing the cursor the
         // one before returned. Nothing posted between requests is missed.
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let hold = remaining
-            .as_secs()
-            .saturating_add(u64::from(remaining.subsec_nanos() > 0))
-            .min(MAX_WAIT_SECS);
+        // Right after an outage, ask without holding: the answer says at
+        // once that the board is back, and what it holds after the cursor.
+        let hold = if outage.failing() {
+            0
+        } else {
+            remaining
+                .as_secs()
+                .saturating_add(u64::from(remaining.subsec_nanos() > 0))
+                .min(MAX_WAIT_SECS)
+        };
         let asked = Instant::now();
         let response = ctx
             .client
@@ -932,11 +1098,17 @@ async fn wait(ctx: &Ctx<'_>, args: &WaitArgs) -> Result<(), Failure> {
             })
             .await;
         let response = match response {
-            Ok(response) => response,
-            // Any other failure ends the wait. In particular a login the
-            // board stopped accepting (`unauthenticated`) is never retried.
+            Ok(response) => {
+                outage.recovered();
+                types_check.accepted(&ctx.client);
+                response
+            }
+            // A board that went away, or that asked to slow down, is tried
+            // again from the same cursor. Any other failure ends the wait;
+            // in particular a login the board stopped accepting
+            // (`unauthenticated`) is never retried.
             Err(failure) => {
-                slow_down(failure, Some(deadline))
+                retry(&mut outage, types_check.refused(failure), Some(deadline))
                     .await
                     .map_err(|failure| failure.resume(ctx.resume().as_ref()))?;
                 continue;
@@ -946,11 +1118,17 @@ async fn wait(ctx: &Ctx<'_>, args: &WaitArgs) -> Result<(), Failure> {
         if let Some(event) = response.events.first() {
             // Resume just past this event, not past everything scanned.
             let resume = ctx.set_resume("wait", &event.cursor, &flags);
-            let found = ctx
-                .client
-                .thread(&event.thread_id)
-                .await
-                .map_err(|failure| failure.resume(Some(&resume)))?;
+            let found = loop {
+                match ctx.client.thread(&event.thread_id).await {
+                    Ok(found) => {
+                        outage.recovered();
+                        break found;
+                    }
+                    Err(failure) => retry(&mut outage, failure, Some(deadline))
+                        .await
+                        .map_err(|failure| failure.resume(Some(&resume)))?,
+                }
+            };
             let message = std::iter::once(&found.root)
                 .chain(&found.replies)
                 .find(|message| message.id == event.message_id)
@@ -990,6 +1168,11 @@ async fn wait(ctx: &Ctx<'_>, args: &WaitArgs) -> Result<(), Failure> {
     }
 }
 
+/// `--reconnect`'s default, as a duration.
+fn default_reconnect() -> Duration {
+    cli::parse_duration(reconnect::DEFAULT_RECONNECT).unwrap_or(Duration::from_secs(120))
+}
+
 /// Waits out a `rate_limited` answer for as long as the board asked, so the
 /// caller can try again. Every other failure is handed back, and so is a
 /// pause that would run past `deadline`.
@@ -1019,12 +1202,19 @@ async fn tail(ctx: &Ctx<'_>, args: &TailArgs) -> Result<(), Failure> {
         mentions_self: args.mentions_me.then_some(true),
         ..EventsQuery::default()
     };
+    let reconnect_flag =
+        (args.reconnect != default_reconnect()).then(|| cli::format_duration(args.reconnect));
     let flags = [
         ("--channel", args.channel.as_deref()),
         ("--thread", thread.as_deref()),
         ("--type", types.as_deref()),
         ("--mentions-me", args.mentions_me.then_some("")),
+        ("--reconnect", reconnect_flag.as_deref()),
     ];
+    let mut types_check = TypeCheck::new(&args.types);
+    // As for `wait`: retrying starts once the board has answered, or at
+    // once when continuing from a cursor.
+    let mut outage = Outage::new(args.reconnect).arm(args.after.is_some());
 
     // Fix the starting cursor before streaming, so a reconnect always has a
     // cursor to continue from, even if no event has arrived yet.
@@ -1036,16 +1226,21 @@ async fn tail(ctx: &Ctx<'_>, args: &TailArgs) -> Result<(), Failure> {
                 limit: Some(1),
                 ..filter.clone()
             };
-            loop {
+            let now = loop {
                 match ctx.client.events(&query).await {
-                    Err(failure) => slow_down(failure, None).await?,
-                    Ok(now) => break now.cursor,
+                    Ok(now) => {
+                        outage.recovered();
+                        break now.cursor;
+                    }
+                    Err(failure) => {
+                        retry(&mut outage, types_check.refused(failure), None).await?;
+                    }
                 }
-            }
+            };
+            types_check.accepted(&ctx.client);
+            now
         }
     };
-    let mut connected = false;
-    let mut failures = 0u32;
     loop {
         let query = EventsQuery {
             after: Some(cursor.clone()),
@@ -1055,8 +1250,8 @@ async fn tail(ctx: &Ctx<'_>, args: &TailArgs) -> Result<(), Failure> {
             Ok(mut response) => {
                 // The board accepted the cursor, so it is safe to resume from.
                 ctx.set_resume("tail", &cursor, &flags);
-                connected = true;
-                failures = 0;
+                outage.recovered();
+                types_check.accepted(&ctx.client);
                 let mut parser = sse::SseParser::default();
                 loop {
                     let chunk = match tokio::time::timeout(STREAM_SILENCE, response.chunk()).await {
@@ -1082,28 +1277,18 @@ async fn tail(ctx: &Ctx<'_>, args: &TailArgs) -> Result<(), Failure> {
                     }
                 }
                 eprintln!("openboard: the event stream ended; reconnecting after {cursor}");
+                // A board that ends streams as soon as they open is not
+                // reconnected to in a tight loop.
+                tokio::time::sleep(Duration::from_millis(250)).await;
             }
-            Err(failure) => {
-                // Told to slow down: wait as long as asked, then go on.
-                let failure = match slow_down(failure, None).await {
-                    Ok(()) => continue,
-                    Err(failure) => failure,
-                };
-                // A login the board stopped accepting is not transient: the
-                // tail ends here with `unauthenticated`.
-                let transient = [
-                    codes::CONNECTION_FAILED,
-                    codes::REQUEST_TIMEOUT,
-                    codes::REQUEST_FAILED,
-                ]
-                .contains(&failure.code.as_str());
-                failures += 1;
-                if !connected || !transient || failures > MAX_RECONNECTS {
-                    return Err(failure.resume(ctx.resume().as_ref()));
-                }
-            }
+            // A board that went away is tried again from the cursor, for as
+            // long as --reconnect allows. A login the board stopped
+            // accepting is not transient: the tail ends with
+            // `unauthenticated`.
+            Err(failure) => retry(&mut outage, types_check.refused(failure), None)
+                .await
+                .map_err(|failure| failure.resume(ctx.resume().as_ref()))?,
         }
-        tokio::time::sleep(Duration::from_secs(1 << failures.min(3))).await;
     }
 }
 

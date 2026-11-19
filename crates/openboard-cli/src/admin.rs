@@ -10,7 +10,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use openboard_api::auth::{CredentialInfo, DEFAULT_TOKEN_TTL_SECS};
 use openboard_api::ActorKind;
 use openboard_server::operator::{
-    self, InviteOptions, Invited, OperatorError, PersonInvite, PrincipalInfo,
+    self, Backup, InviteOptions, Invited, OperatorError, PersonInvite, PrincipalInfo,
+    UpgradeAction, UpgradeCheck,
 };
 use openboard_server::Mode;
 use serde::Serialize;
@@ -296,14 +297,245 @@ fn status_of(credential: &CredentialInfo, now: &str) -> &'static str {
 fn data_dir_of(command: &AdminCommand) -> PathBuf {
     match command {
         AdminCommand::Info(args)
+        | AdminCommand::UpgradeCheck(args)
         | AdminCommand::Agents(args)
         | AdminCommand::People(args)
         | AdminCommand::Credentials(args)
         | AdminCommand::Invites(args) => args.data_dir.clone(),
         AdminCommand::Revoke(args) => args.data.data_dir.clone(),
         AdminCommand::SecurityLog(args) => args.data.data_dir.clone(),
+        AdminCommand::Backups(args) => args.data.data_dir.clone(),
         AdminCommand::VerifyLog(args) => args.data_dir.clone(),
     }
+}
+
+/// A byte count for people: `512 B`, `3.4 MiB`.
+fn bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = n as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{n} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// An age for people: `45s`, `3h`, `12d`.
+fn age(secs: u64) -> String {
+    match secs {
+        s if s < 120 => format!("{s}s"),
+        s if s < 2 * 3600 => format!("{}m", s / 60),
+        s if s < 2 * 86_400 => format!("{}h", s / 3600),
+        s => format!("{}d", s / 86_400),
+    }
+}
+
+/// Who last started a server on the directory, for people.
+fn started_by(check: &UpgradeCheck) -> String {
+    match &check.last_started_by {
+        Some(by) => {
+            let mut text = format!("Openboard {}", render::safe(&by.version));
+            if let Some(commit) = &by.commit {
+                text.push_str(&format!(" ({})", render::safe(commit)));
+            }
+            if let Some(at) = &by.at {
+                text.push_str(&format!(" at {}", render::safe(at)));
+            }
+            text
+        }
+        None => "not recorded (a version older than 0.1.0, or never started)".to_owned(),
+    }
+}
+
+/// What the next start does, for people.
+fn next_start(check: &UpgradeCheck) -> String {
+    match check.action {
+        UpgradeAction::None => "nothing to migrate: the schema is this version's".to_owned(),
+        UpgradeAction::Migrate { from, to } => format!(
+            "migrate the database from schema version {from} to {to}, after writing a backup"
+        ),
+        UpgradeAction::Refuse => format!(
+            "refuse to start: the database is newer than this openboard ({}) supports",
+            openboard_api::build::DESCRIBE
+        ),
+    }
+}
+
+fn last_started_json(check: &UpgradeCheck) -> serde_json::Value {
+    match &check.last_started_by {
+        Some(by) => json!({ "version": by.version, "commit": by.commit, "at": by.at }),
+        None => serde_json::Value::Null,
+    }
+}
+
+/// `admin upgrade-check`. Read-only.
+async fn upgrade_check(json_output: bool, dir: &Path) -> Result<(), Failure> {
+    let check = operate(dir, operator::upgrade_check).await?;
+    let backup = check
+        .backup_name
+        .as_ref()
+        .map(|name| check.backup_dir.join(name).display().to_string());
+    let (migrates, to) = match check.action {
+        UpgradeAction::Migrate { to, .. } => (true, Some(to)),
+        _ => (false, None),
+    };
+    let failure = match check.action {
+        UpgradeAction::Refuse => Some(
+            Failure::new(
+                codes::SCHEMA_TOO_NEW,
+                format!(
+                    "the database has schema version {}, newer than this openboard supports ({})",
+                    check.schema_version, check.supported_schema_version
+                ),
+            )
+            .next(
+                "install the version of Openboard that last started this board, or a newer one \
+                 (`last started by` above), or restore a backup taken before the upgrade",
+            ),
+        ),
+        UpgradeAction::Migrate { .. } if check.room_for_backup == Some(false) => Some(
+            Failure::new(
+                codes::NO_ROOM_FOR_BACKUP,
+                format!(
+                    "a migration is due, but the file system holding {} has {} free and the \
+                     backup needs about {}",
+                    dir.display(),
+                    bytes(check.free_bytes.unwrap_or(0)),
+                    bytes(check.database_bytes)
+                ),
+            )
+            .next(
+                "free some space in the data directory's file system: the server refuses to \
+                 migrate without its backup",
+            ),
+        ),
+        _ => None,
+    };
+    if json_output {
+        let mut document = json!({
+            "data_dir": dir.display().to_string(),
+            "schema_version": check.schema_version,
+            "supported_schema_version": check.supported_schema_version,
+            "openboard": {
+                "version": openboard_api::build::VERSION,
+                "commit": openboard_api::build::commit(),
+            },
+            "last_started_by": last_started_json(&check),
+            "action": match check.action {
+                UpgradeAction::None => "none",
+                UpgradeAction::Migrate { .. } => "migrate",
+                UpgradeAction::Refuse => "refuse",
+            },
+            "would_migrate": migrates,
+            "migrate_to": to,
+            "backup_path": backup,
+            "database_bytes": check.database_bytes,
+            "free_bytes": check.free_bytes,
+            "room_for_backup": check.room_for_backup,
+        });
+        if let Some(failure) = &failure {
+            let error: serde_json::Value =
+                serde_json::from_str(&failure.to_json()).unwrap_or_default();
+            document["error"] = error["error"].clone();
+        }
+        write_stdout(&document.to_string())?;
+    } else {
+        let mut human = format!(
+            "data directory: {}\n\
+             database schema version: {}\n\
+             this openboard: {}, schema version {}\n\
+             last started by: {}\n\
+             on next start: {}",
+            dir.display(),
+            check.schema_version,
+            openboard_api::build::DESCRIBE,
+            check.supported_schema_version,
+            started_by(&check),
+            next_start(&check),
+        );
+        if let Some(backup) = &backup {
+            let room = match check.room_for_backup {
+                Some(true) => "yes",
+                Some(false) => "NO",
+                None => "unknown",
+            };
+            human.push_str(&format!(
+                "\nbackup: {backup}\ndatabase size: {}; free space: {}; room for the backup: \
+                 {room}",
+                bytes(check.database_bytes),
+                check.free_bytes.map_or_else(|| "unknown".to_owned(), bytes),
+            ));
+        }
+        write_stdout(&human)?;
+    }
+    match failure {
+        Some(mut failure) => {
+            failure.no_stdout = true;
+            Err(failure)
+        }
+        None => Ok(()),
+    }
+}
+
+/// `admin backups [--prune]`.
+async fn backups(json_output: bool, dir: &Path, prune: bool) -> Result<(), Failure> {
+    let found: Vec<Backup> = if prune {
+        operate(dir, operator::prune_backups).await?
+    } else {
+        operate(dir, operator::list_backups).await?
+    };
+    if json_output {
+        let rows: Vec<serde_json::Value> = found
+            .iter()
+            .map(|backup| {
+                json!({
+                    "path": backup.path.display().to_string(),
+                    "file_name": backup.file_name,
+                    "size_bytes": backup.size_bytes,
+                    "modified_at": backup.modified_at,
+                    "age_secs": backup.age_secs,
+                    "migrated_to_schema_version": backup.before_schema_version,
+                })
+            })
+            .collect();
+        return write_stdout(&json!({ "backups": rows, "pruned": prune }).to_string());
+    }
+    let dir_flag = shell_quote(&dir.display().to_string());
+    if found.is_empty() {
+        return write_stdout(&format!("no backups in {}", dir.display()));
+    }
+    if prune {
+        let names: Vec<String> = found.iter().map(|b| render::safe(&b.file_name)).collect();
+        return write_stdout(&format!(
+            "deleted {} backup(s) from {}: {}",
+            found.len(),
+            dir.display(),
+            names.join(", ")
+        ));
+    }
+    let rows: Vec<Vec<String>> = found
+        .iter()
+        .map(|backup| {
+            vec![
+                backup.file_name.clone(),
+                bytes(backup.size_bytes),
+                backup.age_secs.map_or_else(|| "-".to_owned(), age),
+                or_dash(&backup.modified_at),
+            ]
+        })
+        .collect();
+    write_stdout(&format!(
+        "{}\n\
+         each backup keeps the text of messages deleted or edited since it was taken; once the \
+         upgrade is confirmed, delete them with: openboard admin backups --prune --data-dir \
+         {dir_flag}",
+        render::table(&["FILE", "SIZE", "AGE", "WRITTEN"], &rows)
+    ))
 }
 
 /// What an empty listing means on this data directory.
@@ -327,10 +559,18 @@ pub async fn run(json_output: bool, command: &AdminCommand) -> Result<(), Failur
             human
         })
     };
+    // These read a database of any version, a newer one included.
+    match command {
+        AdminCommand::UpgradeCheck(_) => return upgrade_check(json_output, &dir).await,
+        AdminCommand::Backups(args) => return backups(json_output, &dir, args.prune).await,
+        _ => {}
+    }
     // Also the check that the directory holds a board at all.
     let info = operate(&dir, operator::board_info).await?;
     match command {
+        AdminCommand::UpgradeCheck(_) | AdminCommand::Backups(_) => Ok(()),
         AdminCommand::Info(_) => {
+            let check = operate(&dir, operator::upgrade_check).await?;
             let mut human = format!("mode: {}", info.mode);
             match info.mode {
                 Mode::Network => {
@@ -345,13 +585,25 @@ pub async fn run(json_output: bool, command: &AdminCommand) -> Result<(), Failur
                      fingerprint: none (plain HTTP on loopback, no authentication)",
                 ),
             }
-            human.push_str(&format!("\ndata directory: {}", dir.display()));
+            human.push_str(&format!(
+                "\ndata directory: {}\nschema version: {} (this openboard: {})\non next start: \
+                 {}\nlast started by: {}",
+                dir.display(),
+                check.schema_version,
+                check.supported_schema_version,
+                next_start(&check),
+                started_by(&check),
+            ));
             print(
                 json!({
                     "mode": info.mode.as_str(),
                     "url": info.url,
                     "fingerprint": info.fingerprint,
                     "data_dir": dir.display().to_string(),
+                    "schema_version": check.schema_version,
+                    "supported_schema_version": check.supported_schema_version,
+                    "would_migrate": matches!(check.action, UpgradeAction::Migrate { .. }),
+                    "last_started_by": last_started_json(&check),
                 }),
                 human,
             )

@@ -192,6 +192,8 @@ pub async fn join(global: &Global, text: &str) -> Result<(), Failure> {
 
 pub async fn whoami(ctx: &Ctx<'_>) -> Result<(), Failure> {
     let me = ctx.client.whoami().await?;
+    // From the headers of that answer: nothing more is asked.
+    let server = ctx.client.server().unwrap_or_default();
     let login = match &ctx.target.origin {
         Origin::Local => "none",
         Origin::Env => "env",
@@ -204,12 +206,19 @@ pub async fn whoami(ctx: &Ctx<'_>) -> Result<(), Failure> {
         url: &'a str,
         /// Where the token came from: `stored`, `env` or `none`.
         login: &'a str,
+        /// The board's version, from its answer. `None` from a board older
+        /// than 0.1.0.
+        server_version: Option<&'a str>,
+        /// The board's API level. `None` from a board older than level 1.
+        server_api_level: Option<u32>,
     }
     ctx.print(
         &Me {
             whoami: &me,
             url: &ctx.target.url,
             login,
+            server_version: server.version.as_deref(),
+            server_api_level: server.api_level,
         },
         || {
             let kind = serde_json::to_value(me.actor.kind)
@@ -237,6 +246,7 @@ pub async fn whoami(ctx: &Ctx<'_>) -> Result<(), Failure> {
                     out.push_str(&format!("\nlogin: stored in {}", path.display()));
                 }
             }
+            out.push_str(&format!("\nboard runs: {}", server.describe()));
             out
         },
     )

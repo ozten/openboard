@@ -53,8 +53,39 @@
 //!   who can post, until grants arrive.
 //! - Every change to a message appends one [`Event`]. Events never carry
 //!   text, label values or reaction names.
+//!
+//! # Versions and compatibility
+//!
+//! A server and its clients are upgraded at different times, so each side
+//! tells the other what it is and neither assumes they match.
+//!
+//! - The server sends [`VERSION_HEADER`] and [`API_LEVEL_HEADER`] on every
+//!   response: successes, errors, the refusal of an unauthenticated request,
+//!   and the web UI's pages and assets. The values are the same on every
+//!   response of one server, so they say nothing about the request.
+//!   [`Health`] carries the same, and the commit the server was built from.
+//! - A client sends [`CLIENT_API_LEVEL_HEADER`] on every request, and its
+//!   version in `User-Agent` as `openboard/<version>`.
+//! - [`API_LEVEL`] is the compatibility number. It goes up by one with every
+//!   release that adds or changes a route, a field or a behaviour that a
+//!   client can observe. A server that sends no [`API_LEVEL_HEADER`] is
+//!   older than the header: it has the routes of level 1 without the
+//!   reporting.
+//!
+//! The policy within the 0.x series:
+//!
+//! - A server accepts clients of any API level. It never refuses a request
+//!   because the client is older or newer than it; it only reports.
+//! - Clients must ignore fields they do not know in every response, and
+//!   event types they do not know in [`Event::kind`]. New fields and new
+//!   event types are therefore not breaking changes.
+//! - A client that uses a route or a parameter newer than the server gets
+//!   [`codes::NOT_FOUND`] or [`codes::INVALID_REQUEST`], as for any unknown
+//!   route or parameter, and can tell why from [`API_LEVEL_HEADER`].
+//! - Breaking changes are listed in the changelog's upgrade notes.
 
 pub mod auth;
+pub mod build;
 pub mod web;
 
 use std::collections::BTreeMap;
@@ -100,6 +131,26 @@ pub const PROFILE_HEADER: &str = "x-board-profile";
 pub const IDEMPOTENCY_HEADER: &str = "idempotency-key";
 /// Value of [`EventsQuery::after`] that means "from the first event".
 pub const CURSOR_START: &str = "start";
+
+/// The API level of this version of the contract; see the crate
+/// documentation for the policy.
+///
+/// It starts at 1 and goes up by one with every release that adds or
+/// changes a route, a field or a behaviour that clients can observe. Level 1
+/// is the surface of milestone M2 (messages, events, labels, reactions,
+/// mentions, the web UI) together with the version reporting itself: the
+/// two response headers and [`Health::commit`] and [`Health::api_level`].
+pub const API_LEVEL: u32 = 1;
+/// Response header, on every response: the server's version, as
+/// [`build::VERSION`].
+pub const VERSION_HEADER: &str = "x-openboard-version";
+/// Response header, on every response: the server's [`API_LEVEL`], in
+/// decimal.
+pub const API_LEVEL_HEADER: &str = "x-openboard-api-level";
+/// Request header, on every request of a client that has one: the
+/// [`API_LEVEL`] the client was built for, in decimal. The server reads it
+/// for nothing yet and refuses nobody by it.
+pub const CLIENT_API_LEVEL_HEADER: &str = "x-openboard-client-api-level";
 
 /// Stable error codes returned in [`ApiError::code`].
 pub mod codes {
@@ -593,9 +644,18 @@ pub struct EventsResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Health {
     pub status: String,
+    /// The server's version, as [`build::VERSION`].
     pub version: String,
     /// [`auth::MODE_LOCAL`] or [`auth::MODE_NETWORK`].
     pub mode: String,
+    /// The commit the server was built from, as [`build::COMMIT`]. Absent
+    /// from a server older than API level 1, and from a build that could
+    /// not tell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    /// The server's [`API_LEVEL`]. Absent from a server older than level 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_level: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -612,4 +672,33 @@ pub struct ApiError {
     /// A suggested next step, where one exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn health_from_a_server_older_than_the_version_reporting_still_parses() {
+        let old: Health =
+            serde_json::from_str(r#"{"status":"ok","version":"0.0.1","mode":"local"}"#).unwrap();
+        assert_eq!(old.commit, None);
+        assert_eq!(old.api_level, None);
+        let new: Health = serde_json::from_str(
+            r#"{"status":"ok","version":"0.1.0","mode":"network","commit":"3ad55f3c0a1b","api_level":1,"later":true}"#,
+        )
+        .unwrap();
+        assert_eq!(new.commit.as_deref(), Some("3ad55f3c0a1b"));
+        assert_eq!(new.api_level, Some(1));
+    }
+
+    #[test]
+    fn the_header_names_are_lowercase_and_distinct() {
+        let names = [VERSION_HEADER, API_LEVEL_HEADER, CLIENT_API_LEVEL_HEADER];
+        for name in names {
+            assert_eq!(name, name.to_ascii_lowercase());
+            assert!(name.starts_with("x-openboard-"));
+        }
+        const { assert!(API_LEVEL >= 1) };
+    }
 }

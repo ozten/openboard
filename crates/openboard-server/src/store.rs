@@ -454,6 +454,16 @@ impl Store {
         make_private(data_dir).map_err(StoreError::Other)?;
         let mut conn = Connection::open(data_dir.join(DB_FILE_NAME))?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
+        // Read before anything is written to the database, so that a
+        // database this server will not use, or cannot back up, is left
+        // exactly as it was found.
+        let found: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if !(0..=SCHEMA_VERSION).contains(&found) {
+            return Err(StoreError::Other(unsupported_schema(&conn, found)));
+        }
+        if found != 0 && found != SCHEMA_VERSION {
+            backup_before_migration(&conn, data_dir, found).map_err(StoreError::Other)?;
+        }
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -482,11 +492,7 @@ impl Store {
             // Milestone M1.
             2 => tx.execute_batch(MIGRATE_V2_TO_V3)?,
             SCHEMA_VERSION => {}
-            other => {
-                return Err(StoreError::Other(format!(
-                    "the database has schema version {other}, but this server supports version {SCHEMA_VERSION}"
-                )));
-            }
+            other => return Err(StoreError::Other(unsupported_schema(&tx, other))),
         }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
@@ -616,6 +622,19 @@ impl Store {
             identity::meta_set(&tx, identity::META_URL, url)?;
             identity::meta_set(&tx, identity::META_FINGERPRINT, fingerprint)?;
         }
+        // Which build served the directory last, for a later version that
+        // has to explain itself, or an earlier one that cannot open it.
+        identity::meta_set(
+            &tx,
+            identity::META_STARTED_VERSION,
+            openboard_api::build::VERSION,
+        )?;
+        identity::meta_set(
+            &tx,
+            identity::META_STARTED_COMMIT,
+            openboard_api::build::COMMIT,
+        )?;
+        identity::meta_set(&tx, identity::META_STARTED_AT, &now_rfc3339())?;
         identity::log(
             &tx,
             &LogEntry {
@@ -1464,6 +1483,193 @@ impl Store {
             more,
         })
     }
+}
+
+/// The build that last started a server on a data directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StartedBy {
+    pub version: String,
+    pub commit: Option<String>,
+    pub at: Option<String>,
+}
+
+impl StartedBy {
+    /// For example `Openboard 0.1.0 (3ad55f3c0a1b)`.
+    pub(crate) fn describe(&self) -> String {
+        match &self.commit {
+            Some(commit) => format!("Openboard {} ({commit})", self.version),
+            None => format!("Openboard {}", self.version),
+        }
+    }
+}
+
+/// Who last started a server on the database open on `conn`. `None` for a
+/// database only versions older than 0.1.0 have served, and for one whose
+/// `meta` table cannot be read, whatever the reason.
+pub(crate) fn started_by(conn: &Connection) -> Option<StartedBy> {
+    let get = |key| identity::meta_get(conn, key).ok().flatten();
+    let version = get(identity::META_STARTED_VERSION)?;
+    Some(StartedBy {
+        version,
+        commit: get(identity::META_STARTED_COMMIT)
+            .filter(|commit| commit != openboard_api::build::UNKNOWN),
+        at: get(identity::META_STARTED_AT),
+    })
+}
+
+/// Why a database with schema version `found` cannot be used, and what to
+/// do about it.
+pub(crate) fn unsupported_schema(conn: &Connection, found: i64) -> String {
+    let this = openboard_api::build::describe();
+    if found < 0 {
+        return format!(
+            "the database has schema version {found}, which no version of Openboard writes"
+        );
+    }
+    let (writer, install) = match started_by(conn) {
+        Some(by) => (
+            format!("; it was last started by {}", by.describe()),
+            format!("install Openboard {} or newer", by.version),
+        ),
+        None => (
+            String::new(),
+            "install the version of Openboard that last ran this board, or a newer one".to_owned(),
+        ),
+    };
+    format!(
+        "the database has schema version {found}, which is newer than this version of \
+         Openboard ({this}) supports: it reads and writes up to schema version \
+         {SCHEMA_VERSION}{writer}. To use this data directory, {install}; or restore a backup \
+         taken before the upgrade: stop the server, move a file named {} over {DB_FILE_NAME}, \
+         and remove {DB_FILE_NAME}-wal and {DB_FILE_NAME}-shm (`openboard admin backups` lists \
+         the backups)",
+        backup_pattern(found)
+    )
+}
+
+/// The start of every backup's file name.
+pub(crate) const BACKUP_PREFIX: &str = "openboard.db.pre-v";
+
+/// The file names of the backups taken before a migration to `schema`, as
+/// a pattern for people.
+pub(crate) fn backup_pattern(schema: i64) -> String {
+    format!("{BACKUP_PREFIX}{schema}-<UTC time>")
+}
+
+/// The file name of a backup taken now, before a migration to `schema`:
+/// `openboard.db.pre-v3-20261119T153000Z`.
+pub(crate) fn backup_file_name(schema: i64) -> String {
+    // `2026-11-19T15:30:00.123Z` without its punctuation and milliseconds.
+    let now = now_rfc3339();
+    let compact: String = now
+        .chars()
+        .take(19)
+        .filter(|c| !matches!(c, '-' | ':'))
+        .collect();
+    format!("{BACKUP_PREFIX}{schema}-{compact}Z")
+}
+
+/// Writes a consistent copy of the database beside it, before a migration
+/// from schema version `found` changes anything, and tells the operator on
+/// stderr where it is and how to go back. An error means no migration may
+/// run: the database has not been touched, and what there is of the copy
+/// has been removed.
+///
+/// The copy is made by SQLite's `VACUUM INTO` through the connection that
+/// will migrate, so it holds exactly what that connection sees, including
+/// what is still in the write-ahead log. It is one file, private to its
+/// owner.
+fn backup_before_migration(
+    conn: &Connection,
+    data_dir: &Path,
+    found: i64,
+) -> std::result::Result<PathBuf, String> {
+    let path = data_dir.join(backup_file_name(SCHEMA_VERSION));
+    let refused = |detail: String| {
+        format!(
+            "the database is at schema version {found} and must be migrated to version \
+             {SCHEMA_VERSION}, but the backup that comes first could not be written to {}: \
+             {detail}. Nothing was changed. Make the data directory writable with room for a \
+             copy of the database (`openboard admin upgrade-check` shows how much), then start \
+             again",
+            path.display()
+        )
+    };
+    // Created here, empty, so that it has its final mode before it has any
+    // content. `VACUUM INTO` accepts an empty file and no other.
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(&path)
+        .map_err(|error| refused(error.to_string()))?;
+    let written = (|| -> std::result::Result<u64, String> {
+        let target = path
+            .to_str()
+            .ok_or_else(|| "the path is not valid UTF-8".to_owned())?;
+        conn.execute("VACUUM INTO ?1", [target])
+            .map_err(|error| error.to_string())?;
+        file.sync_all().map_err(|error| error.to_string())?;
+        // The copy must open, be whole, and be at the old version.
+        let copy = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|error| error.to_string())?;
+        let version: i64 = copy
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(|error| error.to_string())?;
+        let check: String = copy
+            .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
+            .map_err(|error| error.to_string())?;
+        if version != found || check != "ok" {
+            return Err("the copy does not match the database".to_owned());
+        }
+        drop(copy);
+        std::fs::metadata(&path)
+            .map(|found| found.len())
+            .map_err(|error| error.to_string())
+    })();
+    let bytes = match written {
+        Ok(bytes) => bytes,
+        Err(detail) => {
+            let _ = std::fs::remove_file(&path);
+            return Err(refused(detail));
+        }
+    };
+    let database = data_dir.join(DB_FILE_NAME);
+    let old = match started_by(conn) {
+        Some(by) => format!("the OLD binary ({})", by.describe()),
+        None => "the OLD binary (the version that ran this board until now)".to_owned(),
+    };
+    eprintln!(
+        "openboard-server: migrating the database from schema version {found} to \
+         {SCHEMA_VERSION} (Openboard {})",
+        openboard_api::build::describe()
+    );
+    eprintln!(
+        "openboard-server: backup written first: {} ({bytes} bytes, readable only by its owner)",
+        path.display()
+    );
+    eprintln!(
+        "openboard-server: to roll back: 1. stop the server; 2. move the backup into place: mv \
+         {} {}; 3. remove {}-wal and {}-shm if they exist; 4. start {old}",
+        path.display(),
+        database.display(),
+        database.display(),
+        database.display(),
+    );
+    eprintln!(
+        "openboard-server: the backup keeps the text of messages that are deleted or edited \
+         after now, so delete it once the upgrade is confirmed: openboard admin backups --prune \
+         --data-dir {}",
+        data_dir.display()
+    );
+    Ok(path)
 }
 
 /// The mode an existing data directory is in, read without locking,

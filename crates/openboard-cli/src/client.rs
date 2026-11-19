@@ -14,13 +14,14 @@ use std::sync::Arc;
 use openboard_api::auth::{parse_fingerprint, JoinRequest, JoinResponse, WhoAmI};
 use openboard_api::{
     codes as api_codes, BoardList, ChannelList, EditMessageRequest, ErrorBody, EventsQuery,
-    EventsResponse, LabelsRequest, Message, PostMessageRequest, PostMessageResponse, Thread,
-    ThreadList, ThreadsQuery, PROFILE_HEADER,
+    EventsResponse, Health, LabelsRequest, Message, PostMessageRequest, PostMessageResponse,
+    Thread, ThreadList, ThreadsQuery, API_LEVEL, CLIENT_API_LEVEL_HEADER, PROFILE_HEADER,
 };
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER};
 use reqwest::{Method, RequestBuilder, Response, Url};
 use serde::de::DeserializeOwned;
 
+use crate::compat::{self, Requirement, Seen, ServerInfo};
 use crate::error::{codes, Failure};
 use crate::logins::Secret;
 use crate::target::{bad_url, Target};
@@ -51,6 +52,8 @@ pub struct Client {
     verdict: Arc<Verdict>,
     /// See [`Target::assumed`].
     assumed: bool,
+    /// What the board has said about its version in this invocation.
+    seen: Seen,
 }
 
 /// A write to one existing message, for choosing the hint when it fails.
@@ -130,7 +133,7 @@ impl Client {
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(CONNECT_TIMEOUT)
-            .user_agent(concat!("openboard/", env!("CARGO_PKG_VERSION")))
+            .user_agent(format!("openboard/{}", openboard_api::build::VERSION))
             .use_preconfigured_tls(tls)
             .https_only(network)
             .build()
@@ -144,7 +147,20 @@ impl Client {
             fingerprint: target.fingerprint.clone().filter(|_| network),
             verdict,
             assumed: target.assumed,
+            seen: Seen::default(),
         })
+    }
+
+    /// What the board said about itself on its latest answer. `None` until
+    /// it has answered anything.
+    pub fn server(&self) -> Option<ServerInfo> {
+        self.seen.info()
+    }
+
+    /// Rewrites the hint of a failure that a board too old for
+    /// `requirement` explains; see [`compat::explain`].
+    pub fn needs(&self, requirement: &Requirement, failure: Failure) -> Failure {
+        compat::explain(failure, self.server().as_ref(), requirement)
     }
 
     fn is_network(&self) -> bool {
@@ -177,7 +193,10 @@ impl Client {
     }
 
     fn request(&self, method: Method, url: Url, timeout: Option<Duration>) -> RequestBuilder {
-        let mut request = self.http.request(method, url);
+        let mut request = self
+            .http
+            .request(method, url)
+            .header(CLIENT_API_LEVEL_HEADER, API_LEVEL.to_string());
         if let Some(timeout) = timeout {
             request = request.timeout(timeout);
         }
@@ -204,6 +223,8 @@ impl Client {
             .send()
             .await
             .map_err(|error| self.transport(&error))?;
+        // Every answer says which version of the board gave it.
+        self.seen.record(response.headers());
         if response.status().is_success() {
             return Ok(response);
         }
@@ -217,7 +238,7 @@ impl Client {
             .bytes()
             .await
             .map_err(|error| self.transport(&error))?;
-        Err(match serde_json::from_slice::<ErrorBody>(&body) {
+        let mut failure = match serde_json::from_slice::<ErrorBody>(&body) {
             Ok(body) => self.api_failure(body, retry_after),
             Err(_) => Failure::new(
                 codes::BAD_RESPONSE,
@@ -227,7 +248,9 @@ impl Client {
                 ),
             )
             .next("check that --url or BOARD_URL points at an Openboard server"),
-        })
+        };
+        failure.status = Some(status.as_u16());
+        Err(failure)
     }
 
     async fn json<T: DeserializeOwned>(&self, request: RequestBuilder) -> Result<T, Failure> {
@@ -484,6 +507,13 @@ impl Client {
                  check that both sides run the same version of openboard",
             )
         })
+    }
+
+    /// The board's health check, which says what it runs. Needs no token,
+    /// but sends one when there is one.
+    pub async fn health(&self) -> Result<Health, Failure> {
+        self.json(self.request(Method::GET, self.root(&["health"]), Some(REQUEST_TIMEOUT)))
+            .await
     }
 
     pub async fn whoami(&self) -> Result<WhoAmI, Failure> {

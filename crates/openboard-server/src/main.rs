@@ -30,7 +30,16 @@ Options:
                                required with --bind 0.0.0.0 or ::)
   --max-message-chars <n>      Longest message, in characters (default: 10000)
   -h, --help                   Show this help
-  -V, --version                Show the version
+  -V, --version                Show the version, commit and build date
+
+The server stops on SIGINT or SIGTERM: it stops accepting connections, ends
+open long-polls and event streams, finishes writes in progress and exits
+within a few seconds. Clients such as `openboard wait` reconnect by
+themselves when it is started again.
+
+Before a newer version migrates the database it writes a backup beside it,
+openboard.db.pre-v<N>-<UTC time>, and says on stderr how to roll back. It
+refuses to migrate when the backup cannot be written.
 
 Exit codes: 0 success, 1 failure or a broken log, 2 bad usage.
 ";
@@ -76,7 +85,7 @@ fn parse_args(args: Vec<String>) -> Result<Option<(Command, Config)>, String> {
                 return Ok(None);
             }
             "-V" | "--version" => {
-                println!("obd {}", env!("CARGO_PKG_VERSION"));
+                println!("obd {}", openboard_api::build::describe());
                 return Ok(None);
             }
             "--data-dir" => config.data_dir = PathBuf::from(value()?),
@@ -136,6 +145,11 @@ fn run_server(config: Config) -> ExitCode {
             server.mode(),
             server.local_addr(),
             config.data_dir.display()
+        );
+        eprintln!(
+            "obd: version {}, API level {}",
+            openboard_api::build::describe(),
+            openboard_api::API_LEVEL
         );
         eprintln!("obd: url {}", server.url());
         // The fingerprint is public: it is what clients pin.

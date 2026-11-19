@@ -45,6 +45,12 @@ const CSRF_DOMAIN: &[u8] = b"openboard.csrf.v1\n";
 pub(crate) const META_MODE: &str = "mode";
 pub(crate) const META_URL: &str = "public_url";
 pub(crate) const META_FINGERPRINT: &str = "fingerprint";
+/// The version, commit and time of the server that last started on the
+/// directory. Written on every start; a server older than 0.1.0 writes
+/// none of them and reads none of them.
+pub(crate) const META_STARTED_VERSION: &str = "last_started_version";
+pub(crate) const META_STARTED_COMMIT: &str = "last_started_commit";
+pub(crate) const META_STARTED_AT: &str = "last_started_at";
 
 /// Security log entry types.
 pub mod log_kinds {

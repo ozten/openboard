@@ -38,6 +38,7 @@ const el = {
   gateContinue: byId("gate-continue"),
   gateRetry: byId("gate-retry"),
   app: byId("app"),
+  brand: byId("brand"),
   boardSelect: byId("board-select"),
   liveStatus: byId("live-status"),
   meKind: byId("me-kind"),
@@ -290,7 +291,25 @@ async function enterApp(session, notice = null) {
   await applyRoute({ initial: true });
 }
 
+/** Puts the server's version and commit in the brand's tooltip. Never blocks the page. */
+function showServerVersion() {
+  api.loadHealth().then(
+    (health) => {
+      const parts = [`Openboard ${health.version}`];
+      if (health.commit) {
+        parts.push(`(${health.commit})`);
+      }
+      if (health.api_level) {
+        parts.push(`· API level ${health.api_level}`);
+      }
+      el.brand.title = parts.join(" ");
+    },
+    () => {},
+  );
+}
+
 async function boot() {
+  showServerVersion();
   showGate();
   el.gateLoading.hidden = false;
   el.gateBody.hidden = true;

@@ -28,7 +28,7 @@ use std::time::Duration;
 use axum::body::{Body, Bytes};
 use axum::extract::rejection::{BytesRejection, PathRejection, QueryRejection};
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Extension, Path, Query, Request, State};
-use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -40,9 +40,10 @@ use openboard_api::{
     codes, event_types, ApiError, BoardList, ChannelList, DeleteMessageQuery, EditMessageRequest,
     ErrorBody, Event, EventsQuery, EventsResponse, Health, LabelsRequest, Message,
     PostMessageRequest, PostMessageResponse, ReadOptions, Thread, ThreadList, ThreadsQuery,
-    CURSOR_START, DEFAULT_EVENTS_PER_PAGE, DEFAULT_THREADS_PER_PAGE, IDEMPOTENCY_HEADER,
-    MAX_EVENTS_PER_PAGE, MAX_HTML_BYTES_PER_RESPONSE, MAX_REACTION_NAMES_PER_MESSAGE,
-    MAX_THREADS_PER_PAGE, MAX_WAIT_SECS, PROFILE_HEADER,
+    API_LEVEL, API_LEVEL_HEADER, CURSOR_START, DEFAULT_EVENTS_PER_PAGE, DEFAULT_THREADS_PER_PAGE,
+    IDEMPOTENCY_HEADER, MAX_EVENTS_PER_PAGE, MAX_HTML_BYTES_PER_RESPONSE,
+    MAX_REACTION_NAMES_PER_MESSAGE, MAX_THREADS_PER_PAGE, MAX_WAIT_SECS, PROFILE_HEADER,
+    VERSION_HEADER,
 };
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, watch};
@@ -252,10 +253,13 @@ pub(crate) fn router(parts: Parts) -> (Router, Maintenance) {
         .layer(DefaultBodyLimit::max(body_limit))
         // It runs before routing, extraction and every handler.
         .layer(middleware::from_fn_with_state(Arc::clone(&state), gate))
-        // The outermost layer, so what the gate refuses carries the
-        // headers too.
-        .layer(middleware::from_fn(security_headers))
         .with_state(Arc::clone(&state));
+    // The outermost layer, around the whole router, so that what the gate
+    // refuses carries the headers too, and so that it sees, and can take
+    // out, what routing adds to an answer; see `security_headers`.
+    let router = Router::new()
+        .fallback_service(router)
+        .layer(middleware::from_fn(security_headers));
     (router, Maintenance(state))
 }
 
@@ -300,7 +304,14 @@ async fn security_headers(request: Request, next: Next) -> Response {
     let is_asset = request.uri().path().starts_with(pages::ASSETS_PREFIX);
     let mut response = next.run(request).await;
     let cacheable = is_asset && response.status() == StatusCode::OK;
+    let refused = response.status() == StatusCode::UNAUTHORIZED;
     let headers = response.headers_mut();
+    // Routing adds `Allow` to an answer for a known path with the wrong
+    // method, even when the gate refused it first. A refusal must not say
+    // which paths exist, so it never carries one.
+    if refused {
+        headers.remove(header::ALLOW);
+    }
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(CONTENT_SECURITY_POLICY),
@@ -316,6 +327,16 @@ async fn security_headers(request: Request, next: Next) -> Response {
     if !cacheable {
         headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     }
+    // What this server is, the same on every response, so that a client
+    // learns it from whatever it asked and a refusal looks like any other.
+    headers.insert(
+        HeaderName::from_static(VERSION_HEADER),
+        HeaderValue::from_static(openboard_api::build::VERSION),
+    );
+    headers.insert(
+        HeaderName::from_static(API_LEVEL_HEADER),
+        HeaderValue::from(API_LEVEL),
+    );
     response
 }
 
@@ -1376,8 +1397,10 @@ async fn health(
     state.require_global(&caller.principal, Action::Health)?;
     Ok(Json(Health {
         status: "ok".to_owned(),
-        version: env!("CARGO_PKG_VERSION").to_owned(),
+        version: openboard_api::build::VERSION.to_owned(),
         mode: state.mode.as_str().to_owned(),
+        commit: openboard_api::build::commit().map(str::to_owned),
+        api_level: Some(API_LEVEL),
     }))
 }
 
