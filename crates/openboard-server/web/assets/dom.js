@@ -46,14 +46,18 @@ export function keepFocus(container, rebuild) {
   }
 }
 
-/** Focuses the element inside `container` whose `data-fk` equals `key`. */
+/**
+ * Focuses the element inside `container` whose `data-fk` equals `key`.
+ * Returns whether there was one.
+ */
 export function focusKey(container, key) {
   for (const candidate of container.querySelectorAll("[data-fk]")) {
     if (candidate.dataset.fk === key) {
       candidate.focus({ preventScroll: true });
-      return;
+      return true;
     }
   }
+  return false;
 }
 
 // ----- Who wrote it ------------------------------------------------------

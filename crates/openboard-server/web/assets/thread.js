@@ -22,6 +22,8 @@ const REACTION_CHARACTERS = {
 const OFFERED_REACTIONS = ["thumbsup", "heart", "eyes", "check", "question"];
 /** Closer to the end than this counts as reading the newest messages. */
 const NEAR_BOTTOM_PX = 80;
+/** A message taller than this is cut to the height set in app.css, behind "Show more". */
+const COLLAPSE_ABOVE_PX = 640;
 const MAX_MENTION_CHIPS = 6;
 
 const CONFLICT_ON_EDIT = {
@@ -76,6 +78,21 @@ export function createThreadView({ getMe, onLoaded }) {
 
   const draftKey = (view) => `${view.board}\n${view.id}`;
 
+  /**
+   * Message bodies and their cards. A body is measured whenever its size
+   * changes, which is also when its pane first becomes visible, and a
+   * very tall one is collapsed.
+   */
+  const bodyCards = new WeakMap();
+  const bodySizes = new ResizeObserver((entries) => {
+    for (const entry of entries) {
+      const card = bodyCards.get(entry.target);
+      if (card && card.body === entry.target) {
+        fitBody(card);
+      }
+    }
+  });
+
   // ----- Opening, closing and refreshing ---------------------------------
 
   function open(board, id) {
@@ -97,7 +114,10 @@ export function createThreadView({ getMe, onLoaded }) {
       }
     }
     current = null;
+    bodySizes.disconnect();
     el.messages.replaceChildren();
+    el.announce.textContent = "";
+    el.mentionRow.replaceChildren();
     el.replyText.value = "";
     clearError(el.replyError);
     el.replyForm.hidden = true;
@@ -105,6 +125,12 @@ export function createThreadView({ getMe, onLoaded }) {
     el.title.textContent = "Thread";
     el.empty.textContent = "Select a thread to read it.";
     el.empty.hidden = false;
+  }
+
+  /** Closes the thread and forgets every unsent reply. For the end of a session. */
+  function reset() {
+    close();
+    drafts.clear();
   }
 
   /** True when the open thread is the one with this root or message ID. */
@@ -157,7 +183,7 @@ export function createThreadView({ getMe, onLoaded }) {
         const signature = JSON.stringify(message);
         const card = view.cards.get(message.id);
         if (!card) {
-          const added = { message, signature, mode: null, error: null, node: null };
+          const added = { message, signature, mode: null, error: null, node: null, body: null, more: null, expanded: false };
           added.node = buildCard(view, added);
           view.cards.set(message.id, added);
           el.messages.append(added.node);
@@ -192,9 +218,22 @@ export function createThreadView({ getMe, onLoaded }) {
   }
 
   function redraw(view, card) {
+    if (card.body) {
+      bodySizes.unobserve(card.body);
+    }
     const node = buildCard(view, card);
     card.node.replaceWith(node);
     card.node = node;
+  }
+
+  /** Collapses a card's body when it is very tall and not opened by the person. */
+  function fitBody(card) {
+    const tall = card.body.scrollHeight > COLLAPSE_ABOVE_PX;
+    const collapsed = tall && !card.expanded;
+    card.body.classList.toggle("collapsed", collapsed);
+    card.more.hidden = !tall;
+    card.more.textContent = collapsed ? "Show more" : "Show less";
+    card.more.setAttribute("aria-expanded", collapsed ? "false" : "true");
   }
 
   function nearBottom() {
@@ -214,6 +253,8 @@ export function createThreadView({ getMe, onLoaded }) {
     const mine = message.by.id === me.id;
     const deleted = Boolean(message.deleted_at);
     const kind = kindName(message.by.kind);
+    card.body = null;
+    card.more = null;
     const classes = ["message", `from-${kind}`];
     if (message.id === message.thread_id) {
       classes.push("root");
@@ -226,6 +267,7 @@ export function createThreadView({ getMe, onLoaded }) {
       "article",
       {
         class: classes.join(" "),
+        tabindex: "-1",
         "aria-label": `Message from ${message.by.handle}, ${kind}`,
         on: {
           keydown: (event) => {
@@ -269,7 +311,26 @@ export function createThreadView({ getMe, onLoaded }) {
       body.classList.add("plain");
       body.textContent = message.text;
     }
-    node.append(body, chips(view, card, me));
+    const more = h("button", {
+      type: "button",
+      class: "show-more",
+      hidden: true,
+      dataset: { fk: `${message.id} more` },
+      on: {
+        click: () => {
+          card.expanded = !card.expanded;
+          fitBody(card);
+          if (!card.expanded) {
+            card.node.scrollIntoView({ block: "nearest" });
+          }
+        },
+      },
+    });
+    card.body = body;
+    card.more = more;
+    bodyCards.set(body, card);
+    bodySizes.observe(body);
+    node.append(body, more, chips(view, card, me));
     if (card.mode === "react") {
       node.append(reactionPicker(view, card, me));
     } else if (card.mode === "label") {
@@ -318,7 +379,7 @@ export function createThreadView({ getMe, onLoaded }) {
             title: "Remove label",
             dataset: { fk: `${message.id} unlabel ${key}` },
             text: "×",
-            on: { click: () => act(view, card, () => api.clearLabel(view.board, message.id, key), `${message.id} label`) },
+            on: { click: () => act(view, card, () => api.clearLabel(view.board, message.id, key), [`${message.id} label`]) },
           }),
         ),
       );
@@ -386,12 +447,25 @@ export function createThreadView({ getMe, onLoaded }) {
     card.mode = mode;
     card.error = null;
     redraw(view, card);
-    focusKey(card.node, focus);
+    focusIn(card, [focus]);
+  }
+
+  /**
+   * Focuses the first of `keys` that the card still has, and the card
+   * itself when it has none, so a control that removed itself (a deleted
+   * message's buttons, the last reaction of its name) does not drop
+   * keyboard focus to the top of the page.
+   */
+  function focusIn(card, keys) {
+    if (!keys.some((key) => focusKey(card.node, key))) {
+      card.node.focus({ preventScroll: true });
+    }
   }
 
   /**
    * Runs one write on a message, then reloads the thread so the card shows
-   * what the board now holds, or the error.
+   * what the board now holds, or the error. `focus` lists where keyboard
+   * focus should land afterwards, in order of preference.
    */
   async function act(view, card, write, focus) {
     try {
@@ -404,7 +478,7 @@ export function createThreadView({ getMe, onLoaded }) {
     await refresh().catch(() => {});
     if (current === view) {
       redraw(view, card);
-      focusKey(card.node, focus);
+      focusIn(card, focus);
     }
   }
 
@@ -412,7 +486,10 @@ export function createThreadView({ getMe, onLoaded }) {
 
   function toggleReaction(view, card, name, given) {
     const write = given ? api.removeReaction : api.addReaction;
-    return act(view, card, () => write(view.board, card.message.id, name), `${card.message.id} reaction ${name}`);
+    return act(view, card, () => write(view.board, card.message.id, name), [
+      `${card.message.id} reaction ${name}`,
+      `${card.message.id} react`,
+    ]);
   }
 
   function reactionPicker(view, card, me) {
@@ -475,7 +552,7 @@ export function createThreadView({ getMe, onLoaded }) {
               showError(errorBox, error);
               return;
             }
-            await act(view, card, async () => {}, `${message.id} label`);
+            await act(view, card, async () => {}, [`${message.id} label`]);
           },
         },
       },
@@ -538,7 +615,7 @@ export function createThreadView({ getMe, onLoaded }) {
         }
         return;
       }
-      await act(view, card, async () => {}, `${message.id} edit`);
+      await act(view, card, async () => {}, [`${message.id} edit`]);
     }
 
     return h(
@@ -586,7 +663,7 @@ export function createThreadView({ getMe, onLoaded }) {
                 card,
                 // The revision that was on screen when Delete was pressed.
                 () => api.deleteMessage(view.board, message.id, message.revision),
-                `${message.id} delete`,
+                [`${message.id} delete`],
               ),
           },
         }),
@@ -678,5 +755,5 @@ export function createThreadView({ getMe, onLoaded }) {
     }
   });
 
-  return { open, close, refresh, showing };
+  return { open, close, reset, refresh, showing };
 }
