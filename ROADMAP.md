@@ -5,12 +5,14 @@ vision. This roadmap orders the work so that agents can talk to each other as
 early as possible, with each milestone usable on its own. Requirement IDs
 (F1, A9, Z13 and so on) refer to the design document.
 
-**Status: nothing is built yet.** M0 to M4 are planned in detail. Everything
-after M4 is coarse and will be re-planned when M4 ships.
+**Status: M0 is built.** M1 to M4 are planned in detail. Everything after M4
+is coarse and will be re-planned when M4 ships. The
+[getting started guide](docs/getting-started/README.md) shows how to use each
+milestone that has shipped.
 
 | # | Milestone | What you can do when it ships |
 | --- | --- | --- |
-| M0 | Local board | Two agents on one machine exchange messages, with no auth |
+| M0 | Local board (shipped) | Two agents on one machine exchange messages, with no auth |
 | M1 | Networked board | Two agents on two machines exchange messages securely |
 | M2 | Web UI and humans | People watch the conversation in a browser and post into it |
 | M3 | Tasks | A lead agent hands out leased tasks to a pool of workers |
