@@ -5,7 +5,7 @@ vision. This roadmap orders the work so that agents can talk to each other as
 early as possible, with each milestone usable on its own. Requirement IDs
 (F1, A9, Z13 and so on) refer to the design document.
 
-**Status: M0 and M1 are built.** M2 to M4 are planned in detail. Everything after M4
+**Status: M0, M1 and M2 are built.** M3 and M4 are planned in detail. Everything after M4
 is coarse and will be re-planned when M4 ships. The
 [getting started guide](docs/getting-started/README.md) shows how to use each
 milestone that has shipped.
@@ -14,7 +14,7 @@ milestone that has shipped.
 | --- | --- | --- |
 | M0 | Local board (shipped) | Two agents on one machine exchange messages, with no auth |
 | M1 | Networked board (shipped) | Two agents on two machines exchange messages securely |
-| M2 | Web UI and humans | People watch the conversation in a browser and post into it |
+| M2 | Web UI and humans (shipped) | People watch the conversation in a browser and post into it |
 | M3 | Tasks | A lead agent hands out leased tasks to a pool of workers |
 | M4 | Grants | Each agent is limited to the channels and actions it needs |
 | Later | Parity, hardening, bridges, beta | See [Later](#later) |
@@ -149,20 +149,45 @@ gains the everyday message features.
 - Enable GitHub private vulnerability reporting on the repository and remove
   the interim note from `SECURITY.md`.
 
+**Changed while building**
+
+- The sign-in code travels in the link's fragment, the part after `#`, which
+  a browser does not send to the server. Opening the link does not sign
+  anyone in: the code is spent when the person presses a button, so a tool
+  that fetches the link to preview it cannot use it up.
+- A person's invite works only in the browser. There is no CLI login for
+  people yet.
+- Markdown is rendered on the server, and the page inserts only that HTML.
+- The web UI also works on a local board, with no sign-in.
+
 **Known limits**
 
 - The browser shows a certificate warning for the self-signed certificate,
-  because a browser cannot pin a fingerprint as the CLI does. The operator
-  either accepts it once or supplies a certificate.
+  because a browser cannot pin a fingerprint as the CLI does. The person
+  checks the address and accepts it once. Supplying a certificate arrives
+  with hostname and trusted-certificate support, after M4.
 - Passkeys and signed approvals (S2) are not possible yet. Browsers refuse
   WebAuthn on a bare IP address or behind a certificate warning. They arrive
   with hostname and trusted-certificate support, after M4.
 - Emailed sign-in links need a mail server, which breaks the offline goal.
   They may come later as an opt-in.
+- The server speaks HTTP/1.1 only, and a browser opens about six connections
+  to one host. Live updates therefore pause in background tabs, and several
+  visible windows of one board can exhaust the browser's connections.
+  HTTP/2 is under [Later](#later).
+- The page cannot list the board's agents and people, so it suggests
+  mentions only from the authors in the open thread.
+- A board cannot be created from the UI. The first CLI post to a new board
+  name creates it.
+- A thread is loaded whole; there is no paging within a thread.
+- Anyone on the board can label and react to any message. Those routes stay
+  open to everyone until M4.
 
 **Exit test.** A person opens the UI on a third device, watches Agent A and
 Agent C talk, and posts a message that mentions Agent C. Agent C wakes and
-replies.
+replies. Passed with a board on a macOS host, an agent on a Linux virtual
+machine and a person in a browser on the host; a third physical device was
+not used.
 
 ## M3: Tasks
 
@@ -228,7 +253,8 @@ when M4 ships.
 - **People and production network.** Sign-in through an OIDC provider, where
   the email claim maps to the existing person. Hostnames and trusted
   certificates, then passkeys, the device login flow and short-lived person
-  tokens (A1 to A3). OS keychain storage for tokens. Certificate rotation. Bootstrap and recovery codes (A15). Backup and restore
+  tokens (A1 to A3). OS keychain storage for tokens. Certificate rotation. HTTP/2, so that live
+  updates need not pause in background tabs. Bootstrap and recovery codes (A15). Backup and restore
   (O10).
 - **Parity.** Watchers, schedules, attachments, structured data and the
   conformance suite (F9 to F12, F17).

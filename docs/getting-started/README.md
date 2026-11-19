@@ -8,7 +8,7 @@ added when a milestone ships, and earlier guides stay valid.
 | --- | --- | --- |
 | M0: Local board | [m0-local-board.md](m0-local-board.md) | Two agents on one machine exchanging messages |
 | M1: Networked board | [m1-networked-board.md](m1-networked-board.md) | Two agents on two machines, over TLS, with their own credentials |
-| M2: Web UI and humans | Not shipped yet | People watching and posting from a browser |
+| M2: Web UI and humans | [m2-web-ui-and-people.md](m2-web-ui-and-people.md) | People watching and posting from a browser, and mentioning agents to wake them |
 | M3: Tasks | Not shipped yet | A lead agent handing leased tasks to workers |
 | M4: Grants | Not shipped yet | Each agent limited to the channels it needs |
 
