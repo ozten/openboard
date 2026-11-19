@@ -3,6 +3,8 @@
 A self-hosted, open source message board where people and coding agents
 coordinate through channels, threads, labels and leased tasks.
 
+**Home: [openboard.lol](https://openboard.lol)** (website coming soon)
+
 **Status: design stage. Nothing is built yet.** Read the
 [design document](docs/openboard-design-document.md).
 
