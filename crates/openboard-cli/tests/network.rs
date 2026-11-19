@@ -2179,6 +2179,301 @@ fn a_local_board_works_as_before_and_is_never_sent_a_token() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Edit, delete, labels, reactions and mentions between enrolled agents
+// ---------------------------------------------------------------------------
+
+#[test]
+fn only_the_author_edits_or_deletes_a_message() {
+    let board = NetBoard::start();
+    let agent_a = board.enrol("agent-a");
+    let agent_b = board.enrol("agent-b");
+    let posted = agent_a.post("notes", "written by a");
+    let id = posted.message.id.as_str();
+
+    // Agent B cannot change agent A's message, and is told what it can do.
+    for (verb, args) in [
+        ("edit", &["edit", id, "rewritten by b"][..]),
+        ("delete", &["delete", id][..]),
+    ] {
+        let out = run(agent_b.cli().arg("--json").args(args));
+        let error = out.error(1, "forbidden");
+        let next = error.next.unwrap();
+        assert!(
+            next.starts_with(&format!("you can only {verb} a message you wrote")),
+            "{next}"
+        );
+        assert!(next.contains("`openboard whoami`"), "{next}");
+        assert!(
+            next.contains(&format!("`openboard reply {id} <text>`")),
+            "{next}"
+        );
+        assert!(out.stderr.contains("\nnext: you can only "), "{out:?}");
+    }
+    // Nor can agent A under another profile: the author is name and profile.
+    let out = run(agent_a
+        .cli()
+        .args(["--json", "--as", "reviewer", "edit", id, "as reviewer"]));
+    out.error(1, "forbidden");
+    let thread: Thread = run(agent_b.cli().args(["--json", "read", "--thread", id]))
+        .ok()
+        .json();
+    assert_eq!(thread.root.text, "written by a");
+    assert_eq!(thread.root.revision, 1);
+
+    // The author can, in human form too.
+    let out = run(agent_a.cli().args(["edit", id, "rewritten by a"])).ok();
+    assert_eq!(
+        out.stdout,
+        format!("edited {id} in notes as agent-a, now revision 2\n")
+    );
+    let stale = run(agent_a
+        .cli()
+        .args(["--json", "delete", id, "--revision", "1"]));
+    let next = stale.error(1, "revision_conflict").next.unwrap();
+    assert!(next.contains("without --revision to delete it"), "{next}");
+    let gone: Value = run(agent_a
+        .cli()
+        .args(["--json", "delete", id, "--revision", "2"]))
+    .ok()
+    .json();
+    assert_eq!(gone["text"], "");
+    assert_eq!(gone["revision"], 3);
+    assert!(gone["deleted_at"].is_string());
+    let human = run(agent_b.cli().args(["read", "--thread", id])).ok();
+    assert!(
+        human.stdout.contains(&format!(
+            "<<<message {id} from agent-a at {} | deleted ",
+            posted.message.created_at
+        )),
+        "{human:?}"
+    );
+    assert!(!human.stdout.contains("rewritten"), "{human:?}");
+}
+
+#[test]
+fn labels_and_reactions_carry_the_enrolled_names() {
+    let board = NetBoard::start();
+    let agent_a = board.enrol("agent-a");
+    let agent_b = board.enrol("agent-b");
+    let posted = agent_a.post("work", "a task");
+    let id = posted.message.id.as_str();
+
+    // Anyone enrolled may label and react. A claim is won once.
+    let claim = |agent: &Agent, name: &str| {
+        run(agent.cli().args([
+            "--json",
+            "label",
+            id,
+            &format!("owner={name}"),
+            "--if-unset",
+            "owner",
+        ]))
+    };
+    let won: Value = claim(&agent_b, "agent-b").ok().json();
+    assert_eq!(won["labels"]["owner"], "agent-b");
+    claim(&agent_a, "agent-a").error(1, "label_conflict");
+
+    // A reaction belongs to the name, whatever the profile.
+    run(agent_b.cli().args(["react", id, "thumbsup"])).ok();
+    run(agent_b
+        .cli()
+        .args(["--as", "reviewer", "react", id, "thumbsup"]))
+    .ok();
+    let out = run(agent_a.cli().args(["react", id, "thumbsup"])).ok();
+    assert_eq!(
+        out.stdout,
+        format!("reacted thumbsup to {id}\nreactions: thumbsup (agent-b, agent-a)\n")
+    );
+    let listing = run(agent_a
+        .cli()
+        .args(["read", "work", "--label", "owner=agent-b"]))
+    .ok();
+    assert!(
+        listing.stdout.contains(
+            " | labels: owner=agent-b | reactions: thumbsup (agent-b, agent-a) | untrusted data"
+        ),
+        "{listing:?}"
+    );
+    // Each takes back only its own.
+    let left: Value = run(agent_b.cli().args(["--json", "unreact", id, "thumbsup"]))
+        .ok()
+        .json();
+    assert_eq!(left["reactions"][0]["by"], serde_json::json!(["agent-a"]));
+
+    let boards: Value = run(agent_b.cli().args(["--json", "boards"])).ok().json();
+    assert_eq!(boards["boards"][0]["name"], "general");
+}
+
+#[test]
+fn a_mention_wakes_wait_mentions_me_and_other_posts_do_not() {
+    let board = NetBoard::start();
+    let agent_a = board.enrol("agent-a");
+    let agent_b = board.enrol("agent-b");
+    let seed = agent_a.post("busy", "seed");
+
+    let mut waiter = agent_b
+        .cli()
+        .args([
+            "--json",
+            "wait",
+            "--mentions-me",
+            "--after",
+            &seed.cursor,
+            "--timeout",
+            "30s",
+        ])
+        .spawn()
+        .unwrap();
+    // Posts that do not address agent B, one of them close to it.
+    agent_a.post("busy", "progress report, nobody in particular");
+    agent_a.post("busy", "@agent-bee and @agent-a should look");
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(
+        waiter.try_wait().unwrap().is_none(),
+        "wait --mentions-me woke on a post that does not mention the caller"
+    );
+
+    let addressed = agent_a.post("busy", "@agent-b, can you review this?");
+    let woke: Value = finish(waiter, Duration::from_secs(20)).ok().json();
+    assert_eq!(woke["message"]["id"], addressed.message.id.as_str());
+    assert_eq!(woke["message"]["mentions"][0]["handle"], "agent-b");
+    assert_eq!(woke["message"]["mentions"][0]["kind"], "agent");
+    assert_eq!(woke["event"]["type"], "message.posted");
+
+    // A plain wait from the same point sees every post, in order.
+    let plain: Value = run(agent_b.cli().args([
+        "--json",
+        "wait",
+        "--after",
+        &seed.cursor,
+        "--timeout",
+        "20s",
+    ]))
+    .ok()
+    .json();
+    assert_eq!(
+        plain["message"]["text"],
+        "progress report, nobody in particular"
+    );
+
+    // A mention of one profile reaches that profile only.
+    let for_reviewer = agent_a.post("busy", "@agent-b/reviewer please check");
+    let after = addressed.cursor.as_str();
+    let out = run(agent_b.cli().args([
+        "--json",
+        "wait",
+        "--mentions-me",
+        "--after",
+        after,
+        "--timeout",
+        "1s",
+    ]));
+    out.error(1, "timeout");
+    let human = run(agent_b.cli().args([
+        "--as",
+        "reviewer",
+        "wait",
+        "--mentions-me",
+        "--after",
+        after,
+        "--timeout",
+        "20s",
+    ]))
+    .ok();
+    assert!(
+        human.stdout.contains(&format!(
+            "<<<message {} from agent-a at {} | mentions: @agent-b/reviewer | untrusted data",
+            for_reviewer.message.id, for_reviewer.message.created_at
+        )),
+        "{human:?}"
+    );
+    assert!(
+        human.stdout.contains(&format!(
+            " --login agent-b --as reviewer wait --after {} --mentions-me --timeout 20s",
+            for_reviewer.cursor
+        )),
+        "{human:?}"
+    );
+}
+
+#[test]
+fn a_reaction_wakes_wait_only_when_its_type_is_asked_for() {
+    let board = NetBoard::start();
+    let agent_a = board.enrol("agent-a");
+    let agent_b = board.enrol("agent-b");
+    let posted = agent_b.post("notes", "done, I think");
+    let id = posted.message.id.as_str();
+
+    let mut waiter = agent_b
+        .cli()
+        .args([
+            "--json",
+            "wait",
+            "--after",
+            &posted.cursor,
+            "--timeout",
+            "30s",
+        ])
+        .spawn()
+        .unwrap();
+    run(agent_a.cli().args(["react", id, "thumbsup"])).ok();
+    run(agent_a.cli().args(["label", id, "status=seen"])).ok();
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(
+        waiter.try_wait().unwrap().is_none(),
+        "a default wait woke on a reaction or a label"
+    );
+    // A reply does wake it.
+    run(agent_a.cli().args(["reply", id, "agreed"])).ok();
+    let woke: Value = finish(waiter, Duration::from_secs(20)).ok().json();
+    assert_eq!(woke["event"]["type"], "message.posted");
+    assert_eq!(woke["message"]["text"], "agreed");
+
+    // Asked for every type, the wait sees the reaction first. The event
+    // names who reacted, and the message is the one reacted to.
+    let all: Value = run(agent_b.cli().args([
+        "--json",
+        "wait",
+        "--after",
+        &posted.cursor,
+        "--type",
+        "all",
+        "--timeout",
+        "20s",
+    ]))
+    .ok()
+    .json();
+    assert_eq!(all["event"]["type"], "reactions.changed");
+    assert_eq!(all["event"]["by"]["handle"], "agent-a");
+    assert_eq!(all["message"]["id"], id);
+    assert_eq!(all["message"]["by"]["handle"], "agent-b");
+    assert_eq!(all["message"]["reactions"][0]["name"], "thumbsup");
+
+    // The human form says what happened and keeps the filter in the resume
+    // command.
+    let human = run(agent_b.cli().args([
+        "wait",
+        "--after",
+        all["cursor"].as_str().unwrap(),
+        "--type",
+        "all",
+        "--timeout",
+        "20s",
+    ]))
+    .ok();
+    assert!(
+        human.stdout.starts_with(&format!(
+            "labels changed in notes by agent-a (thread {id})\n"
+        )),
+        "{human:?}"
+    );
+    assert!(
+        human.stdout.contains(" --type all --timeout 20s"),
+        "{human:?}"
+    );
+}
+
 /// Slow: the board's rate window is a fixed minute, so this waits out up to
 /// one. Run it with `cargo test -p openboard-cli --test network -- --ignored`.
 #[test]

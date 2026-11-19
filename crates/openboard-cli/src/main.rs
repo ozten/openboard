@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use openboard_api::{
-    Event, EventsQuery, Message, PostMessageRequest, ThreadsQuery, CURSOR_START, MAX_WAIT_SECS,
+    EditMessageRequest, Event, EventsQuery, LabelsRequest, Message, PostMessageRequest,
+    ThreadsQuery, CURSOR_START, MAX_WAIT_SECS,
 };
 use openboard_server::ServeError;
 use serde::Serialize;
@@ -94,8 +95,9 @@ fn run(cli: Cli) -> Result<(), Failure> {
     // Stdin is read before the async runtime starts, so a pipe that never
     // closes is interrupted by the default signal handling.
     let text = match &cli.command {
-        Command::Post(args) => Some(message_text(args.text.as_deref())?),
-        Command::Reply(args) => Some(message_text(args.text.as_deref())?),
+        Command::Post(args) => Some(message_text(args.text.as_deref(), "post <channel>")?),
+        Command::Reply(args) => Some(message_text(args.text.as_deref(), "reply <id>")?),
+        Command::Edit(args) => Some(message_text(args.text.as_deref(), "edit <message-id>")?),
         Command::Join(args) => Some(session::invite_text(args.invite.as_deref())?),
         _ => None,
     };
@@ -112,17 +114,18 @@ fn run(cli: Cli) -> Result<(), Failure> {
 }
 
 /// The message text: the argument, or stdin for `-` or a missing argument
-/// with piped input.
-fn message_text(arg: Option<&str>) -> Result<String, Failure> {
+/// with piped input. `command` is the command as a hint shows it, such as
+/// `post <channel>`.
+fn message_text(arg: Option<&str>, command: &str) -> Result<String, Failure> {
     let text = match arg {
         Some(text) if text != "-" => text.to_owned(),
         _ => {
             let mut stdin = std::io::stdin();
             if arg.is_none() && stdin.is_terminal() {
-                return Err(Failure::usage("no message text was given").next(
+                return Err(Failure::usage("no message text was given").next(format!(
                     "pass the text as an argument, or pipe it on stdin: `echo \"text\" | \
-                     openboard post <channel>`",
-                ));
+                     openboard {command}`"
+                )));
             }
             let mut text = String::new();
             stdin.read_to_string(&mut text).map_err(|error| {
@@ -449,10 +452,35 @@ async fn dispatch(cli: Cli, text: Option<String>) -> Result<(), Failure> {
                 };
                 post(&ctx, &request).await
             }
+            Command::Edit(args) => {
+                let id = message_id(&args.message)?;
+                let request = EditMessageRequest {
+                    text: text.unwrap_or_default(),
+                    revision: args.revision,
+                };
+                let message = ctx.client.edit_message(id, &request).await?;
+                ctx.print(&message, || render::edited(&message))
+            }
+            Command::Delete(args) => {
+                let id = message_id(&args.message)?;
+                let message = ctx.client.delete_message(id, args.revision).await?;
+                ctx.print(&message, || render::deleted(&message))
+            }
+            Command::Label(args) => {
+                let id = message_id(&args.message)?;
+                let message = ctx.client.label_message(id, &labels_request(args)?).await?;
+                ctx.print(&message, || render::labelled(&message))
+            }
+            Command::React(args) => react(&ctx, args, true).await,
+            Command::Unreact(args) => react(&ctx, args, false).await,
             Command::Read(args) => read(&ctx, args).await,
             Command::Channels => {
                 let list = ctx.client.channels().await?;
                 ctx.print(&list, || render::channels(&list, global.board()))
+            }
+            Command::Boards => {
+                let list = ctx.client.boards().await?;
+                ctx.print(&list, || render::boards(&list))
             }
             Command::Wait(args) => wait(&ctx, args).await,
             Command::Tail(args) => tail(&ctx, args).await,
@@ -710,6 +738,86 @@ async fn post(ctx: &Ctx<'_>, request: &PostMessageRequest) -> Result<(), Failure
     ctx.print(&response, || render::posted(&response))
 }
 
+/// A message ID from the command line. An empty one would address another
+/// route, so it never reaches the board.
+fn message_id(raw: &str) -> Result<&str, Failure> {
+    let id = raw.trim();
+    if id.is_empty() {
+        return Err(Failure::usage("the message ID is empty").next(
+            "pass an ID as `openboard read` prints it, such as msg_0123abcd; `openboard read \
+             <channel>` lists them",
+        ));
+    }
+    Ok(id)
+}
+
+/// Splits `key=value` at the first `=`. `flag` says where it was written.
+fn key_value<'a>(raw: &'a str, flag: &str) -> Result<(&'a str, &'a str), Failure> {
+    match raw.split_once('=') {
+        Some((key, value)) if !key.is_empty() && !value.is_empty() => Ok((key, value)),
+        _ => Err(Failure::usage(format!(
+            "{flag} `{}` is not written as key=value",
+            render::safe(raw)
+        ))
+        .next(
+            "write each label as key=value, for example `openboard label <message-id> \
+             status=done`; use --clear <key> to remove one and --if-unset <key> to require \
+             that none is set",
+        )),
+    }
+}
+
+/// The label change a `label` command line asks for.
+fn labels_request(args: &cli::LabelArgs) -> Result<LabelsRequest, Failure> {
+    let mut request = LabelsRequest {
+        clear: args.clear.clone(),
+        if_unset: args.if_unset.clone(),
+        ..LabelsRequest::default()
+    };
+    for (raw, flag, map) in args
+        .set
+        .iter()
+        .map(|raw| (raw, "the label", true))
+        .chain(args.if_equals.iter().map(|raw| (raw, "--if", false)))
+    {
+        let (key, value) = key_value(raw, flag)?;
+        let map = if map {
+            &mut request.set
+        } else {
+            &mut request.if_equals
+        };
+        if map.insert(key.to_owned(), value.to_owned()).is_some() {
+            return Err(
+                Failure::usage(format!("label `{}` is given twice", render::safe(key)))
+                    .next("a label has one value per key: give each key once"),
+            );
+        }
+    }
+    if let Some(key) = request
+        .clear
+        .iter()
+        .find(|key| request.set.contains_key(*key))
+    {
+        return Err(Failure::usage(format!(
+            "label `{}` is both set and cleared",
+            render::safe(key)
+        ))
+        .next("set a label or --clear it, not both in one command"));
+    }
+    Ok(request)
+}
+
+async fn react(ctx: &Ctx<'_>, args: &cli::ReactArgs, add: bool) -> Result<(), Failure> {
+    let id = message_id(&args.message)?;
+    let name = args.name.trim();
+    if name.is_empty() {
+        return Err(Failure::usage("the reaction name is empty")
+            .next("pass a name such as `thumbsup` or `+1`"));
+    }
+    let message = ctx.client.react(id, name, add).await?;
+    ctx.print(&message, || render::reacted(&message, name, add))
+}
+
 async fn read(ctx: &Ctx<'_>, args: &ReadArgs) -> Result<(), Failure> {
     if let Some(id) = &args.thread {
         let thread = ctx.client.thread(id).await?;
@@ -722,10 +830,14 @@ async fn read(ctx: &Ctx<'_>, args: &ReadArgs) -> Result<(), Failure> {
             channel: channel.clone(),
             limit: args.limit,
             cursor: args.cursor.clone(),
+            label: args.label.clone(),
             ..ThreadsQuery::default()
         })
         .await?;
-    ctx.print(&list, || render::thread_list(&list, &channel))
+    let label = args.label.as_deref().map(shell_quote);
+    ctx.print(&list, || {
+        render::thread_list(&list, &channel, label.as_deref())
+    })
 }
 
 /// The root ID of the thread holding `id`, so event filters accept any
@@ -757,9 +869,20 @@ async fn wait(ctx: &Ctx<'_>, args: &WaitArgs) -> Result<(), Failure> {
     let deadline = Instant::now() + args.timeout;
     let timeout_flag =
         (args.timeout != Duration::from_secs(30 * 60)).then(|| cli::format_duration(args.timeout));
+    // Without --type only new messages wake the wait, so that a reaction or
+    // a label somewhere does not end an agent's sleep.
+    let types = cli::types_filter(&args.types);
+    let mentions_self = args.mentions_me.then_some(true);
+    let type_flag = match types.as_deref() {
+        Some(openboard_api::event_types::MESSAGE_POSTED) => None,
+        Some(types) => Some(types),
+        None => Some(cli::ALL_TYPES),
+    };
     let flags = [
         ("--channel", args.channel.as_deref()),
         ("--thread", thread.as_deref()),
+        ("--type", type_flag),
+        ("--mentions-me", args.mentions_me.then_some("")),
         ("--timeout", timeout_flag.as_deref()),
         ("--include-self", args.include_self.then_some("")),
     ];
@@ -775,6 +898,8 @@ async fn wait(ctx: &Ctx<'_>, args: &WaitArgs) -> Result<(), Failure> {
             thread: thread.clone(),
             not_from_self,
             limit: Some(1),
+            types: types.clone(),
+            mentions_self,
             ..EventsQuery::default()
         };
         let now = loop {
@@ -806,7 +931,8 @@ async fn wait(ctx: &Ctx<'_>, args: &WaitArgs) -> Result<(), Failure> {
                 not_from_self,
                 wait: Some(hold),
                 limit: Some(1),
-                ..EventsQuery::default()
+                types: types.clone(),
+                mentions_self,
             })
             .await;
         let response = match response {
@@ -889,14 +1015,19 @@ async fn slow_down(failure: Failure, deadline: Option<Instant>) -> Result<(), Fa
 
 async fn tail(ctx: &Ctx<'_>, args: &TailArgs) -> Result<(), Failure> {
     let thread = thread_root(ctx, args.thread.as_deref()).await?;
+    let types = cli::types_filter(&args.types);
     let filter = EventsQuery {
         channel: args.channel.clone(),
         thread: thread.clone(),
+        types: types.clone(),
+        mentions_self: args.mentions_me.then_some(true),
         ..EventsQuery::default()
     };
     let flags = [
         ("--channel", args.channel.as_deref()),
         ("--thread", thread.as_deref()),
+        ("--type", types.as_deref()),
+        ("--mentions-me", args.mentions_me.then_some("")),
     ];
 
     // Fix the starting cursor before streaming, so a reconnect always has a

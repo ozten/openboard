@@ -13,8 +13,9 @@ use std::sync::Arc;
 
 use openboard_api::auth::{parse_fingerprint, JoinRequest, JoinResponse, WhoAmI};
 use openboard_api::{
-    codes as api_codes, ChannelList, ErrorBody, EventsQuery, EventsResponse, PostMessageRequest,
-    PostMessageResponse, Thread, ThreadList, ThreadsQuery, PROFILE_HEADER,
+    codes as api_codes, BoardList, ChannelList, EditMessageRequest, ErrorBody, EventsQuery,
+    EventsResponse, LabelsRequest, Message, PostMessageRequest, PostMessageResponse, Thread,
+    ThreadList, ThreadsQuery, PROFILE_HEADER,
 };
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER};
 use reqwest::{Method, RequestBuilder, Response, Url};
@@ -50,6 +51,26 @@ pub struct Client {
     verdict: Arc<Verdict>,
     /// See [`Target::assumed`].
     assumed: bool,
+}
+
+/// A write to one existing message, for choosing the hint when it fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Change {
+    Edit,
+    Delete,
+    Label,
+    React,
+}
+
+impl Change {
+    fn verb(self) -> &'static str {
+        match self {
+            Change::Edit => "edit",
+            Change::Delete => "delete",
+            Change::Label => "label",
+            Change::React => "react to",
+        }
+    }
 }
 
 /// What to do about a local board that cannot be reached. When the board
@@ -267,6 +288,41 @@ impl Client {
                 Some(seconds) => format!("retry after {seconds} seconds"),
                 None => "wait a minute, then retry".to_owned(),
             }),
+            // Requests that name a message say more; see `about_message`.
+            api_codes::REVISION_CONFLICT => Some(
+                "the message changed since that revision: read it again with `openboard read \
+                 --thread <id>`, then retry with its current --revision"
+                    .to_owned(),
+            ),
+            api_codes::LABEL_CONFLICT => Some(
+                "an --if or --if-unset condition did not hold, so nothing changed: read the \
+                 message again with `openboard read --thread <id>` to see its labels"
+                    .to_owned(),
+            ),
+            api_codes::INVALID_LABEL => Some(
+                "write a label as key=value: the key is 1 to 64 lowercase letters, digits, '.', \
+                 '_' or '-' and does not start with `board.`; the value is 1 to 256 bytes with \
+                 no control characters; a message holds at most 32 labels"
+                    .to_owned(),
+            ),
+            api_codes::INVALID_REACTION => Some(
+                "use a name, not an emoji character: 1 to 32 lowercase letters, digits, '_', \
+                 '+' or '-', such as `thumbsup` or `+1`"
+                    .to_owned(),
+            ),
+            api_codes::MESSAGE_DELETED => Some(
+                "a deleted message cannot be edited, labelled or reacted to; `openboard reply` \
+                 to its thread still works"
+                    .to_owned(),
+            ),
+            // The CLI sends a token and never a cookie or an `Origin`
+            // header, so something between it and the board added one.
+            api_codes::CSRF_FAILED => Some(format!(
+                "the board took this for a request from a web page, which this command never \
+                 sends: check that --url (or BOARD_URL) is the board's own address ({}) and not \
+                 a proxy that adds `Origin` or `Cookie` headers",
+                self.base
+            )),
             _ => error.next,
         };
         let mut failure = Failure::new(error.code, error.message);
@@ -287,6 +343,48 @@ impl Client {
              you meant another board, check --board (or BOARD_NAME)",
             self.board
         ))
+    }
+
+    /// Rewrites the hint of a failed request that names one message, so it
+    /// gives the command to run next with that message's ID in it.
+    fn about_message(&self, id: &str, change: Change, failure: Failure) -> Failure {
+        // The ID came from the command line. Only one that looks like an ID
+        // is repeated in a command the caller may paste.
+        let plain = !id.is_empty()
+            && id.len() <= 64
+            && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        let id = if plain { id } else { "<message-id>" };
+        let read = format!("`openboard read --thread {id}`");
+        let next = match (failure.code.as_str(), change) {
+            (api_codes::NOT_FOUND, _) => format!(
+                "check the message ID: `openboard read <channel>` lists threads and `openboard \
+                 read --thread <id>` shows every message in one with its ID; a message is only \
+                 found on its own board (this is `{}`), so check --board (or BOARD_NAME) too",
+                self.board
+            ),
+            (api_codes::FORBIDDEN, Change::Edit | Change::Delete) => format!(
+                "you can only {} a message you wrote, under the same login and the same --as \
+                 profile: `openboard whoami` shows who you are now and {read} shows the author; \
+                 to answer someone else's message use `openboard reply {id} <text>`",
+                change.verb()
+            ),
+            (api_codes::REVISION_CONFLICT, Change::Edit | Change::Delete) => format!(
+                "the message was edited or deleted since that revision, and nothing changed: \
+                 run {read} to see it and its current revision, then retry with that \
+                 --revision, or without --revision to {} it whatever it says now",
+                change.verb()
+            ),
+            (api_codes::LABEL_CONFLICT, _) => format!(
+                "an --if or --if-unset condition did not hold, so nothing changed; another \
+                 agent may have got there first: run {read} to see the labels as they are now"
+            ),
+            (api_codes::MESSAGE_DELETED, _) => format!(
+                "a deleted message cannot be edited, labelled or reacted to; `openboard reply \
+                 {id} <text>` still adds to its thread"
+            ),
+            _ => return failure,
+        };
+        failure.next(next)
     }
 
     fn transport(&self, error: &reqwest::Error) -> Failure {
@@ -438,10 +536,92 @@ impl Client {
             if let Some(cursor) = &query.cursor {
                 pairs.append_pair("cursor", cursor);
             }
+            if let Some(label) = &query.label {
+                pairs.append_pair("label", label);
+            }
         }
         self.json(self.request(Method::GET, url, Some(REQUEST_TIMEOUT)))
             .await
             .map_err(|failure| self.board_missing(failure))
+            .map_err(|failure| match failure.code.as_str() {
+                api_codes::INVALID_LABEL => failure.next(
+                    "write --label as `key`, `key=value` or `key=a|b` (quote the last form for \
+                     the shell): a key is lowercase letters, digits, '.', '_' or '-'",
+                ),
+                _ => failure,
+            })
+    }
+
+    /// The boards on this server that the caller may read.
+    pub async fn boards(&self) -> Result<BoardList, Failure> {
+        self.json(self.request(Method::GET, self.root(&["boards"]), Some(REQUEST_TIMEOUT)))
+            .await
+    }
+
+    /// A write to one message, which answers with the message as it is now.
+    async fn change_message(
+        &self,
+        id: &str,
+        change: Change,
+        request: RequestBuilder,
+    ) -> Result<Message, Failure> {
+        self.json(request)
+            .await
+            .map_err(|failure| self.about_message(id, change, failure))
+    }
+
+    fn with_json<T: serde::Serialize>(
+        request: RequestBuilder,
+        body: &T,
+    ) -> Result<RequestBuilder, Failure> {
+        let body = serde_json::to_vec(body).map_err(|error| {
+            Failure::new(codes::IO, format!("cannot encode the request: {error}"))
+        })?;
+        Ok(request.header(CONTENT_TYPE, "application/json").body(body))
+    }
+
+    pub async fn edit_message(
+        &self,
+        id: &str,
+        request: &EditMessageRequest,
+    ) -> Result<Message, Failure> {
+        let url = self.endpoint(&["messages", id]);
+        let http = self.request(Method::PATCH, url, Some(REQUEST_TIMEOUT));
+        self.change_message(id, Change::Edit, Self::with_json(http, request)?)
+            .await
+    }
+
+    pub async fn delete_message(
+        &self,
+        id: &str,
+        revision: Option<u32>,
+    ) -> Result<Message, Failure> {
+        let mut url = self.endpoint(&["messages", id]);
+        if let Some(revision) = revision {
+            url.query_pairs_mut()
+                .append_pair("revision", &revision.to_string());
+        }
+        let http = self.request(Method::DELETE, url, Some(REQUEST_TIMEOUT));
+        self.change_message(id, Change::Delete, http).await
+    }
+
+    pub async fn label_message(
+        &self,
+        id: &str,
+        request: &LabelsRequest,
+    ) -> Result<Message, Failure> {
+        let url = self.endpoint(&["messages", id, "labels"]);
+        let http = self.request(Method::POST, url, Some(REQUEST_TIMEOUT));
+        self.change_message(id, Change::Label, Self::with_json(http, request)?)
+            .await
+    }
+
+    /// Adds (`add`) or removes the caller's reaction `name`.
+    pub async fn react(&self, id: &str, name: &str, add: bool) -> Result<Message, Failure> {
+        let url = self.endpoint(&["messages", id, "reactions", name]);
+        let method = if add { Method::PUT } else { Method::DELETE };
+        let http = self.request(method, url, Some(REQUEST_TIMEOUT));
+        self.change_message(id, Change::React, http).await
     }
 
     /// The thread that holds `id`, which may be any message ID in it.
@@ -463,13 +643,19 @@ impl Client {
                 ("channel", &query.channel),
                 ("thread", &query.thread),
                 ("not_from", &query.not_from),
+                ("types", &query.types),
             ] {
                 if let Some(value) = value {
                     pairs.append_pair(name, value);
                 }
             }
-            if let Some(flag) = query.not_from_self {
-                pairs.append_pair("not_from_self", if flag { "true" } else { "false" });
+            for (name, flag) in [
+                ("not_from_self", query.not_from_self),
+                ("mentions_self", query.mentions_self),
+            ] {
+                if let Some(flag) = flag {
+                    pairs.append_pair(name, if flag { "true" } else { "false" });
+                }
             }
             if let Some(wait) = query.wait {
                 pairs.append_pair("wait", &wait.to_string());
