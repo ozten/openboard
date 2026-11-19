@@ -48,6 +48,12 @@ pub mod codes {
     pub const NOT_NETWORK: &str = "not_network";
     /// An operator command could not use the data directory.
     pub const OPERATOR_FAILED: &str = "operator_failed";
+    /// `skill --install` found a different file where it would write.
+    pub const FILE_EXISTS: &str = "file_exists";
+    /// `admin upgrade-check` found a database newer than this openboard.
+    pub const SCHEMA_TOO_NEW: &str = "schema_too_new";
+    /// `admin upgrade-check` found no room for the backup a migration needs.
+    pub const NO_ROOM_FOR_BACKUP: &str = "no_room_for_backup";
 }
 
 /// A failed command.
@@ -61,6 +67,9 @@ pub struct Failure {
     pub cursor: Option<String>,
     /// Seconds the board asked the caller to wait, on `rate_limited`.
     pub retry_after: Option<u64>,
+    /// The HTTP status of the board's answer, when the board answered.
+    /// `None` for a failure that never reached it, or was decided here.
+    pub status: Option<u16>,
     pub exit: u8,
     /// The command already wrote its stdout document (or must not write one),
     /// so no JSON error object follows.
@@ -77,6 +86,7 @@ impl Failure {
             next: None,
             cursor: None,
             retry_after: None,
+            status: None,
             exit: EXIT_FAILURE,
             no_stdout: false,
             no_stderr: false,

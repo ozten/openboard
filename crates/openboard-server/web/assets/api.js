@@ -147,6 +147,11 @@ function messagePath(board, messageId, rest = "") {
   return boardPath(board, `/messages/${encodeURIComponent(messageId)}${rest}`);
 }
 
+/** What the server is: `{version, commit, api_level, mode}`. Needs no sign-in. */
+export async function loadHealth() {
+  return send("GET", "/v1/health");
+}
+
 // ----- Session ---------------------------------------------------------
 
 /**

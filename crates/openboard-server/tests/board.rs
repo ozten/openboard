@@ -697,6 +697,51 @@ async fn shutdown_releases_long_polls_and_streams() {
 }
 
 #[tokio::test]
+async fn shutdown_does_not_wait_for_clients_that_hold_connections_open() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let board = Board::start().await;
+    // One connection that never finishes its request, and one stream whose
+    // reader never reads.
+    let mut stalled = tokio::net::TcpStream::connect(board.addr).await.unwrap();
+    stalled
+        .write_all(b"GET /v1/health HTTP/1.1\r\nHost: x\r\n")
+        .await
+        .unwrap();
+    let mut silent = tokio::net::TcpStream::connect(board.addr).await.unwrap();
+    silent
+        .write_all(
+            format!(
+                "GET /v1/boards/general/events/stream HTTP/1.1\r\nHost: {}\r\n\r\n",
+                board.addr
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut head = [0u8; 12];
+    silent.read_exact(&mut head).await.unwrap();
+    assert_eq!(&head, b"HTTP/1.1 200");
+
+    let started = Instant::now();
+    // `stop` allows ten seconds; the server takes its five-second grace at
+    // most.
+    board.stop().await;
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "{:?}",
+        started.elapsed()
+    );
+    // Both connections are closed: reading ends.
+    for stream in [&mut stalled, &mut silent] {
+        let mut rest = Vec::new();
+        // A clean end or a reset: either way the server let go.
+        let _ended = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut rest))
+            .await
+            .expect("the connection is closed");
+    }
+}
+
+#[tokio::test]
 async fn not_from_skips_the_callers_own_posts() {
     let board = Board::start().await;
     let mine = json!({"channel": "team", "text": "from a"});

@@ -23,6 +23,11 @@
 //! which is which, since only a person holds sessions. [`invite`] takes
 //! either kind of name.
 //!
+//! [`upgrade_check`], [`list_backups`] and [`prune_backups`] are about
+//! upgrading the server: what the next start would do to the database, and
+//! the backups earlier migrations left. They read the directory whatever
+//! version wrote it, a newer one included.
+//!
 //! Nothing returned here holds a secret, with two exceptions that exist
 //! nowhere else and cannot be read back: [`CreatedInvite::invite`] carries
 //! a new enrolment code, and [`PersonInvite::link`] and
@@ -41,7 +46,7 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 
 use crate::identity::{self, InviteKind, LogEntry};
 use crate::names;
-use crate::store::{DB_FILE_NAME, OLDEST_IDENTITY_SCHEMA, SCHEMA_VERSION};
+use crate::store::{BACKUP_PREFIX, DB_FILE_NAME, OLDEST_IDENTITY_SCHEMA, SCHEMA_VERSION};
 use crate::time::{now_ms, rfc3339_from_ms};
 use crate::Mode;
 
@@ -282,9 +287,9 @@ fn open(data_dir: &Path, write: bool) -> Result<(Connection, Schema)> {
         // Milestone M1's schema has every table used here.
         OLDEST_IDENTITY_SCHEMA..=SCHEMA_VERSION => Schema::Current,
         other => {
-            return Err(OperatorError::Storage(format!(
-            "the database has schema version {other}, but this version supports {SCHEMA_VERSION}"
-        )))
+            return Err(OperatorError::Storage(crate::store::unsupported_schema(
+                &conn, other,
+            )))
         }
     };
     Ok((conn, schema))
@@ -615,4 +620,237 @@ pub fn security_log(data_dir: &Path, limit: Option<u32>) -> Result<Vec<SecurityL
         .collect::<rusqlite::Result<Vec<_>>>()?;
     entries.reverse();
     Ok(entries)
+}
+
+/// The build that last started a server on a data directory. Servers older
+/// than 0.1.0 did not record it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartedBy {
+    /// As `openboard_api::build::VERSION` of that server.
+    pub version: String,
+    /// As `openboard_api::build::COMMIT` of that server, when it knew.
+    pub commit: Option<String>,
+    /// When it started. RFC 3339 timestamp in UTC.
+    pub at: Option<String>,
+}
+
+/// What starting this version of the server on a data directory would do
+/// to its database. The result of [`upgrade_check`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpgradeCheck {
+    /// The schema version the database is at.
+    pub schema_version: i64,
+    /// The schema version this version of the server reads and writes.
+    pub supported_schema_version: i64,
+    /// Who started a server on the directory last, when recorded.
+    pub last_started_by: Option<StartedBy>,
+    /// What the next start would do.
+    pub action: UpgradeAction,
+    /// The directory the backup would be written to: the data directory.
+    pub backup_dir: PathBuf,
+    /// The backup's file name, with `<UTC time>` where the time goes. Set
+    /// when [`UpgradeCheck::action`] is [`UpgradeAction::Migrate`].
+    pub backup_name: Option<String>,
+    /// Size of the database with its write-ahead log, in bytes. The backup
+    /// is at most this large.
+    pub database_bytes: u64,
+    /// Free space in the data directory's file system, in bytes, when the
+    /// system would say.
+    pub free_bytes: Option<u64>,
+    /// Whether the backup fits, with a margin. `None` when the free space
+    /// is not known.
+    pub room_for_backup: Option<bool>,
+}
+
+/// What the next start of this version of the server does to a database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpgradeAction {
+    /// The database is at this version's schema. Nothing is migrated and no
+    /// backup is written.
+    None,
+    /// The database is older. The server writes a backup, then migrates.
+    Migrate { from: i64, to: i64 },
+    /// The database is newer than this version supports. The server refuses
+    /// to start on it.
+    Refuse,
+}
+
+/// One backup the server wrote before a migration. See [`list_backups`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Backup {
+    pub path: PathBuf,
+    pub file_name: String,
+    pub size_bytes: u64,
+    /// When the file was last written. RFC 3339 timestamp in UTC.
+    pub modified_at: Option<String>,
+    /// How long ago that was, in seconds.
+    pub age_secs: Option<u64>,
+    /// The schema version the migration went to, from the file name. The
+    /// backup holds the database as it was before, at an older version.
+    pub before_schema_version: Option<i64>,
+}
+
+fn database_path(data_dir: &Path) -> Result<PathBuf> {
+    let path = data_dir.join(DB_FILE_NAME);
+    if path.is_file() {
+        Ok(path)
+    } else {
+        Err(OperatorError::NoDatabase(path))
+    }
+}
+
+/// The schema version of the database and who last started a server on it,
+/// whatever version wrote it.
+fn read_schema(data_dir: &Path) -> Result<(i64, Option<StartedBy>)> {
+    let path = database_path(data_dir)?;
+    let conn = Connection::open_with_flags(
+        &path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.busy_timeout(Duration::from_secs(5))?;
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let started = crate::store::started_by(&conn).map(|by| StartedBy {
+        version: by.version,
+        commit: by.commit,
+        at: by.at,
+    });
+    Ok((version, started))
+}
+
+/// Free space where `dir` is, as `df` reports it to an unprivileged user.
+/// `None` where there is no `df` or its answer cannot be read.
+fn free_bytes(dir: &Path) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        // POSIX output: a header, then one line whose fourth column is the
+        // available space in 1024-byte blocks.
+        let output = std::process::Command::new("df")
+            .arg("-Pk")
+            .arg(dir)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8(output.stdout).ok()?;
+        let line = text.lines().nth(1)?;
+        // Counted from the end: the first column, a device name, may hold
+        // spaces. The last is the mount point, which may too, so the
+        // columns are found between them.
+        let numbers: Vec<u64> = line
+            .split_whitespace()
+            .skip(1)
+            .map_while(|column| column.trim_end_matches('%').parse().ok())
+            .collect();
+        numbers.get(2)?.checked_mul(1024)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        None
+    }
+}
+
+/// Reports what the next start of this version of the server would do to
+/// the database in `data_dir`: nothing, a migration with its backup, or a
+/// refusal because the database is newer. Read-only; it works beside a
+/// running server and on a directory any version wrote.
+pub fn upgrade_check(data_dir: &Path) -> Result<UpgradeCheck> {
+    let (schema_version, last_started_by) = read_schema(data_dir)?;
+    let action = match schema_version {
+        SCHEMA_VERSION => UpgradeAction::None,
+        // A file SQLite has not written a schema to yet.
+        0 => UpgradeAction::None,
+        older if (1..SCHEMA_VERSION).contains(&older) => UpgradeAction::Migrate {
+            from: older,
+            to: SCHEMA_VERSION,
+        },
+        _ => UpgradeAction::Refuse,
+    };
+    let size = |name: String| std::fs::metadata(data_dir.join(name)).map_or(0, |found| found.len());
+    let database_bytes = size(DB_FILE_NAME.to_owned()) + size(format!("{DB_FILE_NAME}-wal"));
+    let free_bytes = free_bytes(data_dir);
+    // The copy is never larger than the database; the margin is for the
+    // migration itself, which writes to the log.
+    let needed = database_bytes
+        .saturating_add(database_bytes / 10)
+        .saturating_add(1024 * 1024);
+    Ok(UpgradeCheck {
+        schema_version,
+        supported_schema_version: SCHEMA_VERSION,
+        last_started_by,
+        action,
+        backup_dir: data_dir.to_path_buf(),
+        backup_name: matches!(action, UpgradeAction::Migrate { .. })
+            .then(|| crate::store::backup_pattern(SCHEMA_VERSION)),
+        database_bytes,
+        free_bytes,
+        room_for_backup: free_bytes.map(|free| free >= needed),
+    })
+}
+
+fn backup_files(data_dir: &Path) -> Result<Vec<Backup>> {
+    let unreadable = |error: std::io::Error| {
+        OperatorError::Storage(format!("cannot read {}: {error}", data_dir.display()))
+    };
+    let mut backups = Vec::new();
+    for entry in std::fs::read_dir(data_dir).map_err(unreadable)? {
+        let entry = entry.map_err(unreadable)?;
+        let Ok(file_name) = entry.file_name().into_string() else {
+            continue;
+        };
+        let Some(rest) = file_name.strip_prefix(BACKUP_PREFIX) else {
+            continue;
+        };
+        // Never a link or a directory: pruning removes what is listed.
+        let Ok(found) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if !found.is_file() {
+            continue;
+        }
+        let modified_ms = found
+            .modified()
+            .ok()
+            .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|since| i64::try_from(since.as_millis()).ok());
+        backups.push(Backup {
+            path: entry.path(),
+            size_bytes: found.len(),
+            modified_at: modified_ms.map(rfc3339_from_ms),
+            age_secs: modified_ms
+                .map(|at| u64::try_from(now_ms().saturating_sub(at) / 1000).unwrap_or(0)),
+            before_schema_version: rest.split('-').next().and_then(|n| n.parse().ok()),
+            file_name,
+        });
+    }
+    backups.sort_by(|a, b| a.file_name.cmp(&b.file_name));
+    Ok(backups)
+}
+
+/// The backups in `data_dir` that servers wrote before migrating its
+/// database, by file name, which is oldest first for one schema version.
+///
+/// A backup is a whole copy of the database from before an upgrade. It
+/// keeps everything the board held then, including the text of messages
+/// that were deleted or edited afterwards, so it should not be kept longer
+/// than it takes to trust the upgrade; see [`prune_backups`].
+pub fn list_backups(data_dir: &Path) -> Result<Vec<Backup>> {
+    database_path(data_dir)?;
+    backup_files(data_dir)
+}
+
+/// Deletes every backup [`list_backups`] finds and returns what it
+/// deleted. The database itself is never touched. Fails on the first file
+/// that cannot be removed, having removed the ones before it.
+pub fn prune_backups(data_dir: &Path) -> Result<Vec<Backup>> {
+    let backups = list_backups(data_dir)?;
+    for backup in &backups {
+        std::fs::remove_file(&backup.path).map_err(|error| {
+            OperatorError::Storage(format!("cannot delete {}: {error}", backup.path.display()))
+        })?;
+    }
+    Ok(backups)
 }

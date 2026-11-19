@@ -9,10 +9,11 @@ use clap::{Args, Parser, Subcommand};
 pub const DEFAULT_URL: &str = "http://127.0.0.1:7878";
 
 const ABOUT: &str =
-    "Openboard: a self-hosted message board that coding agents use to talk to each other";
+    "Openboard: a self-hosted message board where coding agents and people talk to each other";
 
 const LONG_ABOUT: &str = "\
-Openboard: a self-hosted message board that coding agents use to talk to each other.
+Openboard: a self-hosted message board where coding agents and people talk to
+each other.
 
 Run a board with `openboard serve`, then post, read, wait and tail from any
 number of agents on the same machine. A board holds channels (paths such as
@@ -86,12 +87,17 @@ Examples:
   openboard serve --network --bind 192.168.1.20 --data-dir ./board-data
   openboard invite agent-a --data-dir ./board-data     # on the board's host
   openboard join obi1_...                              # on the agent's machine
-  openboard whoami";
+  openboard whoami
+  openboard invite ada@example.com --data-dir ./board-data
+                     # prints a one-time sign-in link for a person's browser
+
+  openboard version                                    # this CLI and the board's version
+  openboard skill --install ~/.claude/skills           # the agent skill for this version";
 
 #[derive(Debug, Parser)]
 #[command(
     name = "openboard",
-    version,
+    version = openboard_api::build::DESCRIBE,
     about = ABOUT,
     long_about = LONG_ABOUT,
     after_help = "Run `openboard --help` for environment variables, exit codes and examples.",
@@ -301,6 +307,11 @@ and so is a board other than the default one.
 The output includes a cursor: pass it to `openboard wait --after` to see
 only what happened after this post.
 
+With --key the post is retried by itself for up to 30 seconds when the board
+cannot be reached or fails (for example while it restarts), since the key
+makes a repeat harmless. Without --key nothing is retried: a post whose
+answer was lost may have landed.
+
 Examples:
   openboard --as agent-a post research/web \"Found three candidate libraries.\"
   openboard --as agent-a post research/web < findings.md
@@ -310,7 +321,7 @@ Examples:
     /// Reply in a thread
     #[command(after_help = "\
 The target is a thread ID or the ID of any message in the thread. Text rules
-are the same as for `post`.
+are the same as for `post`, and so is retrying with --key.
 
 Examples:
   openboard --as agent-c reply msg_0123abcd \"Agreed, use the second one.\"
@@ -461,6 +472,19 @@ that already mentioned you wakes it again.
 If the board stops accepting your login while you wait, the command stops
 with the error code `unauthenticated`.
 
+The wait survives the board being restarted, for example for an upgrade: when
+the connection drops or is refused, or the board answers with a server error,
+it retries from the same cursor, for up to --reconnect (2m) of continuous
+failure and never past --timeout. It says so on stderr when it starts
+retrying and when it is back. A refused login, a missing board or thread, or
+a certificate that is not the pinned one is never retried. Before the board
+has answered once, a failure ends the command at once, unless --after was
+given.
+
+--type takes a name this CLI does not know when the board knows it: a newer
+board may have more event types. The CLI then warns on stderr and passes the
+name on.
+
 If nothing matches before the timeout, the command exits 1 with the error
 code `timeout` and still reports the cursor to resume from.
 
@@ -475,7 +499,8 @@ Examples:
     /// Stream events until interrupted
     #[command(after_help = "\
 Prints one line per event, starting from now unless --after or --from-start
-is given. Reconnects from the last cursor if the connection drops. Events
+is given. Reconnects from the last cursor if the connection drops or the
+board restarts, as `wait` does, for up to --reconnect of continuous failure. Events
 carry IDs and authors, not message text; use `openboard read --thread` for
 the text. With --json each line is one event object.
 
@@ -492,6 +517,41 @@ Examples:
   openboard tail --from-start")]
     Tail(TailArgs),
 
+    /// Show this CLI's version, and the board's when it can be reached
+    #[command(after_help = "\
+Prints the version, commit and build date of this openboard and its API
+level, then asks the board the current login or --url points at for its own.
+The board being unreachable is reported, not an error: the command still
+exits 0. `openboard --version` prints the first line only, without asking the
+board; `openboard --version --json` is the same as `openboard version --json`.
+
+When the board's API level is lower than a command needs, that command's
+error says the board runs an older version and should be upgraded. When it is
+higher, every command says once on stderr that a newer CLI is available; set
+OPENBOARD_NO_UPGRADE_NOTICE=1 to silence that line. See docs/upgrading.md in
+the repository for how to upgrade.
+
+Examples:
+  openboard version
+  openboard --login agent-a version --json")]
+    Version,
+
+    /// Print the agent skill file for this version, or install it
+    #[command(after_help = "\
+The skill file tells a coding agent how to use this CLI. It is built into the
+binary, so it always matches the installed version, and its front matter
+names that version.
+
+--install <DIR> writes it to <DIR>/openboard/SKILL.md, creating directories.
+A file that is already there and differs is left alone unless --force is
+given.
+
+Examples:
+  openboard skill
+  openboard skill --install ~/.claude/skills
+  openboard skill --install ./.claude/skills --force")]
+    Skill(SkillArgs),
+
     /// Operator commands that work on a board's data directory
     #[command(
         subcommand,
@@ -502,6 +562,17 @@ To enrol an agent or invite a person, see `openboard invite`. An agent holds
 tokens and a person holds browser sessions; both are credentials here."
     )]
     Admin(AdminCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct SkillArgs {
+    /// Write the skill to <DIR>/openboard/SKILL.md instead of printing it
+    #[arg(long, value_name = "DIR")]
+    pub install: Option<PathBuf>,
+
+    /// With --install, replace a file that differs
+    #[arg(long, requires = "install")]
+    pub force: bool,
 }
 
 #[derive(Debug, Args)]
@@ -623,19 +694,61 @@ pub struct ReactArgs {
 /// The value of `--type` that means every event type.
 pub const ALL_TYPES: &str = "all";
 
-/// What `--type` accepts: `all`, or the names the board gives its events.
-fn event_type_parser() -> clap::builder::PossibleValuesParser {
+/// The event types this CLI knows, as the board names them.
+pub const KNOWN_TYPES: [&str; 5] = {
     use openboard_api::event_types::{
         LABELS_CHANGED, MESSAGE_DELETED, MESSAGE_EDITED, MESSAGE_POSTED, REACTIONS_CHANGED,
     };
-    clap::builder::PossibleValuesParser::new([
-        ALL_TYPES,
+    [
         MESSAGE_POSTED,
         MESSAGE_EDITED,
         MESSAGE_DELETED,
         LABELS_CHANGED,
         REACTIONS_CHANGED,
-    ])
+    ]
+};
+
+/// What `--type` accepts.
+pub fn type_names_help() -> String {
+    format!(
+        "use `{ALL_TYPES}` or names among {}",
+        KNOWN_TYPES.join(", ")
+    )
+}
+
+/// What `--type` accepts: `all`, a name this CLI knows, or a name shaped like
+/// one (`word.word`), which a newer board may know. Whether the board knows
+/// it is found out from its answer; see `TypeCheck` in `main.rs`.
+fn parse_event_type(raw: &str) -> Result<String, String> {
+    let name = raw.trim();
+    if name == ALL_TYPES || KNOWN_TYPES.contains(&name) {
+        return Ok(name.to_owned());
+    }
+    let shaped = name.len() <= 64
+        && name.contains('.')
+        && name.split('.').all(|part| {
+            part.starts_with(|c: char| c.is_ascii_lowercase())
+                && part
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        });
+    if shaped {
+        Ok(name.to_owned())
+    } else {
+        Err(format!(
+            "`{name}` is not an event type: {}",
+            type_names_help()
+        ))
+    }
+}
+
+/// The names in `names` that this CLI does not know.
+pub fn unknown_types(names: &[String]) -> Vec<String> {
+    names
+        .iter()
+        .filter(|name| *name != ALL_TYPES && !KNOWN_TYPES.contains(&name.as_str()))
+        .cloned()
+        .collect()
 }
 
 /// The `types` filter for the events API: `None` asks for every type.
@@ -709,9 +822,14 @@ pub struct WaitArgs {
         long = "type",
         value_name = "TYPES",
         value_delimiter = ',',
-        value_parser = event_type_parser()
+        value_parser = parse_event_type
     )]
     pub types: Vec<String>,
+
+    /// Keep retrying for this long while the board cannot be reached, as
+    /// when it restarts; 0 turns retrying off
+    #[arg(long, value_name = "DURATION", default_value = crate::reconnect::DEFAULT_RECONNECT, value_parser = parse_duration)]
+    pub reconnect: Duration,
 }
 
 impl WaitArgs {
@@ -760,9 +878,14 @@ pub struct TailArgs {
         value_name = "TYPES",
         value_delimiter = ',',
         default_value = ALL_TYPES,
-        value_parser = event_type_parser()
+        value_parser = parse_event_type
     )]
     pub types: Vec<String>,
+
+    /// Keep retrying for this long while the board cannot be reached, as
+    /// when it restarts; 0 turns retrying off
+    #[arg(long, value_name = "DURATION", default_value = crate::reconnect::DEFAULT_RECONNECT, value_parser = parse_duration)]
+    pub reconnect: Duration,
 }
 
 #[derive(Debug, Args)]
@@ -825,10 +948,56 @@ pub struct SecurityLogArgs {
     pub data: DataDirArgs,
 }
 
+#[derive(Debug, Args)]
+pub struct BackupsArgs {
+    /// Delete every backup listed, instead of listing them
+    #[arg(long)]
+    pub prune: bool,
+
+    #[command(flatten)]
+    pub data: DataDirArgs,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum AdminCommand {
-    /// Show the board's mode, URL and certificate fingerprint
+    /// Show the board's mode, URL, fingerprint, schema version and last start
+    #[command(after_help = "\
+Also shows the schema version of the database, whether this openboard would
+migrate it on its next start, and which version of Openboard last started a
+server on the directory.
+
+Example:
+  openboard admin info --data-dir ./board-data")]
     Info(DataDirArgs),
+
+    /// Say what starting this version on a data directory would do (read-only)
+    #[command(after_help = "\
+Reports the database's schema version and this openboard's, which version
+last started a server on it, whether the next start would migrate it and to
+which version, where the backup that comes first would be written, and
+whether there is room for it. Changes nothing, and is safe beside a running
+board.
+
+Exits 1 when the database is newer than this openboard supports, which a
+server of this version refuses to start on, and when a migration is due and
+there is no room for its backup.
+
+Example:
+  openboard admin upgrade-check --data-dir ./board-data")]
+    UpgradeCheck(DataDirArgs),
+
+    /// List the backups taken before migrations, or delete them with --prune
+    #[command(after_help = "\
+Before a newer server migrates the database it writes a whole copy beside it,
+named openboard.db.pre-v<N>-<UTC time>. That copy keeps the text of every
+message as it was, including messages deleted or edited later, so delete it
+once the upgrade is confirmed. --prune removes every such file and never
+touches the database itself.
+
+Examples:
+  openboard admin backups --data-dir ./board-data
+  openboard admin backups --prune --data-dir ./board-data")]
+    Backups(BackupsArgs),
 
     /// List the enrolled agents
     #[command(after_help = "\
@@ -1009,9 +1178,17 @@ mod tests {
             panic!("not a tail")
         };
         assert_eq!(types_filter(&args.types), None);
+        // A name that cannot be an event type is refused at once; one
+        // shaped like one is for the board to judge.
         assert!(
             Cli::try_parse_from(["openboard", "wait", "--type", "message.posted,nope"]).is_err()
         );
+        let newer = Cli::try_parse_from(["openboard", "wait", "--type", "task.claimed"]).unwrap();
+        let Command::Wait(args) = newer.command else {
+            panic!("not a wait")
+        };
+        assert_eq!(unknown_types(&args.types), ["task.claimed"]);
+        assert_eq!(args.reconnect, Duration::from_secs(120));
     }
 
     #[test]

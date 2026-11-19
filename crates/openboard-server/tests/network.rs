@@ -12,7 +12,7 @@ use openboard_api::auth::{
 };
 use openboard_api::{
     codes, ActorKind, ErrorBody, Event, EventsResponse, Health, PostMessageResponse, Thread,
-    PROFILE_HEADER,
+    API_LEVEL, API_LEVEL_HEADER, PROFILE_HEADER, VERSION_HEADER,
 };
 use openboard_server::operator::{self, log_kinds, InviteOptions, OperatorError};
 use openboard_server::{
@@ -304,6 +304,9 @@ async fn health_is_open_and_every_other_route_needs_a_valid_token() {
         .unwrap();
     assert_eq!(health.status, "ok");
     assert_eq!(health.mode, MODE_NETWORK);
+    assert_eq!(health.version, openboard_api::build::VERSION);
+    assert_eq!(health.api_level, Some(API_LEVEL));
+    assert_eq!(health.commit.as_deref(), openboard_api::build::commit());
 
     let (revoked, credential) = board.enrol("gone").await;
     assert_eq!(board.status(&revoked).await, StatusCode::OK);
@@ -363,6 +366,7 @@ async fn health_is_open_and_every_other_route_needs_a_valid_token() {
         ("DELETE", "/v1/boards/general/channels", None),
     ];
     let mut bodies = Vec::new();
+    let mut header_names = Vec::new();
     for (method, path, body) in &requests {
         for authorization in &authorizations {
             let mut request = board.http.request(method.parse().unwrap(), board.at(path));
@@ -382,6 +386,25 @@ async fn health_is_open_and_every_other_route_needs_a_valid_token() {
                 "Bearer",
                 "{context}"
             );
+            // The version headers are on every refusal, with the same
+            // values, and the refusals carry the same headers.
+            assert_eq!(
+                response.headers().get(VERSION_HEADER).unwrap(),
+                openboard_api::build::VERSION,
+                "{context}"
+            );
+            assert_eq!(
+                response.headers().get(API_LEVEL_HEADER).unwrap(),
+                API_LEVEL.to_string().as_str(),
+                "{context}"
+            );
+            let mut names: Vec<String> = response
+                .headers()
+                .keys()
+                .map(|name| name.as_str().to_owned())
+                .collect();
+            names.sort();
+            header_names.push(names);
             bodies.push(response.bytes().await.unwrap());
         }
     }
@@ -389,6 +412,9 @@ async fn health_is_open_and_every_other_route_needs_a_valid_token() {
     let parsed: ErrorBody = serde_json::from_slice(first).unwrap();
     assert_eq!(parsed.error.code, codes::UNAUTHENTICATED);
     assert!(bodies.iter().all(|body| body == first));
+    for names in &header_names {
+        assert_eq!(names, &header_names[0]);
+    }
 
     // Nothing was created or posted by any of it.
     let (token, _) = board.enrol("reader").await;
@@ -3357,4 +3383,245 @@ async fn an_m1_data_directory_migrates_verifies_and_takes_the_new_features() {
     let dir = board.stop().await;
     assert_eq!(version(&data_dir_of(&dir)), 3);
     assert_eq!(verified(&data_dir_of(&dir)), 6);
+}
+
+// ---------------------------------------------------------------------------
+// Upgrades: backups before migrations, and refusing newer databases
+// ---------------------------------------------------------------------------
+
+fn schema_of(path: &Path) -> i64 {
+    rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap()
+}
+
+/// Opens a data directory with a server of this version, as a start would,
+/// and closes it again.
+async fn start_once(data_dir: &Path) -> Result<(), ServeError> {
+    let mut config = Config::new(data_dir);
+    config.port = 0;
+    openboard_server::bind(config).await.map(drop)
+}
+
+/// Checks a backup the way an operator rolling back would use it: it is
+/// private, it opens at the schema it was taken at, and its event log
+/// verifies. Returns the backup's path.
+fn check_backup(data_dir: &Path, before: i64, events: u64) -> PathBuf {
+    let backups = operator::list_backups(data_dir).unwrap();
+    assert_eq!(backups.len(), 1, "{backups:?}");
+    let backup = &backups[0];
+    assert!(
+        backup.file_name.starts_with("openboard.db.pre-v3-"),
+        "{backup:?}"
+    );
+    assert!(backup.file_name.ends_with('Z'), "{backup:?}");
+    assert_eq!(backup.before_schema_version, Some(3));
+    assert!(backup.size_bytes > 0);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&backup.path)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+    }
+    assert_eq!(schema_of(&backup.path), before);
+    // Verified as a data directory of its own, as it is after a rollback.
+    let copy = TempDir::new().unwrap();
+    std::fs::copy(&backup.path, copy.path().join(DB_FILE_NAME)).unwrap();
+    let report = verify_log(copy.path()).unwrap();
+    assert!(report.is_ok(), "{report:?}");
+    assert_eq!(report.boards[0].verified_events, events);
+    backup.path.clone()
+}
+
+/// The rollback the server prints: move the backup into place, remove the
+/// side files. The old version's offline tools then read it as before.
+fn roll_back(data_dir: &Path, backup: &Path) {
+    std::fs::rename(backup, data_dir.join(DB_FILE_NAME)).unwrap();
+    for side in ["-wal", "-shm"] {
+        let _ = std::fs::remove_file(data_dir.join(format!("{DB_FILE_NAME}{side}")));
+    }
+}
+
+#[tokio::test]
+async fn a_version_2_directory_is_backed_up_before_it_is_migrated() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let dir = TempDir::new().unwrap();
+    let data_dir = data_dir_of(&dir);
+    let (alice, message) = write_m1_directory(&data_dir);
+
+    // The check says what will happen, and changes nothing.
+    let check = operator::upgrade_check(&data_dir).unwrap();
+    assert_eq!(check.schema_version, 2);
+    assert_eq!(
+        check.action,
+        operator::UpgradeAction::Migrate { from: 2, to: 3 }
+    );
+    assert_eq!(
+        check.backup_name.as_deref(),
+        Some("openboard.db.pre-v3-<UTC time>")
+    );
+    assert_eq!(check.backup_dir, data_dir);
+    assert!(check.database_bytes > 0);
+    assert_eq!(check.room_for_backup, Some(true));
+    assert_eq!(check.last_started_by, None);
+    assert!(operator::list_backups(&data_dir).unwrap().is_empty());
+    assert_eq!(schema_of(&data_dir.join(DB_FILE_NAME)), 2);
+
+    start_once(&data_dir).await.unwrap();
+    assert_eq!(schema_of(&data_dir.join(DB_FILE_NAME)), 3);
+    let backup = check_backup(&data_dir, 2, 1);
+    // The backup holds the board as it was.
+    let text: String = rusqlite::Connection::open(&backup)
+        .unwrap()
+        .query_row(
+            "SELECT text FROM messages WHERE id = ?1",
+            [message],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(text, "an M1 thread, cc @alice");
+    // The start was recorded, and the next one needs no migration and
+    // writes no backup.
+    let check = operator::upgrade_check(&data_dir).unwrap();
+    assert_eq!(check.action, operator::UpgradeAction::None);
+    assert_eq!(check.backup_name, None);
+    let by = check.last_started_by.unwrap();
+    assert_eq!(by.version, openboard_api::build::VERSION);
+    assert_eq!(by.commit.as_deref(), openboard_api::build::commit());
+    start_once(&data_dir).await.unwrap();
+    assert_eq!(operator::list_backups(&data_dir).unwrap().len(), 1);
+
+    // Rolled back, the directory is the version 2 one again: the old
+    // version's tools read it, and the credential still works there.
+    roll_back(&data_dir, &backup);
+    assert_eq!(schema_of(&data_dir.join(DB_FILE_NAME)), 2);
+    assert_eq!(verified(&data_dir), 1);
+    assert_eq!(operator::list_credentials(&data_dir).unwrap().len(), 1);
+    // Upgraded again, it is backed up again, and the board works.
+    let board = Net::start_in(dir, |_| {}).await;
+    assert_eq!(board.status(&alice).await, StatusCode::OK);
+    assert_eq!(operator::list_backups(&board.data_dir()).unwrap().len(), 1);
+    let pruned = operator::prune_backups(&board.data_dir()).unwrap();
+    assert_eq!(pruned.len(), 1);
+    assert!(!pruned[0].path.exists());
+    assert!(operator::list_backups(&board.data_dir())
+        .unwrap()
+        .is_empty());
+    assert_eq!(board.read(&alice, message).await.root.id, message);
+    board.stop().await;
+}
+
+#[tokio::test]
+async fn a_version_1_directory_is_backed_up_before_it_is_migrated() {
+    let dir = TempDir::new().unwrap();
+    let data_dir = data_dir_of(&dir);
+    write_m0_directory(&data_dir);
+    let check = operator::upgrade_check(&data_dir).unwrap();
+    assert_eq!(
+        check.action,
+        operator::UpgradeAction::Migrate { from: 1, to: 3 }
+    );
+    start_once(&data_dir).await.unwrap();
+    assert_eq!(schema_of(&data_dir.join(DB_FILE_NAME)), 3);
+    assert_eq!(verified(&data_dir), 2);
+    let backup = check_backup(&data_dir, 1, 2);
+    roll_back(&data_dir, &backup);
+    assert_eq!(schema_of(&data_dir.join(DB_FILE_NAME)), 1);
+    assert_eq!(verified(&data_dir), 2);
+    assert_eq!(operator::board_info(&data_dir).unwrap().mode, Mode::Local);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_read_only_data_directory_refuses_to_migrate_and_is_left_alone() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new().unwrap();
+    let data_dir = data_dir_of(&dir);
+    write_m1_directory(&data_dir);
+    // A connection held open keeps the write-ahead log's side files, so
+    // that the database can still be read once the directory cannot be
+    // written; and the lock file is there already.
+    let holder = open_db(&data_dir);
+    holder
+        .query_row("SELECT count(*) FROM messages", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap();
+    std::fs::write(data_dir.join(openboard_server::LOCK_FILE_NAME), b"").unwrap();
+    let before = std::fs::read(data_dir.join(DB_FILE_NAME)).unwrap();
+    let listing = |dir: &Path| {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    };
+    let files = listing(&data_dir);
+    std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    // Someone who can write anyway (root) cannot run this test.
+    let probe = data_dir.join("probe");
+    if std::fs::write(&probe, b"").is_ok() {
+        let _ = std::fs::remove_file(&probe);
+        std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        eprintln!("skipped: the directory is writable whatever its mode");
+        return;
+    }
+
+    let error = start_once(&data_dir).await.unwrap_err().to_string();
+    std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    for needle in [
+        "schema version 2",
+        "migrated to version 3",
+        "backup",
+        "Nothing was changed",
+        "upgrade-check",
+    ] {
+        assert!(error.contains(needle), "{needle}: {error}");
+    }
+    drop(holder);
+    assert_eq!(schema_of(&data_dir.join(DB_FILE_NAME)), 2);
+    assert_eq!(std::fs::read(data_dir.join(DB_FILE_NAME)).unwrap(), before);
+    assert_eq!(listing(&data_dir), files);
+    assert!(operator::list_backups(&data_dir).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_newer_database_is_refused_with_who_wrote_it_and_what_to_do() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let board = Net::start().await;
+    let dir = board.stop().await;
+    let data_dir = data_dir_of(&dir);
+    // As a later version would leave it.
+    {
+        let conn = open_db(&data_dir);
+        conn.execute_batch(
+            "UPDATE meta SET value = '9.9.9' WHERE key = 'last_started_version';
+             UPDATE meta SET value = 'abcdef012345' WHERE key = 'last_started_commit';
+             PRAGMA user_version = 99;",
+        )
+        .unwrap();
+    }
+    let error = start_once(&data_dir).await.unwrap_err().to_string();
+    for needle in [
+        "schema version 99",
+        "newer than this version of Openboard",
+        "last started by Openboard 9.9.9 (abcdef012345)",
+        "install Openboard 9.9.9 or newer",
+        "restore a backup",
+        "openboard admin backups",
+    ] {
+        assert!(error.contains(needle), "{needle}: {error}");
+    }
+    assert_eq!(schema_of(&data_dir.join(DB_FILE_NAME)), 99);
+    // The check reads it and says the same; operator commands refuse it.
+    let check = operator::upgrade_check(&data_dir).unwrap();
+    assert_eq!(check.action, operator::UpgradeAction::Refuse);
+    assert_eq!(check.last_started_by.unwrap().version, "9.9.9");
+    let refused = operator::board_info(&data_dir).unwrap_err().to_string();
+    assert!(refused.contains("9.9.9"), "{refused}");
 }

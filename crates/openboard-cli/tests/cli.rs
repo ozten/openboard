@@ -1597,10 +1597,17 @@ fn usage_errors_exit_2() {
 
 #[test]
 fn help_and_version_document_the_contract() {
+    // One line: the version, then the commit and the build date.
     let version = run(openboard().arg("--version")).ok();
     assert_eq!(
         version.stdout,
-        format!("openboard {}\n", env!("CARGO_PKG_VERSION"))
+        format!("openboard {}\n", openboard_api::build::DESCRIBE)
+    );
+    assert!(
+        version
+            .stdout
+            .starts_with(&format!("openboard {} (", env!("CARGO_PKG_VERSION"))),
+        "{version:?}"
     );
     let help = run(openboard().arg("--help")).ok();
     for needle in [

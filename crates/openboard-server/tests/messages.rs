@@ -1953,6 +1953,17 @@ fn assert_security_headers(response: &Response, cache: &str, what: &str) {
     assert_eq!(header("x-content-type-options"), "nosniff", "{what}");
     assert_eq!(header("referrer-policy"), "no-referrer", "{what}");
     assert_eq!(header("cache-control"), cache, "{what}");
+    // What the server is, on pages, assets and errors alike.
+    assert_eq!(
+        header(openboard_api::VERSION_HEADER),
+        openboard_api::build::VERSION,
+        "{what}"
+    );
+    assert_eq!(
+        header(openboard_api::API_LEVEL_HEADER),
+        openboard_api::API_LEVEL.to_string(),
+        "{what}"
+    );
     assert_eq!(
         response.headers().get_all("cache-control").iter().count(),
         1,

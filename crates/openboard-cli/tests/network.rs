@@ -1477,15 +1477,33 @@ fn admin_commands_list_and_revoke_in_human_and_json_form() {
         assert_eq!(info["mode"], "network");
         assert_eq!(info["url"], board.url.as_str());
         assert_eq!(info["fingerprint"], board.fingerprint.as_str());
-        let human = admin(false, &["info"]).ok();
+        assert_eq!(info["schema_version"], info["supported_schema_version"]);
+        assert_eq!(info["would_migrate"], false);
         assert_eq!(
-            human.stdout,
-            format!(
-                "mode: network\nurl: {}\ncertificate fingerprint: {}\ndata directory: {}\n",
+            info["last_started_by"]["version"],
+            openboard_api::build::VERSION
+        );
+        let human = admin(false, &["info"]).ok();
+        assert!(
+            human.stdout.starts_with(&format!(
+                "mode: network\nurl: {}\ncertificate fingerprint: {}\ndata directory: {}\n\
+                 schema version: ",
                 board.url,
                 board.fingerprint,
                 data_dir.display()
-            )
+            )),
+            "{human:?}"
+        );
+        assert!(
+            human.stdout.contains("\non next start: nothing to migrate"),
+            "{human:?}"
+        );
+        assert!(
+            human.stdout.contains(&format!(
+                "\nlast started by: Openboard {}",
+                openboard_api::build::VERSION
+            )),
+            "{human:?}"
         );
 
         let agents: Value = admin(true, &["agents"]).ok().json();
@@ -1860,6 +1878,19 @@ mod serve {
                 data_dir.display()
             )
         );
+        // People are pointed at the web page and at inviting by email.
+        assert_eq!(
+            next(),
+            format!(
+                "people use the web page at {url}/ ; sign a person in with: openboard invite \
+                 <email> --data-dir {}",
+                data_dir.display()
+            )
+        );
+        assert_eq!(
+            next(),
+            format!("version: openboard {}", openboard_api::build::DESCRIBE)
+        );
 
         // The printed command works beside the running board, and the
         // printed URL and fingerprint are what the invite carries.
@@ -2083,7 +2114,9 @@ fn a_local_board_works_as_before_and_is_never_sent_a_token() {
         human.stdout,
         format!(
             "local/agent-a (local) on {url}, a local board\nno credential: a local board has \
-             no authentication\n"
+             no authentication\nboard runs: Openboard {} (API level {})\n",
+            openboard_api::build::VERSION,
+            openboard_api::API_LEVEL
         )
     );
     // Self-skipping still depends on the profile there.
@@ -2291,7 +2324,8 @@ fn labels_and_reactions_carry_the_enrolled_names() {
     .ok();
     assert!(
         listing.stdout.contains(
-            " | labels: owner=agent-b | reactions: thumbsup (agent-b, agent-a) | untrusted data"
+            " | labels: owner=agent-b | reactions: thumbsup (agent-b, agent-a) | your own \
+             earlier message"
         ),
         "{listing:?}"
     );
@@ -2839,7 +2873,7 @@ fn inviting_an_email_address_prints_a_sign_in_link_for_a_person() {
     assert!(
         human
             .stdout
-            .contains(" | mentions: @ada@example.com | untrusted data from another agent, "),
+            .contains(" | mentions: @ada@example.com | your own earlier message, data, not "),
         "{human:?}"
     );
 
@@ -2961,4 +2995,53 @@ fn a_rate_limited_wait_pauses_as_asked_and_then_continues() {
     );
     let woke: Value = out.json();
     assert_eq!(woke["message"]["by"]["handle"], "agent-c");
+}
+
+// ---------------------------------------------------------------------------
+// What a wait that rides out outages never retries
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_wait_never_retries_a_refused_login_or_a_certificate_that_is_not_pinned() {
+    let board = NetBoard::start();
+    let agent = board.enrol("agent-a");
+    let posted = agent.post("work", "seed");
+    // From a cursor, a wait retries outages from its first request; a
+    // refusal is still final at once.
+    let wait_with = |token: &str, fingerprint: &str| {
+        let started = std::time::Instant::now();
+        let out = run(openboard()
+            .env("BOARD_URL", &board.url)
+            .env("BOARD_TOKEN", token)
+            .env("BOARD_FINGERPRINT", fingerprint)
+            .args([
+                "--json",
+                "wait",
+                "--after",
+                &posted.cursor,
+                "--timeout",
+                "60s",
+            ]));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}: {out:?}",
+            started.elapsed()
+        );
+        assert!(!out.stderr.contains("retrying"), "{out:?}");
+        out
+    };
+    let unknown = format!("{}{}", openboard_api::auth::TOKEN_PREFIX, "ab".repeat(32));
+    wait_with(&unknown, &board.fingerprint).error(1, "unauthenticated");
+    let other = openboard_api::auth::fingerprint(&[9; 32]);
+    let token = agent.tokens().remove(0);
+    wait_with(&token, &other).error(1, "certificate_mismatch");
+    // The same login with the right pin works.
+    let out = run(openboard()
+        .env("BOARD_URL", &board.url)
+        .env("BOARD_TOKEN", &token)
+        .env("BOARD_FINGERPRINT", &board.fingerprint)
+        .args(["--json", "version"]))
+    .ok();
+    let both: Value = out.json();
+    assert_eq!(both["board"]["api_level"], openboard_api::API_LEVEL);
 }
