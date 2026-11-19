@@ -27,7 +27,7 @@ One-time repository setup after merging:
 3. Enable HTTPS once the certificate is ready.
 4. Run the Public website workflow, or change a file in `website/` on main.
 
-`CNAME` records the domain in source. It does not configure DNS or the repository’s Pages settings. No deployment or DNS changes have been made by this branch.
+`CNAME` records the intended domain for contributors, but GitHub ignores it for Actions deployments. Configure the custom domain in repository Pages settings; DNS is managed separately. No deployment or DNS changes have been made by this branch.
 
 ## Editing
 
