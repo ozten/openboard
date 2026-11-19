@@ -1,4 +1,5 @@
-//! Operator functions: enrolment, revocation and the security log.
+//! Operator functions: enrolment, sign-in links, revocation and the
+//! security log.
 //!
 //! These act on a board's data directory, on the board's own host. There is
 //! no network API for any of them, so only someone who can already read and
@@ -14,9 +15,18 @@
 //!
 //! They block on disk I/O. Call them from a blocking context.
 //!
-//! Nothing returned here holds a secret, with one exception:
-//! [`CreatedInvite::invite`] carries the new enrolment code, which exists
-//! nowhere else and cannot be read back.
+//! Agents and people are both principals. An agent is invited by name and
+//! enrols with a token; a person is invited by email address and signs in
+//! from a browser, which gives them a session. Tokens and sessions are both
+//! credentials: [`list_credentials`], [`revoke_credential`] and
+//! [`revoke_principal`] treat them alike, and [`CredentialInfo::kind`] says
+//! which is which, since only a person holds sessions. [`invite`] takes
+//! either kind of name.
+//!
+//! Nothing returned here holds a secret, with two exceptions that exist
+//! nowhere else and cannot be read back: [`CreatedInvite::invite`] carries
+//! a new enrolment code, and [`PersonInvite::link`] and
+//! [`PersonInvite::code`] a new sign-in code.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -25,10 +35,11 @@ use std::time::Duration;
 use openboard_api::auth::{
     CredentialInfo, Invite, DEFAULT_INVITE_TTL_SECS, DEFAULT_TOKEN_TTL_SECS,
 };
+use openboard_api::web::{sign_in_link, DEFAULT_SESSION_TTL_SECS};
 use openboard_api::ActorKind;
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 
-use crate::identity::{self, LogEntry};
+use crate::identity::{self, InviteKind, LogEntry};
 use crate::names;
 use crate::store::{DB_FILE_NAME, OLDEST_IDENTITY_SCHEMA, SCHEMA_VERSION};
 use crate::time::{now_ms, rfc3339_from_ms};
@@ -44,7 +55,8 @@ pub enum OperatorError {
     /// The data directory is not a network board, or no server has started
     /// on it in network mode yet, so it has no certificate to pin.
     NotNetwork,
-    /// The name breaks the naming rules or is reserved. Holds the reason.
+    /// The name breaks the naming rules or is reserved, or the email
+    /// address is not one the board accepts. Holds the reason.
     InvalidName(&'static str),
     /// The board URL is not usable in an invite. Holds the reason.
     InvalidUrl(&'static str),
@@ -69,7 +81,7 @@ impl fmt::Display for OperatorError {
             OperatorError::InvalidName(reason) => write!(f, "invalid name: {reason}"),
             OperatorError::InvalidUrl(reason) => write!(f, "invalid board URL: {reason}"),
             OperatorError::NoSuchCredential(id) => write!(f, "no credential has the ID {id}"),
-            OperatorError::NoSuchPrincipal(name) => write!(f, "no agent is named {name}"),
+            OperatorError::NoSuchPrincipal(name) => write!(f, "no agent or person is named {name}"),
             OperatorError::Storage(detail) => {
                 write!(f, "cannot use the board database: {detail}")
             }
@@ -98,30 +110,69 @@ pub struct BoardInfo {
     pub fingerprint: Option<String>,
 }
 
-/// Options of [`create_invite`].
+/// Options of [`invite`], [`create_invite`] and [`create_person_invite`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InviteOptions {
-    /// How long the invite can be used, in seconds.
+    /// How long the invite or sign-in link can be used, in seconds.
     pub ttl_secs: u64,
-    /// Lifetime of the token the invite turns into, in seconds, counted
-    /// from enrolment.
-    pub token_ttl_secs: u64,
-    /// The board URL to put in the invite, for when clients reach the board
-    /// by another address than the one the server recorded. Must start with
-    /// `https://`.
+    /// Lifetime of the credential the invite turns into, in seconds,
+    /// counted from enrolment or sign-in: an agent's token or a person's
+    /// browser session. `None` is the default for the kind:
+    /// [`DEFAULT_TOKEN_TTL_SECS`] for a token and
+    /// [`DEFAULT_SESSION_TTL_SECS`] for a session.
+    pub token_ttl_secs: Option<u64>,
+    /// The board URL to put in the invite or the sign-in link, for when
+    /// clients reach the board by another address than the one the server
+    /// recorded. Must start with `https://`.
     pub url: Option<String>,
 }
 
 impl Default for InviteOptions {
-    /// [`DEFAULT_INVITE_TTL_SECS`], [`DEFAULT_TOKEN_TTL_SECS`] and the
-    /// recorded URL.
+    /// [`DEFAULT_INVITE_TTL_SECS`], the default credential lifetime of the
+    /// kind, and the recorded URL.
     fn default() -> Self {
         Self {
             ttl_secs: DEFAULT_INVITE_TTL_SECS,
-            token_ttl_secs: DEFAULT_TOKEN_TTL_SECS,
+            token_ttl_secs: None,
             url: None,
         }
     }
+}
+
+/// The result of [`invite`]: what to hand to the agent or the person.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Invited {
+    /// The name was an agent's. See [`create_invite`].
+    Agent(CreatedInvite),
+    /// The name was an email address. See [`create_person_invite`].
+    Person(PersonInvite),
+}
+
+/// The result of [`create_person_invite`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersonInvite {
+    /// The one-time sign-in link to hand to the person, as
+    /// `openboard_api::web::sign_in_link` builds it: the board's URL, the
+    /// sign-in page, and the code as the fragment. A secret until used or
+    /// expired.
+    pub link: String,
+    /// The code in the link's fragment. A secret until used or expired.
+    pub code: String,
+    /// The board URL the link points to.
+    pub url: String,
+    /// Non-secret ID of the invite, as [`PendingInvite::id`] lists it.
+    pub id: String,
+    /// The person's handle as the board records it: the email address,
+    /// lowercased.
+    pub principal: String,
+    /// True when this invite created the person, false when it lets a
+    /// known person sign in once more, for example from a second browser.
+    pub new_principal: bool,
+    /// When the link stops working. RFC 3339 timestamp in UTC.
+    pub expires_at: String,
+    /// Lifetime of the browser session the link turns into, in seconds,
+    /// counted from sign-in.
+    pub session_ttl_secs: u64,
 }
 
 /// The result of [`create_invite`].
@@ -140,26 +191,34 @@ pub struct CreatedInvite {
     pub expires_at: String,
 }
 
-/// An agent known to the board.
+/// An agent or a person known to the board.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrincipalInfo {
     pub id: String,
+    /// An agent's name, or a person's email address, lowercased.
     pub handle: String,
+    /// [`ActorKind::Person`] for a person, [`ActorKind::Agent`] for an
+    /// agent.
     pub kind: ActorKind,
     /// RFC 3339 timestamp in UTC.
     pub created_at: String,
-    /// Credentials that are neither revoked nor expired.
+    /// Credentials that are neither revoked nor expired: an agent's tokens,
+    /// a person's browser sessions.
     pub active_credentials: u64,
-    /// Invites that can still be used.
+    /// Invites, or for a person sign-in links, that can still be used.
     pub pending_invites: u64,
 }
 
-/// An invite that can still be used. Never holds its code.
+/// An invite or a sign-in link that can still be used. Never holds its
+/// code.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingInvite {
     pub id: String,
     /// Handle of the principal the invite enrols.
     pub principal: String,
+    /// [`ActorKind::Person`] for a person's sign-in link,
+    /// [`ActorKind::Agent`] for an agent's invite.
+    pub kind: ActorKind,
     /// RFC 3339 timestamps in UTC.
     pub created_at: String,
     pub expires_at: String,
@@ -285,31 +344,21 @@ pub fn board_info(data_dir: &Path) -> Result<BoardInfo> {
 /// `anonymous` are reserved.
 ///
 /// Fails with [`OperatorError::NotNetwork`] until a server has started on
-/// the directory in network mode.
+/// the directory in network mode, and with [`OperatorError::InvalidName`]
+/// for an email address: a person is invited with
+/// [`create_person_invite`], or with [`invite`], which takes either.
 pub fn create_invite(
     data_dir: &Path,
     name: &str,
     options: &InviteOptions,
 ) -> Result<CreatedInvite> {
     names::validate_handle(name).map_err(OperatorError::InvalidName)?;
-    let url_override = match &options.url {
-        None => None,
-        Some(url) => Some(crate::normalize_public_url(url).map_err(OperatorError::InvalidUrl)?),
-    };
-    let (mut conn, recorded_url, fingerprint) = open_network(data_dir)?;
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let created = identity::create_invite(
-        &tx,
-        name,
-        ttl_ms(options.ttl_secs),
-        ttl_ms(options.token_ttl_secs),
-        now_ms(),
-    )
-    .map_err(OperatorError::Storage)?;
-    tx.commit()?;
+    let token_ttl = options.token_ttl_secs.unwrap_or(DEFAULT_TOKEN_TTL_SECS);
+    let (created, url, fingerprint) =
+        new_invite(data_dir, name, InviteKind::Agent, options, token_ttl)?;
     Ok(CreatedInvite {
         invite: Invite {
-            url: url_override.unwrap_or(recorded_url),
+            url,
             fingerprint,
             code: created.code,
         },
@@ -320,6 +369,93 @@ pub fn create_invite(
     })
 }
 
+/// Creates a single-use sign-in link for the person with the email address
+/// `email`.
+///
+/// A new address creates the person, a principal of kind
+/// [`ActorKind::Person`] whose handle is the address lowercased. A known
+/// address gets one more link for the same person: for a second browser,
+/// or after a link or a session has expired. No email is sent; handing the
+/// link over is the verification.
+///
+/// The address is checked loosely. It is at most 254 bytes of ASCII
+/// letters, digits and `.`, `_`, `+`, `-` around exactly one `@`, and each
+/// of those marks stands between two letters or digits, so that the handle
+/// can always be mentioned as `@` and the address.
+///
+/// The link works once, at the board's sign-in page, for
+/// [`InviteOptions::ttl_secs`]. The browser session it turns into lasts
+/// [`InviteOptions::token_ttl_secs`], or
+/// [`DEFAULT_SESSION_TTL_SECS`] when that is `None`.
+///
+/// Fails with [`OperatorError::NotNetwork`] until a server has started on
+/// the directory in network mode: a local board needs no sign-in.
+pub fn create_person_invite(
+    data_dir: &Path,
+    email: &str,
+    options: &InviteOptions,
+) -> Result<PersonInvite> {
+    let handle = names::validate_email(email).map_err(OperatorError::InvalidName)?;
+    let session_ttl_secs = options.token_ttl_secs.unwrap_or(DEFAULT_SESSION_TTL_SECS);
+    let (created, url, _fingerprint) = new_invite(
+        data_dir,
+        &handle,
+        InviteKind::Person,
+        options,
+        session_ttl_secs,
+    )?;
+    Ok(PersonInvite {
+        link: sign_in_link(&url, &created.code),
+        code: created.code,
+        url,
+        id: created.row.id,
+        principal: created.row.handle,
+        new_principal: created.new_principal,
+        expires_at: rfc3339_from_ms(created.row.expires_ms),
+        session_ttl_secs,
+    })
+}
+
+/// Invites an agent or a person, whichever `name` is: a name that contains
+/// `@` is a person's email address and gets a sign-in link from
+/// [`create_person_invite`], and any other name is an agent's and gets an
+/// invite from [`create_invite`].
+pub fn invite(data_dir: &Path, name: &str, options: &InviteOptions) -> Result<Invited> {
+    if name.contains('@') {
+        create_person_invite(data_dir, name, options).map(Invited::Person)
+    } else {
+        create_invite(data_dir, name, options).map(Invited::Agent)
+    }
+}
+
+/// Writes the invite. Returns it with the board URL it is for and the
+/// board's fingerprint.
+fn new_invite(
+    data_dir: &Path,
+    name: &str,
+    kind: InviteKind,
+    options: &InviteOptions,
+    credential_ttl_secs: u64,
+) -> Result<(identity::NewInvite, String, String)> {
+    let url_override = match &options.url {
+        None => None,
+        Some(url) => Some(crate::normalize_public_url(url).map_err(OperatorError::InvalidUrl)?),
+    };
+    let (mut conn, recorded_url, fingerprint) = open_network(data_dir)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let created = identity::create_invite(
+        &tx,
+        name,
+        kind,
+        ttl_ms(options.ttl_secs),
+        ttl_ms(credential_ttl_secs),
+        now_ms(),
+    )
+    .map_err(OperatorError::Storage)?;
+    tx.commit()?;
+    Ok((created, url_override.unwrap_or(recorded_url), fingerprint))
+}
+
 fn ttl_ms(secs: u64) -> i64 {
     // Capped at a thousand years, far below where adding it to the clock
     // could overflow.
@@ -327,7 +463,24 @@ fn ttl_ms(secs: u64) -> i64 {
     (secs.min(MAX_SECS) * 1000) as i64
 }
 
-/// Every principal, oldest first. Empty on a local board.
+/// Every person, oldest first: the principals of kind
+/// [`ActorKind::Person`]. Empty on a local board.
+pub fn list_people(data_dir: &Path) -> Result<Vec<PrincipalInfo>> {
+    let mut principals = list_principals(data_dir)?;
+    principals.retain(|principal| principal.kind == ActorKind::Person);
+    Ok(principals)
+}
+
+/// Every agent, oldest first: the principals that are not people. Empty on
+/// a local board.
+pub fn list_agents(data_dir: &Path) -> Result<Vec<PrincipalInfo>> {
+    let mut principals = list_principals(data_dir)?;
+    principals.retain(|principal| principal.kind != ActorKind::Person);
+    Ok(principals)
+}
+
+/// Every principal, agents and people alike, oldest first. Empty on a local
+/// board. See [`list_agents`] and [`list_people`].
 pub fn list_principals(data_dir: &Path) -> Result<Vec<PrincipalInfo>> {
     let (conn, schema) = open(data_dir, false)?;
     if matches!(schema, Schema::Old) {
@@ -346,8 +499,10 @@ pub fn list_principals(data_dir: &Path) -> Result<Vec<PrincipalInfo>> {
         .collect())
 }
 
-/// Every credential, oldest first, including revoked and expired ones.
-/// Empty on a local board.
+/// Every credential, oldest first, including revoked and expired ones:
+/// agents' tokens and people's browser sessions. A credential whose
+/// [`CredentialInfo::kind`] is [`ActorKind::Person`] is a session. Empty on
+/// a local board.
 pub fn list_credentials(data_dir: &Path) -> Result<Vec<CredentialInfo>> {
     let (conn, schema) = open(data_dir, false)?;
     if matches!(schema, Schema::Old) {
@@ -359,7 +514,8 @@ pub fn list_credentials(data_dir: &Path) -> Result<Vec<CredentialInfo>> {
         .collect())
 }
 
-/// Invites that can still be used, oldest first. Empty on a local board.
+/// Invites and sign-in links that can still be used, oldest first. Empty on
+/// a local board.
 pub fn list_invites(data_dir: &Path) -> Result<Vec<PendingInvite>> {
     let (conn, schema) = open(data_dir, false)?;
     if matches!(schema, Schema::Old) {
@@ -370,14 +526,15 @@ pub fn list_invites(data_dir: &Path) -> Result<Vec<PendingInvite>> {
         .map(|row| PendingInvite {
             id: row.id,
             principal: row.handle,
+            kind: row.kind,
             created_at: rfc3339_from_ms(row.created_ms),
             expires_at: rfc3339_from_ms(row.expires_ms),
         })
         .collect())
 }
 
-/// Revokes one credential by its ID. Revoking a credential that is already
-/// revoked succeeds and changes nothing.
+/// Revokes one credential by its ID: a token or a browser session. Revoking
+/// a credential that is already revoked succeeds and changes nothing.
 pub fn revoke_credential(data_dir: &Path, credential_id: &str) -> Result<Revoked> {
     let (mut conn, _, _) = open_network(data_dir)?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -409,9 +566,10 @@ pub fn revoke_credential(data_dir: &Path, credential_id: &str) -> Result<Revoked
     })
 }
 
-/// Revokes every credential of the principal `name` and withdraws its
-/// pending invites. The principal keeps its handle, and a later
-/// [`create_invite`] for the same name enrols it again.
+/// Revokes every credential of the principal `name`, an agent's name or a
+/// person's email address in any case, and withdraws its pending invites
+/// and sign-in links. The principal keeps its handle, and a later
+/// [`invite`] for the same name enrols it again.
 pub fn revoke_principal(data_dir: &Path, name: &str) -> Result<Revoked> {
     let (mut conn, _, _) = open_network(data_dir)?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;

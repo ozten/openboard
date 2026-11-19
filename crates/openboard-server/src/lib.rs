@@ -7,8 +7,13 @@
 //!   that is refused unless it binds to loopback.
 //! - **Network**: TLS 1.3 on every listener, loopback included, with a
 //!   self-signed certificate that clients pin by fingerprint, and a bearer
-//!   token on every request except the health check, enrolment and the web
-//!   UI's static files. See `openboard_api::auth` for the contract.
+//!   token or a browser session cookie on every request except the health
+//!   check, enrolment, sign-in and the web UI's static files. See
+//!   `openboard_api::auth` and `openboard_api::web` for the contract.
+//!
+//! In both modes a write that names an `Origin` other than the address it
+//! was sent to is refused, and a write made with a session cookie needs the
+//! session's anti-CSRF token as well.
 //!
 //! In both modes the server also serves the web UI's page and its assets,
 //! which are compiled into the binary from this crate's `web/` directory
@@ -26,7 +31,8 @@
 //!
 //! The server makes no outbound network calls and writes nothing but
 //! start-up and failure lines to stderr. Logs never contain message text,
-//! tokens, enrolment codes or their hashes.
+//! tokens, session cookie values, enrolment or sign-in codes, or their
+//! hashes.
 //!
 //! # Running a board
 //!
@@ -55,10 +61,12 @@
 //! # }
 //! ```
 //!
-//! # Enrolling agents
+//! # Enrolling agents and people
 //!
-//! Agents are invited, listed and revoked with the functions in
+//! Agents and people are invited, listed and revoked with the functions in
 //! [`operator`], which act on the data directory and have no network API.
+//! An agent enrols with an invite and gets a token; a person opens a
+//! one-time sign-in link in a browser and gets a session.
 //!
 //! # Data directory
 //!

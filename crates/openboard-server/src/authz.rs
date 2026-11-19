@@ -9,7 +9,8 @@
 //! [`LocalPolicy`] allows everything it is asked. A network board
 //! authenticates every caller first and then asks [`NetworkPolicy`], which
 //! until milestone M4 allows every enrolled principal everything: access is
-//! open among the agents the operator has invited. Later milestones replace
+//! open among the agents and people the operator has invited. A person
+//! signed in from a browser is a principal like an agent. Later milestones replace
 //! the [`Policy`], not the call sites.
 
 use std::sync::Arc;
@@ -42,9 +43,10 @@ impl Principal {
     }
 
     /// A caller the server has not authenticated. A network board uses it
-    /// for the routes that take no token, the health check, enrolment and
-    /// the web UI's static files, and for nothing else. It never writes anything, and no
-    /// agent can be given its handle.
+    /// for the routes that take no token, the health check, enrolment,
+    /// sign-in and the web UI's static files, and for nothing else. It
+    /// never writes anything, and no agent or person can be given its
+    /// handle.
     pub fn anonymous() -> Self {
         Self {
             id: ANONYMOUS_ID.to_owned(),
@@ -101,9 +103,13 @@ pub enum Action {
     /// Swap an enrolment code for a token. Carries no board. The caller is
     /// not authenticated yet; the code is what is checked.
     Enrol,
-    /// Read or end the caller's own session: `whoami` and `logout`. Carries
-    /// no board.
+    /// Read or end the caller's own session: `whoami`, the web UI's session
+    /// description and `logout`. Carries no board.
     Session,
+    /// Swap a person's sign-in code for a browser session. Carries no
+    /// board. The caller is not authenticated yet; the code is what is
+    /// checked.
+    SignIn,
     /// Replace the text of a message. The policy decides whether the caller
     /// may edit in the channel at all; that only the message's own author
     /// may do it is a fixed rule the server applies on top.
@@ -170,7 +176,7 @@ impl Policy for LocalPolicy {
 
 /// The network policy until milestone M4: every authenticated principal may
 /// do everything, and an unauthenticated caller may only check health,
-/// enrol and fetch the web UI's static files.
+/// enrol, sign in and fetch the web UI's static files.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NetworkPolicy;
 
@@ -183,7 +189,10 @@ impl Policy for NetworkPolicy {
         _channel: Option<&str>,
     ) -> Decision {
         let allowed = if principal.is_anonymous() {
-            matches!(action, Action::Health | Action::Enrol | Action::Page)
+            matches!(
+                action,
+                Action::Health | Action::Enrol | Action::SignIn | Action::Page
+            )
         } else {
             // The local principal does not exist on a network board.
             principal.kind != ActorKind::Local
@@ -224,7 +233,7 @@ impl Authorizer {
 mod tests {
     use super::*;
 
-    const ACTIONS: [Action; 12] = [
+    const ACTIONS: [Action; 13] = [
         Action::Health,
         Action::Read,
         Action::Post,
@@ -232,6 +241,7 @@ mod tests {
         Action::CreateBoard,
         Action::Enrol,
         Action::Session,
+        Action::SignIn,
         Action::Edit,
         Action::Delete,
         Action::Label,
@@ -247,13 +257,23 @@ mod tests {
             kind: ActorKind::Agent,
             handle: "builder".into(),
         };
+        let person = Principal {
+            id: "prn_2".into(),
+            kind: ActorKind::Person,
+            handle: "ada@example.com".into(),
+        };
         for action in ACTIONS {
-            let decision = authz.authorize(&agent, action, Some("general"), Some("a"));
-            assert_eq!(decision, Decision::Allow, "{action:?}");
+            for enrolled in [&agent, &person] {
+                let decision = authz.authorize(enrolled, action, Some("general"), Some("a"));
+                assert_eq!(decision, Decision::Allow, "{action:?}");
+            }
             let decision = authz.authorize(&Principal::local(), action, Some("general"), None);
             assert_eq!(decision, Decision::Deny, "{action:?}");
             let anonymous = authz.authorize(&Principal::anonymous(), action, None, None);
-            let open = matches!(action, Action::Health | Action::Enrol | Action::Page);
+            let open = matches!(
+                action,
+                Action::Health | Action::Enrol | Action::SignIn | Action::Page
+            );
             assert_eq!(anonymous.is_allowed(), open, "{action:?}");
         }
     }

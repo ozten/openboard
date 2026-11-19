@@ -1,14 +1,17 @@
 //! The HTTP surface: routes, request validation and error mapping.
 //!
-//! Handlers never log request or message content, tokens or enrolment codes
-//! (design P15).
+//! Handlers never log request or message content, tokens, session cookie
+//! values, or enrolment and sign-in codes (design P15).
 //!
 //! Every request passes [`gate`] before anything else looks at it. On a
 //! local board the gate checks the `Host` header. On a network board it
-//! authenticates the bearer token, so a caller without a valid one learns
-//! nothing about boards, routes or the shape of valid requests. The only
-//! routes it lets through without one are the health check, enrolment and
-//! the web UI's static files, which hold no board content.
+//! authenticates the bearer token or, when the request has no
+//! `Authorization` header, the browser session cookie, so a caller without
+//! a valid credential learns nothing about boards, routes or the shape of
+//! valid requests. The only routes it lets through without one are the
+//! health check, enrolment, sign-in and the web UI's static files, which
+//! hold no board content. In both modes the gate then applies the two
+//! anti-CSRF checks of `openboard_api::web` to every write.
 //!
 //! Every response, from a handler, the gate or a fallback, leaves through
 //! [`security_headers`].
@@ -32,6 +35,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post, put};
 use axum::{Json, Router};
 use openboard_api::auth::{JoinRequest, JoinResponse, WhoAmI};
+use openboard_api::web::{LoginRequest, Session, CSRF_HEADER, SESSION_COOKIE};
 use openboard_api::{
     codes, event_types, ApiError, BoardList, ChannelList, DeleteMessageQuery, EditMessageRequest,
     ErrorBody, Event, EventsQuery, EventsResponse, Health, LabelsRequest, Message,
@@ -45,7 +49,10 @@ use tokio::time::Instant;
 
 use crate::authz::{Action, Authorizer, Principal};
 use crate::chain::hex;
-use crate::identity::{self, log_kinds, token_lookup_hash, AuthOutcome, Credential, LogEntry};
+use crate::identity::{
+    self, log_kinds, session_lookup_hash, token_lookup_hash, AuthOutcome, Credential, InviteKind,
+    LogEntry,
+};
 use crate::limits::{address_key, Hit, Limits, LogRetention, RateTable, WaiterGuard, Waiters};
 use crate::markdown;
 use crate::names::{self, ChannelSel};
@@ -67,7 +74,8 @@ const STREAM_KEEP_ALIVE: Duration = Duration::from_secs(15);
 /// reader that stalls can have queued when its credential is revoked, and a
 /// revocation discards it.
 const STREAM_BUFFER: usize = 4;
-/// Largest accepted body of an enrolment request, which holds one code.
+/// Largest accepted body of an enrolment or sign-in request, which holds
+/// one code.
 const MAX_JOIN_BODY: usize = 4096;
 
 /// Wakes event waiters when a board's log grows. It holds one entry per
@@ -113,7 +121,7 @@ pub(crate) struct AppState {
     /// Requests per credential.
     requests: RateTable<String>,
     retention: LogRetention,
-    /// Failed enrolment attempts per client address.
+    /// Failed enrolment and sign-in attempts per client address.
     joins: RateTable<IpAddr>,
     /// Failed authentications per client address.
     auth_failures: RateTable<IpAddr>,
@@ -197,6 +205,8 @@ pub(crate) fn router(parts: Parts) -> (Router, Maintenance) {
     let router = Router::new()
         .route(HEALTH_PATH, get(health))
         .route(JOIN_PATH, post(join))
+        .route(LOGIN_PATH, post(web_login))
+        .route(SESSION_PATH, get(web_session))
         .route("/v1/whoami", get(whoami))
         .route("/v1/logout", post(logout))
         .route(pages::INDEX_PATH, get(page))
@@ -233,16 +243,23 @@ pub(crate) fn router(parts: Parts) -> (Router, Maintenance) {
     (router, Maintenance(state))
 }
 
-/// The two API routes a network board answers without a token.
+/// The API routes a network board answers without a credential.
 const HEALTH_PATH: &str = "/v1/health";
 const JOIN_PATH: &str = "/v1/join";
+const LOGIN_PATH: &str = "/v1/web/login";
+/// Describes the caller's session. It needs a credential like any route.
+const SESSION_PATH: &str = "/v1/web/session";
 
-/// Whether a network board answers this request without a token: the health
-/// check, enrolment, and a `GET` of the web UI's page or of one file
-/// directly under `/assets/`. Nothing else is exempt, whatever its method.
+/// Whether a network board answers this request without a credential: the
+/// health check, enrolment, a `POST` of a sign-in, and a `GET` of the web
+/// UI's page or of one file directly under `/assets/`. Nothing else is
+/// exempt, whatever its method.
 fn needs_no_token(method: &Method, path: &str) -> bool {
     if path == HEALTH_PATH || path == JOIN_PATH {
         return true;
+    }
+    if path == LOGIN_PATH {
+        return method == Method::POST;
     }
     if method != Method::GET {
         return false;
@@ -304,7 +321,7 @@ impl AppError {
     fn new(code: &'static str, message: impl Into<String>) -> Self {
         let status = match code {
             codes::NOT_FOUND => StatusCode::NOT_FOUND,
-            codes::FORBIDDEN | codes::INVITE_INVALID => StatusCode::FORBIDDEN,
+            codes::FORBIDDEN | codes::INVITE_INVALID | codes::CSRF_FAILED => StatusCode::FORBIDDEN,
             codes::UNAUTHENTICATED => StatusCode::UNAUTHORIZED,
             codes::RATE_LIMITED => StatusCode::TOO_MANY_REQUESTS,
             codes::IDEMPOTENCY_CONFLICT
@@ -325,8 +342,9 @@ impl AppError {
     }
 
     /// The one answer to every request a network board cannot authenticate:
-    /// no token, a malformed one, an unknown one, an expired one or a
-    /// revoked one. It never varies, so it tells the caller nothing.
+    /// no token or session, a malformed one, an unknown one, an expired one
+    /// or a revoked one. It never varies, so it tells the caller nothing,
+    /// and it is the same for a bearer token and a session cookie.
     fn unauthenticated() -> Self {
         Self::new(
             codes::UNAUTHENTICATED,
@@ -335,7 +353,29 @@ impl AppError {
         .next("enrol with an invite from the board's operator, or ask for a new one if your token has expired or been revoked")
     }
 
-    /// The one answer to every enrolment code that cannot be used.
+    /// A write that failed the `Origin` check. Nothing was changed.
+    fn foreign_origin() -> Self {
+        Self::new(
+            codes::CSRF_FAILED,
+            "the request's Origin is not the address it was sent to",
+        )
+        .next("write to the board only from its own pages, or send no Origin header")
+    }
+
+    /// A write with a session cookie and without that session's anti-CSRF
+    /// token. Nothing was changed.
+    fn csrf_token_missing() -> Self {
+        Self::new(
+            codes::CSRF_FAILED,
+            "a write with a session cookie needs the session's anti-CSRF token",
+        )
+        .next(format!(
+            "send the csrf_token from GET {SESSION_PATH} in the {CSRF_HEADER} header"
+        ))
+    }
+
+    /// The one answer to every enrolment or sign-in code that cannot be
+    /// used, at either endpoint.
     fn invite_invalid() -> Self {
         Self::new(
             codes::INVITE_INVALID,
@@ -485,6 +525,9 @@ struct Identity {
     principal: Principal,
     /// The credential behind an authenticated request on a network board.
     credential: Option<Credential>,
+    /// The anti-CSRF token of the session, when the request was
+    /// authenticated by the session cookie and not by a bearer token.
+    csrf: Option<String>,
     client: Option<IpAddr>,
 }
 
@@ -495,10 +538,15 @@ struct Identity {
 /// whose `Host` is not a loopback name are refused.
 ///
 /// Network mode authenticates instead: clients address the board by its LAN
-/// address, and only the health check, enrolment and the web UI's static
-/// files are answered without a valid token; see [`needs_no_token`]. Any
-/// other unauthenticated request is refused here, before routing, so
-/// unknown routes, bad paths and bad bodies all look the same to it.
+/// address, and only the health check, enrolment, sign-in and the web UI's
+/// static files are answered without a valid token or session; see
+/// [`needs_no_token`]. Any other unauthenticated request is refused here,
+/// before routing, so unknown routes, bad paths and bad bodies all look the
+/// same to it.
+///
+/// Last, in both modes, come the anti-CSRF checks on writes; see
+/// [`check_csrf`]. They too run before routing, so a refused write reaches
+/// no handler and changes nothing.
 async fn gate(State(state): State<Shared>, mut request: Request, next: Next) -> Response {
     let client = request
         .extensions()
@@ -520,6 +568,7 @@ async fn gate(State(state): State<Shared>, mut request: Request, next: Next) -> 
             Identity {
                 principal: Principal::local(),
                 credential: None,
+                csrf: None,
                 client,
             }
         }
@@ -528,13 +577,15 @@ async fn gate(State(state): State<Shared>, mut request: Request, next: Next) -> 
                 Identity {
                     principal: Principal::anonymous(),
                     credential: None,
+                    csrf: None,
                     client,
                 }
             } else {
                 match state.authenticate(request.headers(), client).await {
-                    Ok(credential) => Identity {
+                    Ok((credential, csrf)) => Identity {
                         principal: credential.principal(),
                         credential: Some(credential),
+                        csrf,
                         client,
                     },
                     Err(refused) => return refused.into_response(),
@@ -542,8 +593,87 @@ async fn gate(State(state): State<Shared>, mut request: Request, next: Next) -> 
             }
         }
     };
+    if let Err(refused) = check_csrf(
+        state.mode,
+        request.method(),
+        request.headers(),
+        identity.csrf.as_deref(),
+    ) {
+        return refused.into_response();
+    }
     request.extensions_mut().insert(identity);
     next.run(request).await
+}
+
+/// The two anti-CSRF checks of `openboard_api::web`, on a write: any
+/// request whose method is not `GET` or `HEAD`.
+///
+/// First, a write that names its `Origin` must name the scheme and
+/// authority it was sent to, which is the board's scheme and the request's
+/// `Host`. A browser sends `Origin` with every cross-origin write and
+/// cannot be made to forge it, so a page of another site, or of another
+/// port on the same host, cannot write here even where no credential is
+/// needed: on a local board and at sign-in. A client that is not a browser
+/// sends no `Origin` and is not affected.
+///
+/// Second, a write authenticated by the session cookie must carry the
+/// session's anti-CSRF token, `csrf`, in the [`CSRF_HEADER`] header. A
+/// bearer token is never sent by a browser on its own, so a request
+/// authenticated by one skips this check.
+fn check_csrf(
+    mode: Mode,
+    method: &Method,
+    headers: &HeaderMap,
+    csrf: Option<&str>,
+) -> ApiResult<()> {
+    if method == Method::GET || method == Method::HEAD {
+        return Ok(());
+    }
+    let scheme = match mode {
+        Mode::Local => "http",
+        Mode::Network => "https",
+    };
+    if !origin_is_own(headers, scheme) {
+        return Err(AppError::foreign_origin());
+    }
+    if let Some(expected) = csrf {
+        let presented = headers
+            .get(CSRF_HEADER)
+            .and_then(|value| value.to_str().ok());
+        // Compared in constant time: the token is a secret of the session.
+        if !presented.is_some_and(|presented| identity::constant_time_eq(presented, expected)) {
+            return Err(AppError::csrf_token_missing());
+        }
+    }
+    Ok(())
+}
+
+/// Whether the request has no `Origin` header, or exactly one that is
+/// `scheme://` followed by the request's `Host`. The comparison ignores
+/// ASCII case and nothing else: a browser writes the port the same way in
+/// both headers. `Origin: null`, a second `Origin`, and an `Origin` on a
+/// request without exactly one `Host` all fail.
+fn origin_is_own(headers: &HeaderMap, scheme: &str) -> bool {
+    let mut origins = headers.get_all(header::ORIGIN).iter();
+    let Some(origin) = origins.next() else {
+        return true;
+    };
+    if origins.next().is_some() {
+        return false;
+    }
+    let mut hosts = headers.get_all(header::HOST).iter();
+    let (Some(host), None) = (hosts.next(), hosts.next()) else {
+        return false;
+    };
+    let (Ok(origin), Ok(host)) = (origin.to_str(), host.to_str()) else {
+        return false;
+    };
+    let Some((origin_scheme, authority)) = origin.split_once("://") else {
+        return false;
+    };
+    !host.is_empty()
+        && origin_scheme.eq_ignore_ascii_case(scheme)
+        && authority.eq_ignore_ascii_case(host)
 }
 
 /// The token of an `Authorization: Bearer <token>` header.
@@ -553,20 +683,69 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     scheme.eq_ignore_ascii_case("bearer").then_some(token)
 }
 
+/// The value of the session cookie, from whichever `Cookie` header holds
+/// it. The first cookie with the session's name counts, and a browser
+/// sends at most one, because the `__Host-` prefix ties the cookie to this
+/// exact host and to `Path=/`.
+///
+/// The header is not ours alone: a browser sends every cookie it holds for
+/// the host, whatever port set them, so it may be long, hold bytes that
+/// are not ASCII and hold pairs that are not well formed. It is read as
+/// bytes, in one pass, without copying; whatever is not the session cookie
+/// is skipped, and a value that is not text is no session.
+fn session_cookie(headers: &HeaderMap) -> Option<&str> {
+    let trim = |bytes: &[u8]| -> std::ops::Range<usize> {
+        let blank = |b: &u8| *b == b' ' || *b == b'\t';
+        let start = bytes.iter().position(|b| !blank(b)).unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .rposition(|b| !blank(b))
+            .map_or(start, |i| i + 1);
+        start..end
+    };
+    for header in headers.get_all(header::COOKIE) {
+        for pair in header.as_bytes().split(|b| *b == b';') {
+            let Some(equals) = pair.iter().position(|b| *b == b'=') else {
+                continue;
+            };
+            let (name, value) = (&pair[..equals], &pair[equals + 1..]);
+            if &name[trim(name)] == SESSION_COOKIE.as_bytes() {
+                return std::str::from_utf8(&value[trim(value)]).ok();
+            }
+        }
+    }
+    None
+}
+
 impl AppState {
-    /// Resolves the bearer token to its credential, and counts the request
-    /// against that credential's rate limit. Every failure is the same
-    /// `401`, except that a client address with too many failures is told
-    /// to slow down.
+    /// Resolves the bearer token, or without an `Authorization` header the
+    /// session cookie, to its credential, and counts the request against
+    /// that credential's rate limit. Returns the credential and, for a
+    /// session, its anti-CSRF token. Every failure is the same `401`,
+    /// except that a client address with too many failures is told to slow
+    /// down.
+    ///
+    /// A request with an `Authorization` header is authenticated by that
+    /// header alone, whatever it holds: the cookie is not looked at, not
+    /// even when the header is unusable.
     async fn authenticate(
         self: &Arc<Self>,
         headers: &HeaderMap,
         client: Option<IpAddr>,
-    ) -> ApiResult<Credential> {
-        // Text that cannot be a token is refused without a lookup. A token
-        // is found by its digest, never by comparing secrets.
-        let presented = bearer_token(headers);
-        let outcome = match presented.and_then(token_lookup_hash) {
+    ) -> ApiResult<(Credential, Option<String>)> {
+        // Text that cannot be a token or a session is refused without a
+        // lookup. A credential is found by its digest, never by comparing
+        // secrets. The two have different shapes, so a token in the cookie
+        // or a session in the header is malformed.
+        let by_header = headers.contains_key(header::AUTHORIZATION);
+        let (presented, hash) = if by_header {
+            let token = bearer_token(headers);
+            (token, token.and_then(token_lookup_hash))
+        } else {
+            let session = session_cookie(headers);
+            (session, session.and_then(session_lookup_hash))
+        };
+        let outcome = match hash {
             None => None,
             Some(hash) => Some(
                 self.db(move |state| {
@@ -583,7 +762,13 @@ impl AppState {
                     .requests
                     .hit(credential.id.clone(), self.limits.requests_per_minute)
                 {
-                    Hit::Allowed => Ok(credential),
+                    Hit::Allowed => {
+                        let csrf = match presented {
+                            Some(session) if !by_header => Some(identity::csrf_token(session)),
+                            _ => None,
+                        };
+                        Ok((credential, csrf))
+                    }
                     Hit::Limited { retry_after, first } => {
                         if first {
                             self.log(
@@ -598,10 +783,18 @@ impl AppState {
                     }
                 };
             }
-            Some(AuthOutcome::Expired(credential)) => ("expired token", Some(credential)),
-            Some(AuthOutcome::Revoked(credential)) => ("revoked token", Some(credential)),
-            Some(AuthOutcome::Unknown) => ("unknown token", None),
-            None if presented.is_some() => ("malformed token", None),
+            Some(AuthOutcome::Expired(credential)) if by_header => {
+                ("expired token", Some(credential))
+            }
+            Some(AuthOutcome::Revoked(credential)) if by_header => {
+                ("revoked token", Some(credential))
+            }
+            Some(AuthOutcome::Expired(credential)) => ("expired session", Some(credential)),
+            Some(AuthOutcome::Revoked(credential)) => ("revoked session", Some(credential)),
+            Some(AuthOutcome::Unknown) if by_header => ("unknown token", None),
+            Some(AuthOutcome::Unknown) => ("unknown session", None),
+            None if presented.is_some() && by_header => ("malformed token", None),
+            None if presented.is_some() => ("malformed session", None),
             None => ("no token", None),
         };
         match self
@@ -1063,11 +1256,14 @@ async fn join(
     }
     state.require_global(&identity.principal, Action::Enrol)?;
     let client = identity.client;
-    let request = match read_join_request(&state, &headers, body).await {
+    let request: JoinRequest = match read_code_request(&state, &headers, body, "join request").await
+    {
         Ok(request) => request,
-        Err(malformed) => return Err(state.join_failed(client, None, malformed).await),
+        Err(malformed) => return Err(state.join_failed(ENROLMENT, client, None, malformed).await),
     };
-    let joined = if identity::code_is_well_formed(&request.code) {
+    // A person's sign-in code does not have this shape, so it is refused
+    // here without being looked up, and stays unspent.
+    let joined = if identity::code_is_well_formed(&request.code, InviteKind::Agent) {
         state
             .db(move |state| state.store.join(&request.code, client))
             .await?
@@ -1076,7 +1272,12 @@ async fn join(
     };
     let Some((token, credential)) = joined else {
         return Err(state
-            .join_failed(client, Some("unusable code"), AppError::invite_invalid())
+            .join_failed(
+                ENROLMENT,
+                client,
+                Some("unusable code"),
+                AppError::invite_invalid(),
+            )
             .await);
     };
     let response = JoinResponse {
@@ -1087,14 +1288,15 @@ async fn join(
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(response)).into_response())
 }
 
-/// Reads the body of an enrolment request. The caller is not authenticated,
-/// so the body is small and has to arrive within the time a request head
-/// has.
-async fn read_join_request(
+/// Reads the body of an enrolment or sign-in request. The caller is not
+/// authenticated, so the body is small and has to arrive within the time a
+/// request head has.
+async fn read_code_request<T: serde::de::DeserializeOwned>(
     state: &AppState,
     headers: &HeaderMap,
     body: Body,
-) -> ApiResult<JoinRequest> {
+    what: &str,
+) -> ApiResult<T> {
     if !is_json(headers) {
         return Err(
             AppError::invalid("the request body must be sent as application/json")
@@ -1109,16 +1311,35 @@ async fn read_join_request(
         .map_err(|_| unreadable())?;
     // The error never quotes the body, which may hold a code.
     serde_json::from_slice(&body)
-        .map_err(|_| AppError::invalid("the request body is not a valid join request"))
+        .map_err(|_| AppError::invalid(format!("the request body is not a valid {what}")))
 }
 
+/// How the two ways of swapping a code for a credential appear in the
+/// security log.
+struct CodeSwap {
+    /// The entry type of a failed attempt.
+    failed: &'static str,
+    /// The detail of the entry written when an address runs into the limit.
+    limited: &'static str,
+}
+
+const ENROLMENT: CodeSwap = CodeSwap {
+    failed: log_kinds::ENROL_FAILED,
+    limited: "enrolment",
+};
+const SIGN_IN: CodeSwap = CodeSwap {
+    failed: log_kinds::WEB_LOGIN_FAILED,
+    limited: "web login",
+};
+
 impl AppState {
-    /// Counts a failed enrolment attempt against its client address and
-    /// returns the answer: `refusal` while the address is within its
-    /// budget, `rate_limited` once it is over. `reason` is logged for an
-    /// attempt that presented a code.
+    /// Counts a failed enrolment or sign-in attempt against its client
+    /// address and returns the answer: `refusal` while the address is
+    /// within its budget, `rate_limited` once it is over. The two share one
+    /// budget. `reason` is logged for an attempt that presented a code.
     async fn join_failed(
         self: &Arc<Self>,
+        swap: CodeSwap,
         client: Option<IpAddr>,
         reason: Option<&'static str>,
         refusal: AppError,
@@ -1129,14 +1350,13 @@ impl AppState {
         {
             Hit::Allowed => {
                 if let Some(reason) = reason {
-                    self.log_failure(log_kinds::ENROL_FAILED, None, client, reason)
-                        .await;
+                    self.log_failure(swap.failed, None, client, reason).await;
                 }
                 refusal
             }
             Hit::Limited { retry_after, first } => {
                 if first {
-                    self.log_capped(log_kinds::RATE_LIMITED, None, client, "enrolment")
+                    self.log_capped(log_kinds::RATE_LIMITED, None, client, swap.limited)
                         .await;
                 }
                 AppError::rate_limited(retry_after)
@@ -1161,10 +1381,11 @@ async fn whoami(
 }
 
 /// `POST /v1/logout`: revokes the credential the caller authenticated with.
+/// When that is a browser session, the response also clears the cookie.
 async fn logout(
     State(state): State<Shared>,
     Extension(identity): Extension<Identity>,
-) -> ApiResult<StatusCode> {
+) -> ApiResult<Response> {
     state.require_global(&identity.principal, Action::Session)?;
     let Some(credential) = identity.credential else {
         return Err(AppError::invalid(
@@ -1172,10 +1393,112 @@ async fn logout(
         ));
     };
     let client = identity.client;
+    let session = identity.csrf.is_some();
+    let detail = session.then_some("session");
     state
-        .db(move |state| state.store.logout(&credential, client))
+        .db(move |state| state.store.logout(&credential, client, detail))
         .await?;
-    Ok(StatusCode::NO_CONTENT)
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    if session {
+        response
+            .headers_mut()
+            .insert(header::SET_COOKIE, session_cookie_header("", 0)?);
+    }
+    Ok(response)
+}
+
+/// The `Set-Cookie` header that sets the session cookie to `value` for
+/// `max_age` seconds, with the attributes `openboard_api::web` fixes. An
+/// empty value and a zero age clear the cookie. The header is marked
+/// sensitive, so nothing that prints headers shows the value.
+fn session_cookie_header(value: &str, max_age: i64) -> ApiResult<HeaderValue> {
+    let cookie = format!(
+        "{SESSION_COOKIE}={value}; Secure; HttpOnly; SameSite=Strict; Path=/; Max-Age={max_age}"
+    );
+    let mut header = HeaderValue::from_str(&cookie)
+        .map_err(|_| AppError::internal(&"the session cookie is not a valid header"))?;
+    header.set_sensitive(true);
+    Ok(header)
+}
+
+/// `POST /v1/web/login`: swaps a person's single-use sign-in code for a
+/// browser session, and sets the session cookie.
+///
+/// The cookie's value is the session's secret. It is in the `Set-Cookie`
+/// header and nowhere else: the body describes the session without it, so
+/// script on the page cannot read it. Failures are counted and answered
+/// exactly as those of [`join`], with which this shares its budget, and an
+/// agent's enrolment code is refused here without being spent.
+async fn web_login(
+    State(state): State<Shared>,
+    Extension(identity): Extension<Identity>,
+    headers: HeaderMap,
+    body: Body,
+) -> ApiResult<Response> {
+    if state.mode == Mode::Local {
+        return Err(AppError::invalid(
+            "this is a local board: it has no sign-in and needs none",
+        ));
+    }
+    state.require_global(&identity.principal, Action::SignIn)?;
+    // A declared profile is checked before the code is spent.
+    let profile = Caller::new(&identity, &headers)?.profile;
+    let client = identity.client;
+    let request: LoginRequest = match read_code_request(&state, &headers, body, "login request")
+        .await
+    {
+        Ok(request) => request,
+        Err(malformed) => return Err(state.join_failed(SIGN_IN, client, None, malformed).await),
+    };
+    let signed_in = if identity::code_is_well_formed(&request.code, InviteKind::Person) {
+        state
+            .db(move |state| state.store.web_login(&request.code, client))
+            .await?
+    } else {
+        None
+    };
+    let Some((secret, credential)) = signed_in else {
+        return Err(state
+            .join_failed(
+                SIGN_IN,
+                client,
+                Some("unusable code"),
+                AppError::invite_invalid(),
+            )
+            .await);
+    };
+    let max_age = credential.expires_ms.saturating_sub(credential.created_ms) / 1000;
+    let session = Session {
+        actor: credential.principal().actor(profile.as_deref()),
+        mode: state.mode.as_str().to_owned(),
+        csrf_token: Some(identity::csrf_token(&secret)),
+        credential: Some(credential.info()),
+    };
+    let mut response = Json(session).into_response();
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        session_cookie_header(&secret, max_age.max(0))?,
+    );
+    Ok(response)
+}
+
+/// `GET /v1/web/session`: who the request is authenticated as, for the web
+/// UI. On a local board that is the local principal. On a network board a
+/// request without a valid session or token never gets here: the gate's
+/// `401` is how the page learns that it must show the sign-in screen.
+async fn web_session(
+    State(state): State<Shared>,
+    Extension(identity): Extension<Identity>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Session>> {
+    let caller = Caller::new(&identity, &headers)?;
+    state.require_global(&caller.principal, Action::Session)?;
+    Ok(Json(Session {
+        actor: caller.actor(),
+        mode: state.mode.as_str().to_owned(),
+        csrf_token: identity.csrf.clone(),
+        credential: identity.credential.as_ref().map(Credential::info),
+    }))
 }
 
 async fn post_message(
@@ -2118,6 +2441,7 @@ mod tests {
         for (method, path) in [
             (Method::GET, "/v1/health"),
             (Method::POST, "/v1/join"),
+            (Method::POST, "/v1/web/login"),
             (Method::GET, "/"),
             (Method::GET, "/join"),
             (Method::GET, "/assets/app.js"),
@@ -2141,10 +2465,189 @@ mod tests {
             (Method::GET, "/v1/boards"),
             (Method::GET, "/v1/whoami"),
             (Method::GET, "/v1/web/session"),
-            (Method::POST, "/v1/web/login"),
+            (Method::POST, "/v1/web/session"),
+            (Method::GET, "/v1/web/login"),
+            (Method::PUT, "/v1/web/login"),
+            (Method::POST, "/v1/web/login/"),
             (Method::GET, "/v1/join/"),
         ] {
             assert!(!needs_no_token(&method, path), "{method} {path}");
+        }
+    }
+
+    fn headers(pairs: &[(&'static str, &[u8])]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.append(*name, HeaderValue::from_bytes(value).unwrap());
+        }
+        headers
+    }
+
+    #[test]
+    fn the_session_cookie_is_found_among_others() {
+        let cookie = |values: &[&[u8]]| {
+            let pairs: Vec<(&'static str, &[u8])> =
+                values.iter().map(|value| ("cookie", *value)).collect();
+            session_cookie(&headers(&pairs)).map(str::to_owned)
+        };
+        let found = Some("obs_abc".to_owned());
+        assert_eq!(cookie(&[b"__Host-openboard_session=obs_abc"]), found);
+        assert_eq!(
+            cookie(&[b"a=1; __Host-openboard_session=obs_abc; b=2"]),
+            found
+        );
+        assert_eq!(
+            cookie(&[b"a=1;__Host-openboard_session=obs_abc;b=2"]),
+            found
+        );
+        assert_eq!(
+            cookie(&[b" \t __Host-openboard_session \t= obs_abc \t ;"]),
+            found
+        );
+        // Another header, after ones that hold other applications' cookies:
+        // not ASCII, not pairs, empty.
+        assert_eq!(
+            cookie(&[
+                b"theme=d\xc3\xa9j\xc3\xa0; \xff\xfe=1",
+                b";;; no-equals ; =; ===",
+                b"",
+                b"x=y; __Host-openboard_session=obs_abc"
+            ]),
+            found
+        );
+        // The first one counts, and a value that holds `=` is kept whole.
+        assert_eq!(
+            cookie(&[b"__Host-openboard_session=obs_abc; __Host-openboard_session=other"]),
+            found
+        );
+        assert_eq!(
+            cookie(&[b"__Host-openboard_session=a=b"]),
+            Some("a=b".to_owned())
+        );
+        assert_eq!(cookie(&[b"__Host-openboard_session="]), Some(String::new()));
+        // Names are exact.
+        for absent in [
+            &b"openboard_session=obs_abc"[..],
+            b"__host-openboard_session=obs_abc",
+            b"__Host-openboard_session2=obs_abc",
+            b"x__Host-openboard_session=obs_abc",
+            b"__Host-openboard_session",
+            b"other=__Host-openboard_session=obs_abc",
+            b"",
+        ] {
+            assert_eq!(cookie(&[absent]), None, "{absent:?}");
+        }
+        assert_eq!(cookie(&[]), None);
+        // A value that is not text is no session.
+        assert_eq!(cookie(&[b"__Host-openboard_session=\xff\xfe"]), None);
+
+        // A hostile header is read once, quickly, and yields nothing.
+        let mut huge = b"a=b; ".repeat(200_000);
+        huge.extend_from_slice(&b"=".repeat(100_000));
+        huge.extend_from_slice(&b";".repeat(100_000));
+        let started = std::time::Instant::now();
+        assert_eq!(cookie(&[&huge]), None);
+        huge.extend_from_slice(b"__Host-openboard_session=obs_abc");
+        assert_eq!(cookie(&[&huge]), found);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn a_write_is_refused_from_another_origin_and_without_the_csrf_token() {
+        let check = |mode, method: &Method, pairs: &[(&'static str, &[u8])], csrf| {
+            check_csrf(mode, method, &headers(pairs), csrf)
+                .map_err(|error| (error.status, error.code))
+        };
+        let refused = Err((StatusCode::FORBIDDEN, codes::CSRF_FAILED));
+        let host: (&'static str, &[u8]) = ("host", b"192.168.1.20:7878");
+        let writes = [Method::POST, Method::PUT, Method::PATCH, Method::DELETE];
+
+        for method in &writes {
+            // No Origin, or the board's own.
+            assert_eq!(check(Mode::Network, method, &[host], None), Ok(()));
+            assert_eq!(check(Mode::Network, method, &[], None), Ok(()));
+            for own in [
+                &b"https://192.168.1.20:7878"[..],
+                b"HTTPS://192.168.1.20:7878",
+            ] {
+                let pairs = [host, ("origin", own)];
+                assert_eq!(
+                    check(Mode::Network, method, &pairs, None),
+                    Ok(()),
+                    "{own:?}"
+                );
+            }
+            for foreign in [
+                &b"https://evil.example"[..],
+                b"http://192.168.1.20:7878",
+                b"https://192.168.1.20",
+                b"https://192.168.1.20:7879",
+                b"https://192.168.1.20:7878/",
+                b"https://192.168.1.20:7878.evil.example",
+                b"https://evil.example/https://192.168.1.20:7878",
+                b"192.168.1.20:7878",
+                b"null",
+                b"",
+                b"https://",
+                b"https://\xff",
+            ] {
+                let pairs = [host, ("origin", foreign)];
+                assert_eq!(
+                    check(Mode::Network, method, &pairs, None),
+                    refused,
+                    "{foreign:?}"
+                );
+            }
+            // An Origin cannot be checked without exactly one Host.
+            let own: (&'static str, &[u8]) = ("origin", b"https://192.168.1.20:7878");
+            assert_eq!(check(Mode::Network, method, &[own], None), refused);
+            assert_eq!(
+                check(Mode::Network, method, &[host, host, own], None),
+                refused
+            );
+            assert_eq!(
+                check(Mode::Network, method, &[host, own, own], None),
+                refused
+            );
+            let empty = [("host", &b""[..]), ("origin", &b"https://"[..])];
+            assert_eq!(check(Mode::Network, method, &empty, None), refused);
+
+            // A local board is plain HTTP.
+            let local: (&'static str, &[u8]) = ("host", b"localhost:7878");
+            let pairs = [local, ("origin", &b"http://localhost:7878"[..])];
+            assert_eq!(check(Mode::Local, method, &pairs, None), Ok(()));
+            for foreign in [
+                &b"https://localhost:7878"[..],
+                b"http://localhost:3000",
+                b"http://127.0.0.1:7878",
+                b"http://evil.example",
+            ] {
+                let pairs = [local, ("origin", foreign)];
+                assert_eq!(check(Mode::Local, method, &pairs, None), refused);
+            }
+
+            // A cookie session needs its token as well.
+            let token = Some("a1b2");
+            assert_eq!(check(Mode::Network, method, &[host], token), refused);
+            for wrong in [&b"a1b3"[..], b"a1b", b"a1b2 ", b"", b"A1B2", b"\xff"] {
+                let pairs = [host, (CSRF_HEADER, wrong)];
+                assert_eq!(check(Mode::Network, method, &pairs, token), refused);
+            }
+            let pairs = [host, (CSRF_HEADER, &b"a1b2"[..])];
+            assert_eq!(check(Mode::Network, method, &pairs, token), Ok(()));
+            // The right token does not excuse a foreign Origin.
+            let pairs = [
+                host,
+                (CSRF_HEADER, &b"a1b2"[..]),
+                ("origin", &b"https://evil.example"[..]),
+            ];
+            assert_eq!(check(Mode::Network, method, &pairs, token), refused);
+        }
+
+        // Reads are never checked.
+        for method in [Method::GET, Method::HEAD] {
+            let pairs = [host, ("origin", &b"https://evil.example"[..])];
+            assert_eq!(check(Mode::Network, &method, &pairs, Some("a1b2")), Ok(()));
         }
     }
 

@@ -108,7 +108,7 @@ fn or_dash(value: &Option<String>) -> String {
 pub async fn invite(global: &Global, args: &InviteArgs) -> Result<(), Failure> {
     let options = InviteOptions {
         ttl_secs: args.ttl.as_secs(),
-        token_ttl_secs: args.token_ttl.as_secs(),
+        token_ttl_secs: Some(args.token_ttl.as_secs()),
         // Only the flag: BOARD_URL says which board a client talks to, not
         // what an invite should carry.
         url: global.url_flag().map(str::to_owned),
