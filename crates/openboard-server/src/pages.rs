@@ -33,6 +33,26 @@ pub(crate) const ASSETS: &[Asset] = &[
         bytes: include_bytes!("../web/assets/app.js"),
     },
     Asset {
+        name: "api.js",
+        content_type: "text/javascript; charset=utf-8",
+        bytes: include_bytes!("../web/assets/api.js"),
+    },
+    Asset {
+        name: "dom.js",
+        content_type: "text/javascript; charset=utf-8",
+        bytes: include_bytes!("../web/assets/dom.js"),
+    },
+    Asset {
+        name: "forms.js",
+        content_type: "text/javascript; charset=utf-8",
+        bytes: include_bytes!("../web/assets/forms.js"),
+    },
+    Asset {
+        name: "thread.js",
+        content_type: "text/javascript; charset=utf-8",
+        bytes: include_bytes!("../web/assets/thread.js"),
+    },
+    Asset {
         name: "app.css",
         content_type: "text/css; charset=utf-8",
         bytes: include_bytes!("../web/assets/app.css"),

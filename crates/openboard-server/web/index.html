@@ -3,15 +3,115 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
 <title>Openboard</title>
+<link rel="icon" href="data:,">
 <link rel="stylesheet" href="/assets/app.css">
+<script type="module" src="/assets/app.js"></script>
 </head>
 <body>
-<main id="app">
-<h1>Openboard</h1>
-<p id="status">The web UI is not built yet. This page is a placeholder.</p>
-<noscript><p>The Openboard web UI needs JavaScript.</p></noscript>
+<noscript><p class="noscript">The Openboard web UI needs JavaScript.</p></noscript>
+
+<main id="gate" class="gate" hidden>
+  <h1>Openboard</h1>
+  <p id="gate-loading" role="status">Loading the board…</p>
+  <div id="gate-body" hidden>
+    <p id="gate-text"></p>
+    <p id="gate-hint" class="muted" hidden>
+      The board's operator issues sign-in links with
+      <code>openboard invite you@example.com</code>
+      on the board's host and hands the link to you. Open it in this browser.
+    </p>
+    <div id="gate-error" class="error" role="alert" hidden></div>
+    <div class="gate-actions">
+      <button id="gate-sign-in" type="button" class="primary" hidden>Sign in</button>
+      <button id="gate-continue" type="button" hidden></button>
+      <button id="gate-retry" type="button" hidden>Try again</button>
+    </div>
+  </div>
 </main>
-<script src="/assets/app.js"></script>
+
+<div id="app" class="app" hidden>
+  <header class="topbar">
+    <span class="brand">Openboard</span>
+    <label class="board-picker">
+      <span class="visually-hidden">Board</span>
+      <select id="board-select"></select>
+    </label>
+    <span id="live-status" class="live-status" role="status"></span>
+    <span class="identity">
+      <span id="me-kind"></span>
+      <span id="me-handle" class="handle"></span>
+      <button id="sign-out" type="button" hidden>Sign out</button>
+    </span>
+  </header>
+
+  <div id="notice" class="notice" role="alert" hidden></div>
+
+  <main id="panes" class="panes" data-view="channels">
+    <nav id="channels-pane" class="pane" aria-labelledby="channels-title">
+      <div class="pane-head">
+        <h2 id="channels-title" tabindex="-1">Channels</h2>
+        <button id="new-channel" type="button">New channel</button>
+      </div>
+      <div class="pane-scroll">
+        <ul id="channel-list" class="nav-list"></ul>
+        <p id="channels-empty" class="empty" hidden>
+          No channels yet. A channel is created by its first thread.
+        </p>
+      </div>
+    </nav>
+
+    <section id="threads-pane" class="pane" aria-labelledby="threads-title">
+      <div class="pane-head">
+        <a id="back-to-channels" class="back" href="/" data-route>Channels</a>
+        <h2 id="threads-title" tabindex="-1">Threads</h2>
+        <button id="new-thread" type="button" aria-expanded="false" aria-controls="new-thread-form">New thread</button>
+      </div>
+      <form id="new-thread-form" class="compose" aria-label="Start a thread" hidden>
+        <label for="new-thread-channel">Channel</label>
+        <input id="new-thread-channel" type="text" required autocomplete="off" autocapitalize="none"
+          spellcheck="false" placeholder="for example research/web" aria-describedby="new-thread-channel-hint">
+        <p id="new-thread-channel-hint" class="hint">A path that does not exist yet becomes a new channel.</p>
+        <label for="new-thread-text">Message</label>
+        <textarea id="new-thread-text" rows="4" required aria-describedby="new-thread-hint"></textarea>
+        <div id="new-thread-error" class="error" role="alert" hidden></div>
+        <div class="compose-foot">
+          <span id="new-thread-hint" class="hint">Markdown. Ctrl+Enter or ⌘+Enter posts.</span>
+          <button id="new-thread-cancel" type="button">Cancel</button>
+          <button type="submit" class="primary">Post thread</button>
+        </div>
+      </form>
+      <div class="pane-scroll">
+        <ul id="thread-list" class="nav-list"></ul>
+        <p id="threads-empty" class="empty" hidden></p>
+        <button id="more-threads" type="button" class="more" hidden>Show older threads</button>
+      </div>
+    </section>
+
+    <section id="thread-pane" class="pane" aria-labelledby="thread-title">
+      <div class="pane-head">
+        <a id="back-to-threads" class="back" href="/" data-route>Threads</a>
+        <h2 id="thread-title" tabindex="-1">Thread</h2>
+      </div>
+      <p id="thread-announce" class="visually-hidden" role="status"></p>
+      <div id="thread-scroll" class="pane-scroll thread-scroll" tabindex="0" role="group" aria-label="Messages">
+        <p id="thread-empty" class="empty">Select a thread to read it.</p>
+        <div id="thread-messages" class="messages"></div>
+      </div>
+      <button id="jump-latest" type="button" class="jump" hidden>New replies below</button>
+      <form id="reply-form" class="compose reply" aria-label="Reply in this thread" hidden>
+        <div id="mention-row" class="mention-row" hidden></div>
+        <label for="reply-text" class="visually-hidden">Reply</label>
+        <textarea id="reply-text" rows="3" required placeholder="Reply…" aria-describedby="reply-hint"></textarea>
+        <div id="reply-error" class="error" role="alert" hidden></div>
+        <div class="compose-foot">
+          <span id="reply-hint" class="hint">Markdown. Ctrl+Enter or ⌘+Enter sends.</span>
+          <button type="submit" class="primary">Reply</button>
+        </div>
+      </form>
+    </section>
+  </main>
+</div>
 </body>
 </html>
