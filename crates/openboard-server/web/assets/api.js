@@ -4,9 +4,14 @@
 // stored, logged or put in a URL, and is fetched again on every page load.
 
 const CSRF_HEADER = "x-openboard-csrf";
+/** No request may wait longer than this, so nothing on the page hangs. */
+const REQUEST_TIMEOUT_MS = 20000;
 
 let csrfToken = null;
+/** ID of the actor whose session this page is showing, or null. */
+let shownActorId = null;
 let unauthenticatedHandler = () => {};
+let identityChangedHandler = () => {};
 
 /** A failed request: the server's `ErrorBody`, or a network failure. */
 export class ApiError extends Error {
@@ -17,6 +22,15 @@ export class ApiError extends Error {
     this.next = (error && error.next) || null;
     this.retryAfter = retryAfter;
   }
+
+  /**
+   * True when the same request may succeed later: the board was not
+   * reached, asked the caller to slow down, or failed. Anything else is an
+   * answer, and asking again would get the same one.
+   */
+  get transient() {
+    return this.status === 0 || this.status === 429 || this.status >= 500;
+  }
 }
 
 /** Called whenever a request other than sign-in is answered with 401. */
@@ -24,9 +38,26 @@ export function onUnauthenticated(handler) {
   unauthenticatedHandler = handler;
 }
 
+/**
+ * Called with the new `Session` when this browser turns out to be signed
+ * in as a different actor than the page was showing, which happens when
+ * another tab signs in: the cookie is shared.
+ */
+export function onIdentityChanged(handler) {
+  identityChangedHandler = handler;
+}
+
 async function send(method, path, { query, body } = {}) {
   const headers = { accept: "application/json" };
-  const init = { method, headers, cache: "no-store", credentials: "same-origin", redirect: "error" };
+  const timeout = new AbortController();
+  const init = {
+    method,
+    headers,
+    cache: "no-store",
+    credentials: "same-origin",
+    redirect: "error",
+    signal: timeout.signal,
+  };
   if (body !== undefined) {
     headers["content-type"] = "application/json";
     init.body = JSON.stringify(body);
@@ -34,16 +65,28 @@ async function send(method, path, { query, body } = {}) {
   if (method !== "GET" && csrfToken) {
     headers[CSRF_HEADER] = csrfToken;
   }
+  const timer = setTimeout(() => timeout.abort(), REQUEST_TIMEOUT_MS);
   let response;
+  let data = null;
   try {
     response = await fetch(withQuery(path, query), init);
+    if (response.status !== 204) {
+      data = await response.json().catch(() => null);
+    }
   } catch {
+    if (timeout.signal.aborted) {
+      throw new ApiError(0, { code: "timeout", message: "The board did not answer in time." }, null);
+    }
     throw new ApiError(0, { code: "unreachable", message: "The board could not be reached." }, null);
+  } finally {
+    clearTimeout(timer);
+  }
+  if (timeout.signal.aborted) {
+    throw new ApiError(0, { code: "timeout", message: "The board did not answer in time." }, null);
   }
   if (response.status === 204) {
     return null;
   }
-  const data = await response.json().catch(() => null);
   if (response.ok) {
     return data;
   }
@@ -64,18 +107,28 @@ function withQuery(path, query) {
 
 /**
  * A request made as the signed-in person. A 401 hands control to the
- * sign-in screen. A write refused for its anti-CSRF token is retried once
- * with a fresh token, which covers a session renewed in another tab.
+ * sign-in screen.
+ *
+ * A write refused for its anti-CSRF token means the session changed under
+ * the page. The session is read again, and the write is sent once more
+ * only if it still belongs to the actor the page is showing. If it does
+ * not, nothing is resent: the person wrote it as someone else.
  */
 async function request(method, path, options) {
   try {
     try {
       return await send(method, path, options);
     } catch (error) {
-      if (error.code !== "csrf_failed" || method === "GET" || !csrfToken) {
+      if (error.code !== "csrf_failed" || method === "GET") {
         throw error;
       }
-      await loadSession();
+      if (!(await recheckSession())) {
+        throw new ApiError(
+          error.status,
+          { code: "identity_changed", message: "Nothing was sent, because this browser's sign-in changed." },
+          null,
+        );
+      }
       return await send(method, path, options);
     }
   } catch (error) {
@@ -101,35 +154,55 @@ function messagePath(board, messageId, rest = "") {
  * Does not call the unauthenticated handler: the caller decides.
  */
 export async function loadSession() {
-  let session;
-  try {
-    session = await send("GET", "/v1/web/session");
-  } catch (error) {
-    if (error.status !== 404) {
-      throw error;
-    }
-    // A board built before browser sessions has no such route, but it
-    // still says who the caller is.
-    session = await send("GET", "/v1/whoami");
-  }
-  csrfToken = session.csrf_token || null;
-  return session;
+  return adopt(await send("GET", "/v1/web/session"));
 }
 
 /** Spends a sign-in code. The server sets the session cookie. */
 export async function login(code) {
-  const session = await send("POST", "/v1/web/login", { body: { code } });
+  return adopt(await send("POST", "/v1/web/login", { body: { code } }));
+}
+
+function adopt(session) {
   csrfToken = session.csrf_token || null;
+  shownActorId = session.actor.id;
   return session;
 }
 
+/**
+ * Reads the session again and takes its anti-CSRF token. Resolves to true
+ * when it still belongs to the actor the page is showing. Otherwise the
+ * matching handler has been called (signed out, or signed in as someone
+ * else) and it resolves to false. Rejects when the board cannot say.
+ */
+export async function recheckSession() {
+  const shown = shownActorId;
+  let session;
+  try {
+    session = await send("GET", "/v1/web/session");
+  } catch (error) {
+    if (error.status !== 401) {
+      throw error;
+    }
+    unauthenticatedHandler();
+    return false;
+  }
+  adopt(session);
+  if (shown !== null && session.actor.id !== shown) {
+    identityChangedHandler(session);
+    return false;
+  }
+  return true;
+}
+
+/** Revokes the session. Goes through `request`, so a stale token cannot stop it. */
 export async function logout() {
-  await send("POST", "/v1/logout");
-  csrfToken = null;
+  await request("POST", "/v1/logout");
+  forgetSession();
 }
 
 export function forgetSession() {
   csrfToken = null;
+  shownActorId = null;
 }
 
 // ----- Reads -----------------------------------------------------------

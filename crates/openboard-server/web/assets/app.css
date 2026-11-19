@@ -326,6 +326,10 @@ textarea {
   background: var(--person);
 }
 
+.live-status[data-status="paused"]::before {
+  border-style: dashed;
+}
+
 .live-status[data-status="off"]::before {
   display: none;
 }
@@ -346,7 +350,23 @@ textarea {
 }
 
 .notice {
-  margin: 0.5rem 0.75rem 0;
+  margin: 0.5rem 0.75rem;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: var(--radius);
+  background: var(--surface);
+  font-size: 0.9375rem;
+}
+
+.notice .next {
+  color: var(--muted);
+}
+
+.notice button {
+  min-height: 1.75rem;
+  margin-top: 0.375rem;
+  font-size: 0.8125rem;
 }
 
 /* ----- Panes ----------------------------------------------------------- */
@@ -408,6 +428,7 @@ textarea {
 .pane-scroll {
   flex: 1;
   min-height: 0;
+  overflow-x: hidden;
   overflow-y: auto;
 }
 
@@ -604,7 +625,12 @@ textarea {
 
 .message {
   position: relative;
+  min-width: 0;
   padding: 0.625rem 0.75rem 0.5rem 3.5rem;
+}
+
+.message:focus-visible {
+  outline-offset: -2px;
 }
 
 .message.root {
@@ -799,11 +825,34 @@ textarea {
 
 /* ----- Rendered Markdown ----------------------------------------------- */
 
+/* Anything too wide scrolls inside the message, never the pane. */
+.body {
+  overflow-x: auto;
+}
+
 .body.plain {
   white-space: pre-wrap;
 }
 
-.body > * {
+/* A very tall message is cut here until the person opens it (thread.js). */
+.body.collapsed {
+  overflow: hidden;
+  max-height: 30rem;
+  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 4rem), transparent);
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 4rem), transparent);
+}
+
+.show-more {
+  min-height: 1.75rem;
+  margin-top: 0.375rem;
+  border-radius: 999px;
+  color: var(--accent);
+  font-size: 0.8125rem;
+}
+
+/* Every block, at any depth: the browser's own margins would indent
+   a nested quote by 40px a level. */
+.body :is(p, ul, ol, blockquote, pre, table, hr, h1, h2, h3, h4, h5, h6) {
   margin: 0.375rem 0 0;
 }
 
@@ -842,7 +891,8 @@ textarea {
 }
 
 .body pre {
-  overflow-x: auto;
+  overflow: auto;
+  max-height: 32rem;
   padding: 0.625rem 0.75rem;
   border: 1px solid var(--border);
   border-radius: var(--radius);
@@ -854,6 +904,20 @@ textarea {
 .body pre code {
   padding: 0;
   background: none;
+}
+
+/* Text the server chose not to render arrives as one bare block: wrap it. */
+.body pre:not(:has(code)) {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* Quotes and lists stop indenting past four levels, so deep nesting
+   cannot squeeze the text into a column one character wide. */
+.body :is(blockquote, ul, ol) :is(blockquote, ul, ol) :is(blockquote, ul, ol) :is(blockquote, ul, ol) :is(blockquote, ul, ol) {
+  padding-left: 0;
+  border-left: 0;
+  list-style-position: inside;
 }
 
 .body blockquote {

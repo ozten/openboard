@@ -14,15 +14,21 @@ const SNIPPET_CHARS = 200;
 const LABELS_IN_LIST = 3;
 /** Events arriving within this time are answered by one round of reads. */
 const REFRESH_DELAY_MS = 300;
+/** A read that failed for a passing reason is tried again after this long, doubling up to the cap. */
 const RETRY_DELAY_MS = 5000;
+const MAX_RETRY_DELAY_MS = 60000;
 const SESSION_CHECK_INTERVAL_MS = 10000;
 const MAX_REOPEN_DELAY_MS = 30000;
+/** A tab hidden for longer than this gives up its event stream. */
+const HIDDEN_GRACE_MS = 3000;
 /** At this width all three panes show at once; below it, one at a time. */
 const wideLayout = window.matchMedia("(min-width: 900px)");
+const EVERYTHING = { channels: true, threads: true, thread: true };
 
 const byId = (id) => document.getElementById(id);
 const el = {
   gate: byId("gate"),
+  gateTitle: byId("gate-title"),
   gateLoading: byId("gate-loading"),
   gateBody: byId("gate-body"),
   gateText: byId("gate-text"),
@@ -106,8 +112,12 @@ function showGate() {
   el.gate.hidden = false;
 }
 
-/** The sign-in screen. What it offers depends on the code and the session. */
-function showSignIn({ lead = null, error = null } = {}) {
+/**
+ * The sign-in screen. What it offers depends on the code and the session.
+ * `fromApp` says the person was just looking at the board, so keyboard
+ * focus has to be given somewhere on this screen.
+ */
+function showSignIn({ lead = null, error = null, fromApp = false } = {}) {
   showGate();
   const actor = state.session && state.session.actor;
   let text;
@@ -135,6 +145,8 @@ function showSignIn({ lead = null, error = null } = {}) {
   }
   if (signInCode) {
     el.gateSignIn.focus();
+  } else if (fromApp) {
+    el.gateTitle.focus();
   }
 }
 
@@ -181,14 +193,62 @@ async function signIn() {
   enterApp(session).catch(showLoadFailure);
 }
 
-/** Any request answered with 401: the session ended, was revoked or expired. */
-function sessionEnded() {
-  if (!state.session) {
-    return;
-  }
+/**
+ * The session is over: signed out here, or ended, expired or revoked
+ * elsewhere. Nothing of the board may stay on the page behind the sign-in
+ * screen, so the lists, the open thread and every draft are emptied.
+ */
+function endSession(lead) {
   state.session = null;
   api.forgetSession();
-  showSignIn({ lead: "Your session has ended." });
+  clearTimeout(hiddenTimer);
+  clearTimeout(refreshTimer);
+  hiddenTimer = null;
+  refreshTimer = null;
+  stale = {};
+  threadView.reset();
+  state.boards = [];
+  state.board = null;
+  state.channels = [];
+  state.channelsLoaded = false;
+  state.channel = null;
+  state.threads = [];
+  state.threadsLoaded = false;
+  state.nextCursor = null;
+  state.threadId = null;
+  state.unseenChannels.clear();
+  state.unseenThreads.clear();
+  el.boardSelect.replaceChildren();
+  el.newThreadChannel.value = "";
+  el.newThreadText.value = "";
+  closeNewThread();
+  renderChannels();
+  el.meKind.replaceChildren();
+  el.meHandle.textContent = "";
+  el.meHandle.removeAttribute("title");
+  showNotice(null);
+  document.title = "Openboard";
+  showSignIn({ lead, fromApp: true });
+}
+
+/** Any request answered with 401. */
+function sessionEnded() {
+  if (state.session) {
+    endSession("Your session has ended.");
+  }
+}
+
+/**
+ * Another tab signed this browser in as someone else. Show the board as
+ * that person, say so, and keep what was being written in its box.
+ */
+function identityChanged(session) {
+  const was = state.me ? state.me.handle : "someone else";
+  const notice = {
+    message: `This browser is now signed in as ${session.actor.handle}, not ${was}: the sign-in changed in another tab.`,
+    next: "Nothing you were sending went out. What you had written is still in its box; send it again if you want to post it as this person.",
+  };
+  enterApp(session, notice).catch(showLoadFailure);
 }
 
 async function signOut() {
@@ -196,6 +256,9 @@ async function signOut() {
   try {
     await api.logout();
   } catch (error) {
+    if (error.code === "identity_changed") {
+      return;
+    }
     if (error.status !== 401) {
       showNotice(error);
       return;
@@ -203,13 +266,11 @@ async function signOut() {
   } finally {
     el.signOut.disabled = false;
   }
-  state.session = null;
-  api.forgetSession();
-  showSignIn({ lead: "You signed out." });
+  endSession("You signed out.");
 }
 
-/** Shows the board as the session's principal. */
-async function enterApp(session) {
+/** Shows the board as the session's principal, under `notice` if there is one. */
+async function enterApp(session, notice = null) {
   state.session = session;
   state.me = session.actor;
   el.meKind.replaceChildren(kindBadge(session.actor.kind));
@@ -221,10 +282,10 @@ async function enterApp(session) {
   }
   el.gate.hidden = true;
   el.app.hidden = false;
-  showNotice(null);
+  showNotice(notice);
   // Forget what was on screen so everything is read again as this principal.
   state.board = null;
-  dirty = {};
+  stale = {};
   await refreshBoards();
   await applyRoute({ initial: true });
 }
@@ -234,20 +295,25 @@ async function boot() {
   el.gateLoading.hidden = false;
   el.gateBody.hidden = true;
   let session = null;
+  let failure = null;
   try {
     session = await api.loadSession();
   } catch (error) {
     if (error.status !== 401) {
-      showLoadFailure(error);
-      return;
+      failure = error;
     }
   }
   state.session = session;
-  if (signInCode || !session) {
+  if (signInCode) {
+    // Whatever the probe said, signing in with the code may still work.
     showSignIn();
-    return;
+  } else if (failure) {
+    showLoadFailure(failure);
+  } else if (!session) {
+    showSignIn();
+  } else {
+    enterApp(session).catch(showLoadFailure);
   }
-  enterApp(session).catch(showLoadFailure);
 }
 
 // ----- The address bar ---------------------------------------------------
@@ -344,20 +410,29 @@ async function applyRoute({ initial = false } = {}) {
 
   const loads = [];
   if (boardChanged) {
-    loads.push(refreshChannels());
+    loads.push(["channels", refreshChannels()]);
   }
   if (channelChanged && route.channel) {
-    loads.push(refreshThreads());
+    loads.push(["threads", refreshThreads()]);
   }
   if (route.thread && (threadChanged || boardChanged)) {
-    loads.push(threadView.open(route.board, route.thread));
+    loads.push(["thread", threadView.open(route.board, route.thread)]);
   } else if (threadChanged) {
     threadView.close();
   }
-  try {
-    await Promise.all(loads);
-  } catch (error) {
-    retryLater(error, { channels: true, threads: true, thread: true });
+  const results = await Promise.allSettled(loads.map(([, load]) => load));
+  let rejected = false;
+  for (const [index, result] of results.entries()) {
+    if (result.status === "rejected") {
+      rejected = true;
+      if (selectionFailed(route, loads[index][0], result.reason)) {
+        // The address bar now names something that exists: show that.
+        await applyRoute();
+        return;
+      }
+    }
+  }
+  if (rejected) {
     return;
   }
 
@@ -370,6 +445,37 @@ async function applyRoute({ initial = false } = {}) {
     history.replaceState(null, "", routeUrl({ board: route.board, channel: latest.path }));
     await applyRoute();
   }
+}
+
+/**
+ * One of the reads for a selection failed. A passing failure is tried
+ * again later. Any other is the board's answer about the selection itself,
+ * for example a channel path that is not valid: asking again would only
+ * repeat it, so it is shown once and the selection is taken out of the
+ * address bar. Returns true when the address bar was changed.
+ */
+function selectionFailed(route, part, error) {
+  if (error.status === 401 || error.code === "identity_changed") {
+    return false;
+  }
+  if (error.transient) {
+    readFailed(error, { [part]: true });
+    return false;
+  }
+  showNotice(error);
+  let corrected = null;
+  if (part === "thread" && state.threadId === route.thread) {
+    corrected = { board: route.board, channel: route.channel };
+  } else if (part === "threads" && state.channel === route.channel) {
+    corrected = { board: route.board, thread: route.thread };
+  } else if (part === "channels" && state.board === route.board && route.board !== DEFAULT_BOARD) {
+    corrected = { board: DEFAULT_BOARD };
+  }
+  if (!corrected) {
+    return false;
+  }
+  history.replaceState(null, "", routeUrl(corrected));
+  return true;
 }
 
 /** A thread opened by its ID alone tells us which channel it is in. */
@@ -400,6 +506,9 @@ function updateView() {
 
 async function refreshBoards() {
   const list = await api.listBoards();
+  if (!state.session) {
+    return;
+  }
   state.boards = list.boards;
   const names = state.boards.map((board) => board.name);
   if (state.board && !names.includes(state.board)) {
@@ -489,7 +598,9 @@ async function showOlderThreads() {
     state.nextCursor = page.next_cursor || null;
     renderThreads();
   } catch (error) {
-    showNotice(error);
+    if (error.status !== 401) {
+      showNotice(error);
+    }
   } finally {
     el.moreThreads.disabled = false;
   }
@@ -547,7 +658,7 @@ function threadItem(summary) {
 
 /** The start of a message's Markdown source, on one line. */
 function snippet(text) {
-  const line = text.replace(/\s+/g, " ").trim();
+  const line = text.slice(0, SNIPPET_CHARS * 4).replace(/\s+/g, " ").trim();
   return line.length > SNIPPET_CHARS ? `${line.slice(0, SNIPPET_CHARS)}…` : line;
 }
 
@@ -592,28 +703,40 @@ bindSendForm({
 
 // ----- Live updates ------------------------------------------------------
 //
-// One EventSource for the whole board. Events carry references, not text,
-// so each one marks what it touched as stale, and a short timer later the
-// stale parts are read again in one round.
+// One EventSource for the whole board, held only while the tab is visible.
+// The board speaks HTTP/1.1 and a browser allows about six connections to
+// one host, shared by every tab: if each background tab kept a stream, the
+// sixth would leave no connection for anyone's requests.
+//
+// Events carry references, not text, so each one marks what it touched as
+// stale, and a short timer later the stale parts are read again in one round.
 
 let stream = null;
-let streamFailed = false;
+/** Set while events may have been missed; the next `open` reads everything again. */
+let catchUpOnOpen = false;
+/** True while the stream is closed because the tab is in the background. */
+let streamPaused = false;
+let hiddenTimer = null;
 let reopenTimer = null;
 let reopenDelay = 1000;
 let lastSessionCheck = 0;
 
 function openStream() {
   closeStream();
+  if (document.hidden) {
+    streamPaused = true;
+    setLive("paused");
+    return;
+  }
   const source = new EventSource(api.streamUrl(state.board));
   stream = source;
   setLive("connecting");
   source.addEventListener("open", () => {
     setLive("live");
     reopenDelay = 1000;
-    if (streamFailed) {
-      // Events may have passed while the stream was down.
-      streamFailed = false;
-      scheduleRefresh({ channels: true, threads: true, thread: true });
+    if (catchUpOnOpen) {
+      catchUpOnOpen = false;
+      scheduleRefresh(EVERYTHING);
       refreshBoards().catch(() => {});
     }
   });
@@ -624,6 +747,7 @@ function openStream() {
 function closeStream() {
   clearTimeout(reopenTimer);
   reopenTimer = null;
+  streamPaused = false;
   if (stream) {
     stream.close();
     stream = null;
@@ -631,42 +755,96 @@ function closeStream() {
   setLive("off");
 }
 
+/** The tab has been in the background long enough: free its connection. */
+function pauseStream() {
+  hiddenTimer = null;
+  closeStream();
+  streamPaused = true;
+  setLive("paused");
+}
+
+/**
+ * The tab came to the front. While it was away another tab may have signed
+ * this browser out or in as someone else, so ask first. Then, if the
+ * stream was given up, read everything again and open a new one, which
+ * reads once more when it connects so nothing in between is missed.
+ */
+async function tabShown() {
+  try {
+    if (!(await api.recheckSession())) {
+      return;
+    }
+  } catch {
+    // The board did not answer. The reads below report that.
+  }
+  if (!state.session || document.hidden || !streamPaused) {
+    return;
+  }
+  scheduleRefresh(EVERYTHING, 0);
+  openStream();
+  catchUpOnOpen = true;
+}
+
 /**
  * The stream broke. The browser reconnects by itself after a dropped
  * connection and resumes from the last event it saw. It gives up after an
- * error answer, such as 401 or 429: then find out whether the session is
- * still good, and if it is, open a new stream after a growing delay.
+ * error answer. Then find out whether the session and the board are still
+ * good with ordinary requests, whose answers can be read, and only if they
+ * are, open a new stream after a growing delay.
  */
 async function streamError(source) {
   if (stream !== source) {
     return;
   }
-  streamFailed = true;
+  catchUpOnOpen = true;
   setLive("reconnecting");
   if (Date.now() - lastSessionCheck >= SESSION_CHECK_INTERVAL_MS) {
     lastSessionCheck = Date.now();
     try {
-      await api.loadSession();
-    } catch (error) {
-      if (error.status === 401) {
-        sessionEnded();
+      if (!(await api.recheckSession())) {
         return;
       }
+    } catch {
+      // Unreachable for now. The browser, or the timer below, tries again.
     }
   }
   if (stream !== source || source.readyState !== EventSource.CLOSED || reopenTimer) {
     return;
   }
+  try {
+    await refreshChannels();
+  } catch (error) {
+    if (!error.transient) {
+      // The board will not serve this board to us; a new stream would be
+      // refused the same way.
+      if (stream === source) {
+        closeStream();
+        if (error.status !== 401) {
+          showNotice(error);
+        }
+      }
+      return;
+    }
+  }
+  if (stream !== source || reopenTimer) {
+    return;
+  }
   reopenTimer = setTimeout(() => {
     reopenTimer = null;
     openStream();
-    streamFailed = true;
+    catchUpOnOpen = true;
   }, reopenDelay);
   reopenDelay = Math.min(reopenDelay * 2, MAX_REOPEN_DELAY_MS);
 }
 
 function setLive(status) {
-  const text = { live: "Live", connecting: "Connecting…", reconnecting: "Reconnecting…", off: "" }[status];
+  const text = {
+    live: "Live",
+    connecting: "Connecting…",
+    reconnecting: "Reconnecting…",
+    paused: "Paused in the background",
+    off: "",
+  }[status];
   el.liveStatus.textContent = text;
   el.liveStatus.dataset.status = status;
 }
@@ -691,17 +869,18 @@ function boardEvent(data) {
 }
 
 /** What needs reading again: any of `channels`, `threads` and `thread`. */
-let dirty = {};
+let stale = {};
 let refreshTimer = null;
 let refreshing = false;
+let retryDelay = RETRY_DELAY_MS;
 
 function scheduleRefresh(parts, delay = REFRESH_DELAY_MS) {
-  for (const [part, stale] of Object.entries(parts)) {
-    if (stale) {
-      dirty[part] = true;
+  for (const [part, isStale] of Object.entries(parts)) {
+    if (isStale) {
+      stale[part] = true;
     }
   }
-  if (!refreshTimer && !refreshing && Object.keys(dirty).length > 0) {
+  if (!refreshTimer && !refreshing && Object.keys(stale).length > 0) {
     refreshTimer = setTimeout(refreshStale, delay);
   }
 }
@@ -711,50 +890,65 @@ async function refreshStale() {
   if (!state.session) {
     return;
   }
-  const parts = dirty;
-  dirty = {};
+  const parts = stale;
+  stale = {};
   refreshing = true;
-  let failure = null;
-  try {
-    await Promise.all([
-      parts.channels && refreshChannels(),
-      parts.threads && refreshThreads(),
-      parts.thread && threadView.refresh(),
-    ]);
-    showNotice(null);
-  } catch (error) {
-    failure = error;
-  }
+  const results = await Promise.allSettled([
+    parts.channels && refreshChannels(),
+    parts.threads && refreshThreads(),
+    parts.thread && threadView.refresh(),
+  ]);
   refreshing = false;
-  if (failure) {
-    retryLater(failure, parts);
+  const failed = results.find((result) => result.status === "rejected");
+  if (failed) {
+    readFailed(failed.reason, parts);
   } else {
-    scheduleRefresh({});
+    retryDelay = RETRY_DELAY_MS;
+    if (noticeClearsItself) {
+      showNotice(null);
+    }
   }
+  // Whatever events marked stale while this round was running.
+  scheduleRefresh({});
 }
 
-/** A read failed: say so, and read the same parts again after a pause. */
-function retryLater(error, parts) {
-  if (error.status === 401) {
+/**
+ * A background read failed. Say so. Read the same parts again only when
+ * the failure can pass (the board unreachable, busy or failing), after a
+ * pause that doubles each time and honours `Retry-After`. Any other answer
+ * would be the same next time, so it is shown and not asked for again.
+ */
+function readFailed(error, parts) {
+  if (!state.session || error.status === 401 || error.code === "identity_changed") {
     return;
   }
-  showNotice(error);
-  const pause = Math.max(RETRY_DELAY_MS, (error.retryAfter || 0) * 1000);
+  showNotice(error, error.transient);
+  if (!error.transient) {
+    return;
+  }
+  const pause = Math.max(retryDelay, (error.retryAfter || 0) * 1000);
+  retryDelay = Math.min(retryDelay * 2, MAX_RETRY_DELAY_MS);
   scheduleRefresh(parts, pause);
 }
 
-/** A board-wide problem, shown under the top bar until a read succeeds. */
-function showNotice(error) {
-  if (error) {
-    showError(el.notice, error);
-  } else {
+/** True when the notice on screen reports a passing failure, which the next good read clears. */
+let noticeClearsItself = false;
+
+/** A board-wide message under the top bar. `null` removes it. */
+function showNotice(error, clearsItself = false) {
+  noticeClearsItself = Boolean(error) && clearsItself;
+  if (!error) {
     clearError(el.notice);
+    return;
   }
+  showError(el.notice, error);
+  el.notice.append(h("button", { type: "button", text: "Dismiss", on: { click: () => showNotice(null) } }));
 }
 
 // ----- Wiring ------------------------------------------------------------
 
 api.onUnauthenticated(sessionEnded);
+api.onIdentityChanged(identityChanged);
 
 el.gateSignIn.addEventListener("click", signIn);
 el.gateContinue.addEventListener("click", () => {
@@ -775,7 +969,9 @@ el.newThread.addEventListener("click", () => {
 });
 el.newThreadCancel.addEventListener("click", () => {
   closeNewThread();
-  el.newThread.focus();
+  // On a narrow screen with no channel chosen, closing the form leaves
+  // the threads pane, and the button that opened it, behind.
+  (el.newThread.offsetParent ? el.newThread : el.channelsTitle).focus();
 });
 el.moreThreads.addEventListener("click", showOlderThreads);
 
@@ -796,11 +992,27 @@ window.addEventListener("popstate", () => {
   }
 });
 
-// A sign-in link opened in a tab that already shows the board changes only
-// the fragment, so the page is not loaded again.
+document.addEventListener("visibilitychange", () => {
+  if (!state.session || el.app.hidden) {
+    return;
+  }
+  clearTimeout(hiddenTimer);
+  hiddenTimer = null;
+  if (document.hidden) {
+    hiddenTimer = setTimeout(pauseStream, HIDDEN_GRACE_MS);
+  } else {
+    tabShown();
+  }
+});
+
+// A sign-in link opened where the address already reads `/join`, which is
+// the sign-in screen after a link that did not work, differs only in its
+// fragment, so the browser does not load the page again. The board itself
+// lives at `/`, where a link is always a fresh load; a code that turns up
+// there some other way is taken out of the address bar and not used.
 window.addEventListener("hashchange", () => {
   const code = takeSignInCode();
-  if (code) {
+  if (code && !el.gate.hidden) {
     signInCode = code;
     showSignIn();
   }
