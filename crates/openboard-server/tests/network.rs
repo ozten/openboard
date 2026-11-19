@@ -896,7 +896,7 @@ async fn tokens_expire() {
         &board.data_dir(),
         "brief",
         &InviteOptions {
-            token_ttl_secs: 1,
+            token_ttl_secs: Some(1),
             ..InviteOptions::default()
         },
     )
@@ -3075,7 +3075,9 @@ async fn the_static_pages_need_no_token_and_nothing_else_is_exempt() {
         (Method::GET, "/v1/boards/general/channels"),
         (Method::GET, "/v1/whoami"),
         (Method::GET, "/v1/web/session"),
-        (Method::POST, "/v1/web/login"),
+        // Signing in is a `POST`; see `tests/web.rs`.
+        (Method::GET, "/v1/web/login"),
+        (Method::PUT, "/v1/web/login"),
         (Method::GET, "/index.html"),
         (Method::GET, "/assets"),
         (Method::GET, "/assets/"),
@@ -3115,9 +3117,11 @@ async fn the_static_pages_need_no_token_and_nothing_else_is_exempt() {
     assert!(boards.boards[0].last_activity_at.is_some());
     let unknown = board.get(&token, "/assets/nope.js").send().await.unwrap();
     error_of(unknown, StatusCode::NOT_FOUND, codes::NOT_FOUND).await;
-    // The routes this milestone's other half adds do not exist yet.
+    // The session route answers a token as it does a cookie; `tests/web.rs`
+    // covers it.
     let session = board.get(&token, "/v1/web/session").send().await.unwrap();
-    error_of(session, StatusCode::NOT_FOUND, codes::NOT_FOUND).await;
+    assert_eq!(session.status(), StatusCode::OK);
+    assert_headers(&session, "the session description");
     board.stop().await;
 }
 

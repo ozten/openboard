@@ -420,8 +420,9 @@ struct Found {
 }
 
 /// A character a handle can hold: those of an agent's name and of an email
-/// address.
-fn is_handle_byte(b: u8) -> bool {
+/// address. `names::validate_email` accepts no other character, so every
+/// person's handle can be mentioned.
+pub(crate) fn is_handle_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'+' | b'-' | b'@')
 }
 

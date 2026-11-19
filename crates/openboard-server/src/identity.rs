@@ -4,13 +4,23 @@
 //! running server and the operator functions, which use a second connection,
 //! share one implementation. Callers wrap mutations in a transaction.
 //!
-//! Secrets never reach the database: a token and an enrolment code are
-//! stored only as SHA-256 digests and are looked up by digest, so no secret
-//! is ever compared byte by byte.
+//! Secrets never reach the database: a token, a browser session's cookie
+//! value, an enrolment code and a person's sign-in code are stored only as
+//! SHA-256 digests and are looked up by digest, so no secret is ever
+//! compared byte by byte.
+//!
+//! An agent's token and a person's browser session are both rows of
+//! `credentials`, and an agent's enrolment code and a person's sign-in code
+//! are both rows of `invites`. What tells them apart is the kind of the
+//! principal they belong to and the prefix of the secret, which is part of
+//! what is hashed: a token cannot be presented as a session cookie or the
+//! other way round, and neither kind of code can be spent at the other's
+//! endpoint.
 
 use std::net::IpAddr;
 
 use openboard_api::auth::{CredentialInfo, TOKEN_PREFIX};
+use openboard_api::web::WEB_CODE_PREFIX;
 use openboard_api::ActorKind;
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use sha2::{Digest, Sha256};
@@ -24,6 +34,12 @@ use crate::time::{now_rfc3339, rfc3339_from_ms};
 const SECRET_BYTES: usize = 32;
 /// The longest token the server will hash. Anything longer is malformed.
 const MAX_TOKEN_HEX: usize = 128;
+
+/// Prefix of a session cookie's value, so secret scanners can recognise
+/// one and so that it can never be taken for a bearer token.
+pub(crate) const SESSION_PREFIX: &str = "obs_";
+/// Domain separation of the anti-CSRF token derived from a session secret.
+const CSRF_DOMAIN: &[u8] = b"openboard.csrf.v1\n";
 
 /// `meta` keys.
 pub(crate) const META_MODE: &str = "mode";
@@ -45,6 +61,10 @@ pub mod log_kinds {
     pub const INVITE_REVOKED: &str = "invite.revoked";
     pub const ENROL_SUCCEEDED: &str = "enrol.succeeded";
     pub const ENROL_FAILED: &str = "enrol.failed";
+    /// A person swapped a sign-in code for a browser session. The entry
+    /// names the session's credential.
+    pub const WEB_LOGIN_SUCCEEDED: &str = "web.login.succeeded";
+    pub const WEB_LOGIN_FAILED: &str = "web.login.failed";
     pub const CREDENTIAL_REVOKED: &str = "credential.revoked";
     pub const LOGOUT: &str = "logout";
     pub const AUTH_FAILED: &str = "auth.failed";
@@ -71,15 +91,53 @@ pub(crate) fn sha256_hex(text: &str) -> String {
     hex(&Sha256::digest(text.as_bytes()))
 }
 
+fn is_lower_hex(text: &str) -> bool {
+    text.bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn secret_lookup_hash(presented: &str, prefix: &str) -> Option<String> {
+    let secret = presented.strip_prefix(prefix)?;
+    let well_formed =
+        (SECRET_BYTES * 2..=MAX_TOKEN_HEX).contains(&secret.len()) && is_lower_hex(secret);
+    well_formed.then(|| sha256_hex(presented))
+}
+
 /// The digest to look a presented token up by, or `None` when the text
 /// cannot be a token, in which case nothing is looked up.
 pub(crate) fn token_lookup_hash(presented: &str) -> Option<String> {
-    let secret = presented.strip_prefix(TOKEN_PREFIX)?;
-    let well_formed = (SECRET_BYTES * 2..=MAX_TOKEN_HEX).contains(&secret.len())
-        && secret
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
-    well_formed.then(|| sha256_hex(presented))
+    secret_lookup_hash(presented, TOKEN_PREFIX)
+}
+
+/// The digest to look a presented session cookie value up by, or `None`
+/// when the text cannot be one. The prefix differs from a token's, so a
+/// token is never accepted from the cookie, nor a session from the
+/// `Authorization` header.
+pub(crate) fn session_lookup_hash(presented: &str) -> Option<String> {
+    secret_lookup_hash(presented, SESSION_PREFIX)
+}
+
+/// The anti-CSRF token of the session whose cookie value is `session`. It
+/// is derived, so nothing more is stored, and it cannot be turned back into
+/// the cookie value.
+pub(crate) fn csrf_token(session: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(CSRF_DOMAIN);
+    hasher.update(session.as_bytes());
+    hex(&hasher.finalize())
+}
+
+/// Compares two strings in time that depends only on their lengths.
+pub(crate) fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut difference = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        difference |= x ^ y;
+    }
+    std::hint::black_box(difference) == 0
 }
 
 /// The client address as the security log records it: the last octet of an
@@ -449,6 +507,9 @@ pub(crate) fn list_principals(
 pub(crate) struct InviteRow {
     pub id: String,
     pub handle: String,
+    /// The kind of the principal the invite is for. An invite for a person
+    /// is a sign-in code.
+    pub kind: ActorKind,
     pub created_ms: i64,
     pub expires_ms: i64,
 }
@@ -461,19 +522,81 @@ pub(crate) struct NewInvite {
     pub new_principal: bool,
 }
 
-/// Creates an invite for the agent `name`, creating the principal when the
-/// name is new. The name must already have passed
-/// [`crate::names::validate_handle`].
+/// Who an invite is for, which decides the shape of its code and the one
+/// endpoint that takes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InviteKind {
+    /// An enrolment code, swapped for a bearer token at `POST /v1/join`.
+    Agent,
+    /// A sign-in code, swapped for a browser session at
+    /// `POST /v1/web/login`.
+    Person,
+}
+
+impl InviteKind {
+    fn actor_kind(self) -> ActorKind {
+        match self {
+            InviteKind::Agent => ActorKind::Agent,
+            InviteKind::Person => ActorKind::Person,
+        }
+    }
+
+    fn code_prefix(self) -> &'static str {
+        match self {
+            InviteKind::Agent => "",
+            InviteKind::Person => WEB_CODE_PREFIX,
+        }
+    }
+
+    /// Prefix of the secret the code is swapped for.
+    fn secret_prefix(self) -> &'static str {
+        match self {
+            InviteKind::Agent => TOKEN_PREFIX,
+            InviteKind::Person => SESSION_PREFIX,
+        }
+    }
+
+    /// SQL that is true for the principals this kind of code may enrol.
+    fn principal_clause(self) -> &'static str {
+        match self {
+            InviteKind::Agent => "kind <> 'person'",
+            InviteKind::Person => "kind = 'person'",
+        }
+    }
+}
+
+/// Creates an invite for the principal `name`, creating the principal when
+/// the name is new. An agent's name must already have passed
+/// [`crate::names::validate_handle`], and a person's must be what
+/// [`crate::names::validate_email`] returned. `token_ttl_ms` is the lifetime
+/// of the token or session the code turns into.
 pub(crate) fn create_invite(
     conn: &Connection,
     name: &str,
+    kind: InviteKind,
     ttl_ms: i64,
     token_ttl_ms: i64,
     now_ms: i64,
 ) -> Result<NewInvite, String> {
     let sql = |error: rusqlite::Error| error.to_string();
-    let (principal_id, handle, new_principal) = match find_principal(conn, name).map_err(sql)? {
-        Some((id, handle)) => (id, handle, false),
+    let existing: Option<(String, String, bool)> = conn
+        .query_row(
+            &format!(
+                "SELECT id, handle, {} FROM principals WHERE handle_key = ?1",
+                kind.principal_clause()
+            ),
+            [handle_key(name)],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(sql)?;
+    let (principal_id, handle, new_principal) = match existing {
+        // The two kinds of name cannot collide, since only a person's holds
+        // an `@`. This guards the invariant all the same.
+        Some((_, _, false)) => {
+            return Err("that name belongs to a principal of another kind".to_owned())
+        }
+        Some((id, handle, true)) => (id, handle, false),
         None => {
             let id = format!("prn_{}", random_hex(12)?);
             conn.execute(
@@ -481,7 +604,7 @@ pub(crate) fn create_invite(
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
                     id,
-                    actor_kind_name(ActorKind::Agent),
+                    actor_kind_name(kind.actor_kind()),
                     name,
                     handle_key(name),
                     now_ms
@@ -492,7 +615,7 @@ pub(crate) fn create_invite(
         }
     };
     let id = format!("inv_{}", random_hex(8)?);
-    let code = random_hex(SECRET_BYTES)?;
+    let code = format!("{}{}", kind.code_prefix(), random_hex(SECRET_BYTES)?);
     let expires_ms = now_ms.saturating_add(ttl_ms);
     conn.execute(
         "INSERT INTO invites (id, principal_id, code_hash, token_ttl_ms, created_ms, expires_ms)
@@ -521,6 +644,7 @@ pub(crate) fn create_invite(
         row: InviteRow {
             id,
             handle,
+            kind: kind.actor_kind(),
             created_ms: now_ms,
             expires_ms,
         },
@@ -535,7 +659,7 @@ pub(crate) fn list_pending_invites(
     now_ms: i64,
 ) -> rusqlite::Result<Vec<InviteRow>> {
     conn.prepare(
-        "SELECT i.id, p.handle, i.created_ms, i.expires_ms
+        "SELECT i.id, p.handle, p.kind, i.created_ms, i.expires_ms
          FROM invites i JOIN principals p ON p.id = i.principal_id
          WHERE i.used_ms IS NULL AND i.revoked_ms IS NULL AND i.expires_ms > ?1
          ORDER BY i.created_ms, i.id",
@@ -544,47 +668,55 @@ pub(crate) fn list_pending_invites(
         Ok(InviteRow {
             id: row.get(0)?,
             handle: row.get(1)?,
-            created_ms: row.get(2)?,
-            expires_ms: row.get(3)?,
+            kind: kind_from_row(row, 2)?,
+            created_ms: row.get(3)?,
+            expires_ms: row.get(4)?,
         })
     })?
     .collect()
 }
 
-/// Whether `code` has the shape of an enrolment code: [`SECRET_BYTES`] bytes
-/// in lowercase hex. Anything else cannot be one and is refused without
-/// touching the database.
-pub(crate) fn code_is_well_formed(code: &str) -> bool {
-    code.len() == SECRET_BYTES * 2
-        && code
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+/// Whether `code` has the shape of a code of this kind: the kind's prefix
+/// and [`SECRET_BYTES`] bytes in lowercase hex. Anything else cannot be one
+/// and is refused without touching the database. The two kinds never share
+/// a shape, so a code of one kind is refused here for the other.
+pub(crate) fn code_is_well_formed(code: &str, kind: InviteKind) -> bool {
+    code.strip_prefix(kind.code_prefix())
+        .is_some_and(|secret| secret.len() == SECRET_BYTES * 2 && is_lower_hex(secret))
 }
 
-/// Swaps an enrolment code for a new credential. The code is consumed by
-/// one conditional update, so of any number of concurrent attempts with one
-/// code exactly one succeeds. Returns the token, which exists nowhere else,
-/// and the credential, or `None` when the code is wrong, expired, withdrawn
-/// or already used.
+/// Swaps a code for a new credential: an agent's enrolment code for a
+/// token, a person's sign-in code for a browser session. The code is
+/// consumed by one conditional update, so of any number of concurrent
+/// attempts with one code exactly one succeeds. Returns the secret, which
+/// exists nowhere else, and the credential, or `None` when the code is
+/// wrong, expired, withdrawn, already used or of the other kind. A code of
+/// the other kind is left unspent.
 ///
 /// The caller runs this inside a write transaction and appends the security
 /// log entry.
-pub(crate) fn join(
+pub(crate) fn redeem(
     conn: &Connection,
     code: &str,
+    kind: InviteKind,
     now_ms: i64,
 ) -> Result<Option<(String, Credential)>, String> {
     let sql = |error: rusqlite::Error| error.to_string();
     // Made before the code is looked at, so a failed attempt does the same
     // work as a successful one up to the first write.
-    let token = format!("{TOKEN_PREFIX}{}", random_hex(SECRET_BYTES)?);
+    let token = format!("{}{}", kind.secret_prefix(), random_hex(SECRET_BYTES)?);
     let credential_id = format!("crd_{}", random_hex(8)?);
     let code_hash = sha256_hex(code);
 
     let consumed = conn
         .execute(
-            "UPDATE invites SET used_ms = ?1
-             WHERE code_hash = ?2 AND used_ms IS NULL AND revoked_ms IS NULL AND expires_ms > ?1",
+            &format!(
+                "UPDATE invites SET used_ms = ?1
+                 WHERE code_hash = ?2 AND used_ms IS NULL AND revoked_ms IS NULL
+                   AND expires_ms > ?1
+                   AND principal_id IN (SELECT id FROM principals WHERE {})",
+                kind.principal_clause()
+            ),
             params![now_ms, code_hash],
         )
         .map_err(sql)?;
@@ -704,6 +836,41 @@ mod tests {
         ] {
             assert_eq!(token_lookup_hash(&bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn tokens_and_sessions_never_share_a_shape() {
+        let token = format!("{TOKEN_PREFIX}{}", "0a".repeat(32));
+        let session = format!("{SESSION_PREFIX}{}", "0a".repeat(32));
+        assert!(session_lookup_hash(&session).is_some());
+        assert_eq!(session_lookup_hash(&token), None);
+        assert_eq!(token_lookup_hash(&session), None);
+        assert_ne!(session_lookup_hash(&session), token_lookup_hash(&token));
+
+        let agent = "0a".repeat(32);
+        let web = format!("{WEB_CODE_PREFIX}{agent}");
+        assert!(code_is_well_formed(&agent, InviteKind::Agent));
+        assert!(code_is_well_formed(&web, InviteKind::Person));
+        assert!(!code_is_well_formed(&web, InviteKind::Agent));
+        assert!(!code_is_well_formed(&agent, InviteKind::Person));
+        assert!(!code_is_well_formed(WEB_CODE_PREFIX, InviteKind::Person));
+    }
+
+    #[test]
+    fn the_csrf_token_is_bound_to_its_session() {
+        let a = format!("{SESSION_PREFIX}{}", "0a".repeat(32));
+        let b = format!("{SESSION_PREFIX}{}", "0b".repeat(32));
+        assert_eq!(csrf_token(&a), csrf_token(&a));
+        assert_ne!(csrf_token(&a), csrf_token(&b));
+        assert_eq!(csrf_token(&a).len(), 64);
+        // It is not the digest the session is stored under.
+        assert_ne!(csrf_token(&a), sha256_hex(&a));
+
+        assert!(constant_time_eq("abc", "abc"));
+        assert!(!constant_time_eq("abc", "abd"));
+        assert!(!constant_time_eq("abc", "ab"));
+        assert!(!constant_time_eq("", "a"));
+        assert!(constant_time_eq("", ""));
     }
 
     #[test]

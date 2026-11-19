@@ -19,7 +19,8 @@ use rusqlite::{
 
 use crate::chain::{event_hash, EventFields, GENESIS_HASH, HASH_VERSION};
 use crate::identity::{
-    self, actor_kind_name, log_kinds, parse_actor_kind, AuthOutcome, Credential, LogEntry,
+    self, actor_kind_name, log_kinds, parse_actor_kind, AuthOutcome, Credential, InviteKind,
+    LogEntry,
 };
 use crate::limits::LogRetention;
 use crate::markdown::Candidate;
@@ -614,14 +615,40 @@ impl Store {
         code: &str,
         client: Option<IpAddr>,
     ) -> Result<Option<(String, Credential)>> {
+        self.redeem(code, InviteKind::Agent, log_kinds::ENROL_SUCCEEDED, client)
+    }
+
+    /// Swaps a person's sign-in code for a browser session. Returns the
+    /// cookie value, which exists nowhere else, and the session's
+    /// credential. Logged like [`Store::join`].
+    pub(crate) fn web_login(
+        &self,
+        code: &str,
+        client: Option<IpAddr>,
+    ) -> Result<Option<(String, Credential)>> {
+        self.redeem(
+            code,
+            InviteKind::Person,
+            log_kinds::WEB_LOGIN_SUCCEEDED,
+            client,
+        )
+    }
+
+    fn redeem(
+        &self,
+        code: &str,
+        kind: InviteKind,
+        succeeded: &str,
+        client: Option<IpAddr>,
+    ) -> Result<Option<(String, Credential)>> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let joined = identity::join(&tx, code, now_ms()).map_err(StoreError::Other)?;
-        if let Some((_, credential)) = &joined {
+        let redeemed = identity::redeem(&tx, code, kind, now_ms()).map_err(StoreError::Other)?;
+        if let Some((_, credential)) = &redeemed {
             identity::log(
                 &tx,
                 &LogEntry {
-                    kind: log_kinds::ENROL_SUCCEEDED,
+                    kind: succeeded,
                     principal: Some(&credential.handle),
                     credential_id: Some(&credential.id),
                     client,
@@ -630,11 +657,17 @@ impl Store {
             )?;
         }
         tx.commit()?;
-        Ok(joined)
+        Ok(redeemed)
     }
 
-    /// Revokes the caller's own credential.
-    pub(crate) fn logout(&self, credential: &Credential, client: Option<IpAddr>) -> Result<()> {
+    /// Revokes the caller's own credential: a token, or a browser session,
+    /// for which `detail` says so in the security log.
+    pub(crate) fn logout(
+        &self,
+        credential: &Credential,
+        client: Option<IpAddr>,
+        detail: Option<&str>,
+    ) -> Result<()> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         identity::revoke_credential(&tx, &credential.id, now_ms())?;
@@ -645,7 +678,7 @@ impl Store {
                 principal: Some(&credential.handle),
                 credential_id: Some(&credential.id),
                 client,
-                detail: None,
+                detail,
             },
         )?;
         tx.commit()?;

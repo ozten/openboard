@@ -147,6 +147,44 @@ pub(crate) fn handle_key(name: &str) -> String {
     name.to_ascii_lowercase()
 }
 
+/// Longest email address, in bytes.
+const MAX_EMAIL_LEN: usize = 254;
+
+/// Checks a person's email address and returns it lowercased, which is the
+/// person's handle.
+///
+/// The check is loose about what an address is and strict about what a
+/// handle may hold. The address is at most 254 bytes of ASCII letters,
+/// digits and `.`, `_`, `+`, `-`, with exactly one `@`, and every character
+/// that is not a letter or digit stands between two that are. So the local
+/// part and the domain are not empty, there is no whitespace or control
+/// character, and `@` followed by the address is always read as one mention
+/// of it: the mention grammar matches every character, nothing is trimmed
+/// from its end, and no run of punctuation can be taken for Markdown.
+pub(crate) fn validate_email(address: &str) -> Result<String, &'static str> {
+    const SHAPE: &str = "an email address is letters, digits and single '.', '_', '+' or '-' \
+                         between them, around one '@'";
+    if address.is_empty() || address.len() > MAX_EMAIL_LEN {
+        return Err("an email address is 1 to 254 characters");
+    }
+    let bytes = address.as_bytes();
+    if !bytes.iter().all(|b| crate::markdown::is_handle_byte(*b)) {
+        return Err(SHAPE);
+    }
+    let alphanumeric_at = |at: Option<usize>| {
+        at.and_then(|at| bytes.get(at))
+            .is_some_and(u8::is_ascii_alphanumeric)
+    };
+    let separators_are_enclosed = bytes.iter().enumerate().all(|(at, b)| {
+        b.is_ascii_alphanumeric()
+            || (alphanumeric_at(at.checked_sub(1)) && alphanumeric_at(Some(at + 1)))
+    });
+    if !separators_are_enclosed || bytes.iter().filter(|b| **b == b'@').count() != 1 {
+        return Err(SHAPE);
+    }
+    Ok(address.to_ascii_lowercase())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,5 +316,65 @@ mod tests {
             assert!(validate_handle(bad).is_err(), "{bad}");
         }
         assert_eq!(handle_key("Builder"), handle_key("bUILDER"));
+    }
+
+    #[test]
+    fn email_addresses() {
+        let longest = format!("{}@example.com", "a".repeat(254 - "@example.com".len()));
+        for ok in [
+            "ada@example.com",
+            "Ada.Lovelace+board@Mail.Example.COM",
+            "a@b",
+            "first_last-2@sub-domain.example.org",
+            "7@9",
+            longest.as_str(),
+        ] {
+            let handle = validate_email(ok).unwrap_or_else(|reason| panic!("{ok}: {reason}"));
+            assert_eq!(handle, ok.to_ascii_lowercase());
+            // No agent can hold it, and it is its own comparison key.
+            assert!(validate_handle(&handle).is_err());
+            assert_eq!(handle_key(ok), handle);
+            // `@` and the address is one mention of exactly the address,
+            // also at the end of a sentence.
+            for text in [format!("@{ok}"), format!("ask @{ok}, please. @{ok}.")] {
+                let found = crate::markdown::mention_candidates(&text);
+                assert_eq!(found.len(), 1, "{text}");
+                assert_eq!(found[0].handle, ok, "{text}");
+                assert_eq!(found[0].profile, None, "{text}");
+            }
+        }
+        let too_long = format!("{}@example.com", "a".repeat(255 - "@example.com".len()));
+        for bad in [
+            "",
+            "ada",
+            "@example.com",
+            "ada@",
+            "@",
+            "ada@@example.com",
+            "ada@example@com",
+            "ada @example.com",
+            "ada@exam ple.com",
+            " ada@example.com",
+            "ada@example.com\n",
+            "ada\t@example.com",
+            "ada\u{0}@example.com",
+            "ada@example.com.",
+            ".ada@example.com",
+            "ada.@example.com",
+            "ada@.example.com",
+            "a..b@example.com",
+            "_ada_@example.com",
+            "a__b@example.com",
+            "ada@example.com/reviewer",
+            "ada*@example.com",
+            "<ada@example.com>",
+            "ada@[127.0.0.1]",
+            "\"ada\"@example.com",
+            "ada@exämple.com",
+            "ädä@example.com",
+            too_long.as_str(),
+        ] {
+            assert!(validate_email(bad).is_err(), "{bad:?}");
+        }
     }
 }
