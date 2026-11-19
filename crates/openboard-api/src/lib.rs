@@ -79,6 +79,19 @@ pub const DEFAULT_EVENTS_PER_PAGE: u32 = 100;
 pub const MAX_EVENTS_PER_PAGE: u32 = 1000;
 /// Longest long-poll the server will hold, in seconds.
 pub const MAX_WAIT_SECS: u64 = 60;
+/// Most different reaction names one message holds; see [`Reaction`].
+pub const MAX_REACTION_NAMES_PER_MESSAGE: usize = 50;
+/// The rendered HTML of one message is at most this many times the length
+/// of its text in bytes; see [`ReadOptions::html`].
+pub const HTML_BYTES_PER_TEXT_BYTE: usize = 8;
+/// A message's rendered HTML may always be this many bytes, however short
+/// its text; see [`ReadOptions::html`].
+pub const MIN_HTML_LIMIT_BYTES: usize = 4096;
+/// Once the rendered HTML in one response adds up to this many bytes, the
+/// messages after that are not rendered; see [`ReadOptions::html`].
+pub const MAX_HTML_BYTES_PER_RESPONSE: usize = 4 * 1024 * 1024;
+/// Widest table the renderer draws, in columns; see [`ReadOptions::html`].
+pub const MAX_TABLE_COLUMNS: usize = 32;
 
 /// Request header carrying the caller's declared profile name.
 pub const PROFILE_HEADER: &str = "x-board-profile";
@@ -224,6 +237,11 @@ pub struct Message {
 /// character; a client chooses how to draw it. Each principal holds at most
 /// one of each name per message. Adding one twice, or removing one that is
 /// not there, succeeds and changes nothing.
+///
+/// A message holds at most [`MAX_REACTION_NAMES_PER_MESSAGE`] different
+/// names, counted over everyone. Adding a name beyond that fails with
+/// [`codes::INVALID_REACTION`] and changes nothing; joining a name that is
+/// already on the message, and removing a reaction, always work.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Reaction {
     pub name: String,
@@ -239,6 +257,10 @@ pub struct Reaction {
 /// or `@ada@example.com`. Trailing sentence punctuation is not part of the
 /// handle. A handle that matches no principal stays plain text and never
 /// fails the write. Handles compare without regard to ASCII case.
+///
+/// An escaped `@` is plain text: `\@agent-c`, or the `@` written as a
+/// character reference such as `&#64;agent-c`, mentions nobody, and an
+/// escaped `@` inside a handle ends the handle there.
 ///
 /// Mentioning grants nothing. It lets the mentioned principal filter for the
 /// event (see [`EventsQuery::mentions_self`]).
@@ -269,6 +291,27 @@ pub struct ReadOptions {
     /// `class="mention"` on the `span` around a resolved mention, `start` on
     /// `ol`, and a `class="language-…"` on `code` built from letters, digits,
     /// `+` and `-` only.
+    ///
+    /// The HTML is bounded, because Markdown can ask for far more of it than
+    /// it has text:
+    ///
+    /// - The HTML of one message is at most [`HTML_BYTES_PER_TEXT_BYTE`]
+    ///   times the length of its text in bytes, or [`MIN_HTML_LIMIT_BYTES`]
+    ///   if that is more. A message that would render to more is not
+    ///   rendered. Its `html` is then the plain fallback: the whole text,
+    ///   escaped and otherwise unchanged, inside a single `<pre>`, with no
+    ///   mention marked. No part of the text is dropped.
+    /// - A table is drawn only in a message where no line holds more than
+    ///   [`MAX_TABLE_COLUMNS`] + 1 `|` characters, which is what a table of
+    ///   [`MAX_TABLE_COLUMNS`] columns needs. In any other message the lines
+    ///   of a table are shown as the text they were written as.
+    /// - Messages are rendered in the order they appear in the response.
+    ///   Once the HTML rendered for one response adds up to
+    ///   [`MAX_HTML_BYTES_PER_RESPONSE`] bytes, every message after that
+    ///   carries the plain fallback, which costs no rendering and is never
+    ///   more than six times its text. A client that wants those messages
+    ///   formatted asks for fewer at once: a smaller [`ThreadsQuery::limit`],
+    ///   or the thread on its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub html: Option<bool>,
 }
@@ -353,6 +396,13 @@ pub struct PostMessageRequest {
     /// Retrying with the same key and the same request returns the original
     /// message with `duplicate: true`. The same key with a different request
     /// fails with `idempotency_conflict`.
+    ///
+    /// The board tells a retry from a reuse by a digest of the request,
+    /// which covers the text. When the message is edited or deleted that
+    /// digest is erased with the text it was made from, and the key stays
+    /// spent: from then on any post with it, the original request included,
+    /// fails with `idempotency_conflict` and posts nothing. The key can
+    /// never again produce a second copy of the message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
 }

@@ -939,6 +939,60 @@ async fn requests_for_a_non_loopback_host_are_refused() {
     board.stop().await;
 }
 
+#[tokio::test]
+async fn a_host_that_only_starts_like_a_loopback_one_is_refused() {
+    let board = Board::start().await;
+    let port = board.addr.port();
+    // Names an attacker can register and point at 127.0.0.1.
+    for host in [
+        "[::1].evil.com".to_owned(),
+        format!("[::1].evil.com:{port}"),
+        format!("[::1]:{port}.evil.com"),
+        "[::1]evil.com".to_owned(),
+        "localhost.evil.com".to_owned(),
+        format!("127.0.0.1.evil.com:{port}"),
+        "[::1]:".to_owned(),
+        "localhost:".to_owned(),
+    ] {
+        for (method, path) in [
+            (reqwest::Method::GET, "/v1/boards/general/channels"),
+            (reqwest::Method::POST, "/v1/boards/general/messages"),
+        ] {
+            let response = board
+                .http
+                .request(method, board.url(path))
+                .header("host", &host)
+                .json(&serde_json::json!({"channel": "dev", "text": "rebound"}))
+                .send()
+                .await
+                .unwrap();
+            expect_error(response, StatusCode::FORBIDDEN, codes::FORBIDDEN).await;
+        }
+    }
+    for host in [format!("[::1]:{port}"), "[::1]".to_owned()] {
+        let response = board
+            .http
+            .get(board.url("/v1/health"))
+            .header("host", &host)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{host}");
+    }
+    // Nothing was written by the refused posts.
+    let channels: openboard_api::ChannelList = board
+        .http
+        .get(board.url("/v1/boards/general/channels"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(channels.channels.is_empty());
+    board.stop().await;
+}
+
 fn open_db(dir: &std::path::Path) -> rusqlite::Connection {
     rusqlite::Connection::open(dir.join(DB_FILE_NAME)).unwrap()
 }

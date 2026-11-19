@@ -13,7 +13,8 @@ use openboard_api::auth::{
     parse_fingerprint, CredentialInfo, JoinResponse, WhoAmI, MODE_LOCAL, MODE_NETWORK,
 };
 use openboard_api::web::{
-    sign_in_link, Session, CSRF_HEADER, DEFAULT_SESSION_TTL_SECS, SESSION_COOKIE, WEB_CODE_PREFIX,
+    session_cookie_name, sign_in_link, Session, CSRF_HEADER, DEFAULT_SESSION_TTL_SECS,
+    SESSION_COOKIE_PREFIX, WEB_CODE_PREFIX,
 };
 use openboard_api::{
     codes, ActorKind, BoardList, ErrorBody, EventsResponse, Message, PostMessageResponse, Thread,
@@ -121,6 +122,8 @@ struct Net {
 /// A signed-in browser: what it holds after `POST /v1/web/login`.
 #[derive(Debug, Clone)]
 struct Browser {
+    /// The cookie's name: the one of the board that set it.
+    name: String,
     /// The cookie's value: the session's secret.
     secret: String,
     csrf: String,
@@ -130,7 +133,7 @@ struct Browser {
 impl Browser {
     /// The `Cookie` header a browser sends.
     fn cookie(&self) -> String {
-        format!("{SESSION_COOKIE}={}", self.secret)
+        format!("{}={}", self.name, self.secret)
     }
 }
 
@@ -201,6 +204,17 @@ impl Net {
         format!("{}{path}", self.url)
     }
 
+    /// The name of this board's session cookie: the one for its port.
+    fn cookie_name(&self) -> String {
+        session_cookie_name(self.addr.port())
+    }
+
+    /// A `Cookie` header that holds this board's session cookie with
+    /// `value`.
+    fn cookie(&self, value: &str) -> String {
+        format!("{}={value}", self.cookie_name())
+    }
+
     async fn stop(mut self) -> TempDir {
         self.stop.take().unwrap().send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(10), self.task)
@@ -240,15 +254,32 @@ impl Net {
     /// Swaps a sign-in code for a session, as the sign-in page does.
     async fn login(&self, code: &str) -> Browser {
         let response = self.login_raw(code).await;
+        self.signed_in(response).await
+    }
+
+    /// Signs in from a browser that already holds cookies for this host.
+    async fn login_with_cookies(&self, code: &str, cookies: &str) -> Response {
+        self.http
+            .post(self.at("/v1/web/login"))
+            .header("cookie", cookies)
+            .json(&json!({ "code": code }))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    /// What the browser holds after a successful sign-in.
+    async fn signed_in(&self, response: Response) -> Browser {
         assert_eq!(response.status(), StatusCode::OK);
         let secret = cookie_set_by(&response)
             .split(';')
             .next()
-            .and_then(|pair| pair.strip_prefix(&format!("{SESSION_COOKIE}=")))
+            .and_then(|pair| pair.strip_prefix(&self.cookie("")))
             .expect("the session cookie")
             .to_owned();
         let session: Session = response.json().await.unwrap();
         Browser {
+            name: self.cookie_name(),
             secret,
             csrf: session.csrf_token.expect("a CSRF token"),
             credential: session.credential.expect("a credential"),
@@ -678,8 +709,12 @@ async fn signing_in_swaps_the_code_for_a_session_cookie_exactly_once() {
     // The cookie, attribute by attribute.
     let mut parts = cookie.split("; ");
     let (name, secret) = parts.next().unwrap().split_once('=').unwrap();
-    assert_eq!(name, "__Host-openboard_session");
-    assert_eq!(name, SESSION_COOKIE);
+    assert_eq!(
+        name,
+        format!("__Host-openboard_session_{}", board.addr.port())
+    );
+    assert_eq!(name, session_cookie_name(board.addr.port()));
+    assert!(name.starts_with(SESSION_COOKIE_PREFIX));
     let attributes: Vec<&str> = parts.collect();
     assert_eq!(
         attributes,
@@ -720,6 +755,7 @@ async fn signing_in_swaps_the_code_for_a_session_cookie_exactly_once() {
         DEFAULT_SESSION_TTL_SECS as i64
     );
     let browser = Browser {
+        name: board.cookie_name(),
         secret: secret.to_owned(),
         csrf,
         credential,
@@ -779,14 +815,20 @@ async fn signing_in_swaps_the_code_for_a_session_cookie_exactly_once() {
         browser.cookie().to_uppercase()
     );
     for cookie in [
-        format!("{SESSION_COOKIE}={unknown}"),
-        format!("{SESSION_COOKIE}={token_shaped}"),
-        format!("{SESSION_COOKIE}="),
-        format!("{SESSION_COOKIE}=\"{secret}\""),
-        format!("{SESSION_COOKIE}={secret}x"),
-        format!("{SESSION_COOKIE}={}", secret.to_uppercase()),
+        board.cookie(&unknown),
+        board.cookie(&token_shaped),
+        board.cookie(""),
+        board.cookie(&format!("\"{secret}\"")),
+        board.cookie(&format!("{secret}x")),
+        board.cookie(&secret.to_uppercase()),
         // The first cookie of that name counts.
-        format!("{SESSION_COOKIE}=nope; {}", browser.cookie()),
+        format!("{}; {}", board.cookie("nope"), browser.cookie()),
+        // The name without a port, and with another board's port, are
+        // not this board's cookie.
+        format!("__Host-openboard_session={secret}"),
+        format!("{SESSION_COOKIE_PREFIX}={secret}"),
+        format!("{SESSION_COOKIE_PREFIX}1={secret}"),
+        format!("{}0={secret}", board.cookie_name()),
         format!("openboard_session={secret}"),
         format!("__Secure-openboard_session={secret}"),
         "unrelated=1".to_owned(),
@@ -968,7 +1010,7 @@ async fn a_code_is_not_spent_at_the_wrong_endpoint() {
     let as_cookie = board
         .http
         .get(board.at("/v1/whoami"))
-        .header("cookie", format!("{SESSION_COOKIE}={}", joined.token))
+        .header("cookie", board.cookie(&joined.token))
         .send()
         .await
         .unwrap();
@@ -1321,10 +1363,7 @@ async fn a_local_board_refuses_foreign_origins_and_describes_its_session() {
     let response = board
         .http
         .get(board.at("/v1/web/session"))
-        .header(
-            "cookie",
-            format!("{SESSION_COOKIE}=obs_{}", "ab".repeat(32)),
-        )
+        .header("cookie", board.cookie(&format!("obs_{}", "ab".repeat(32))))
         .header("x-board-profile", "desk")
         .send()
         .await
@@ -1484,7 +1523,7 @@ async fn the_authorization_header_beats_the_cookie() {
     // is the person.
     let response = whoami(
         Some(format!("Bearer {token}")),
-        Some(format!("{SESSION_COOKIE}=garbage")),
+        Some(board.cookie("garbage")),
     )
     .await
     .unwrap();
@@ -1526,9 +1565,13 @@ async fn logout_revokes_the_session_and_clears_the_cookie() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    // The cookie that is cleared is this board's own.
     assert_eq!(
         cookie_set_by(&response),
-        "__Host-openboard_session=; Secure; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"
+        format!(
+            "__Host-openboard_session_{}=; Secure; HttpOnly; SameSite=Strict; Path=/; Max-Age=0",
+            board.addr.port()
+        )
     );
 
     // The session is gone for good, whatever the browser still sends, and
@@ -1688,6 +1731,7 @@ async fn sessions_expire() {
         .to_owned();
     let session: Session = response.json().await.unwrap();
     let brief = Browser {
+        name: board.cookie_name(),
         secret,
         csrf: session.csrf_token.unwrap(),
         credential: session.credential.unwrap(),
@@ -1960,4 +2004,494 @@ async fn an_agent_mentions_a_person_and_their_long_poll_wakes() {
     assert_eq!(mine.events[0].by.handle, "ada@example.com");
     assert_eq!(mine.events[0].by.kind, ActorKind::Person);
     Arc::into_inner(board).unwrap().stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Review fixes
+// ---------------------------------------------------------------------------
+
+/// The security log's entries of one type, as their details.
+fn logged(data_dir: &Path, kind: &str) -> Vec<Option<String>> {
+    operator::security_log(data_dir, None)
+        .unwrap()
+        .into_iter()
+        .filter(|entry| entry.kind == kind)
+        .map(|entry| entry.detail)
+        .collect()
+}
+
+#[tokio::test]
+async fn loading_the_page_signed_out_is_not_a_failed_authentication() {
+    let budget = 3;
+    let board = Net::start_with(|config| config.limits.auth_failures_per_minute = budget).await;
+    let ada = board.sign_in("ada@example.com").await;
+    let data_dir = board.data_dir();
+    let session = |cookie: Option<String>| {
+        let mut request = board.http.get(board.at("/v1/web/session"));
+        if let Some(cookie) = cookie {
+            request = request.header("cookie", cookie);
+        }
+        async move { request.send().await.unwrap() }
+    };
+
+    // What the page does when nobody is signed in, many times over, from
+    // one address: no `Authorization` header and no session cookie of this
+    // board. Other applications' cookies, and another board's session, are
+    // not a credential here.
+    let mut refusal = None;
+    for round in 0..(budget * 10) {
+        let cookie = match round % 4 {
+            0 => None,
+            1 => Some("theme=dark; other=1".to_owned()),
+            2 => Some(format!(
+                "{SESSION_COOKIE_PREFIX}1=obs_{}; __Host-openboard_session=obs_{}",
+                "ab".repeat(32),
+                "cd".repeat(32)
+            )),
+            _ => Some(String::new()),
+        };
+        let response = session(cookie).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "round {round}");
+        assert_eq!(response.headers()["www-authenticate"], "Bearer");
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert!(response.headers().get("retry-after").is_none());
+        let body = response.bytes().await.unwrap();
+        assert_eq!(*refusal.get_or_insert(body.clone()), body, "round {round}");
+    }
+    let refusal = refusal.unwrap();
+    // None of it was counted, and none of it was logged.
+    assert_eq!(logged(&data_dir, log_kinds::AUTH_FAILED), []);
+    assert_eq!(logged(&data_dir, log_kinds::RATE_LIMITED), []);
+    assert_eq!(logged(&data_dir, log_kinds::LOG_SUPPRESSED), []);
+    // The person who is signed in is still answered.
+    assert_eq!(session(Some(ada.cookie())).await.status(), StatusCode::OK);
+
+    // The rule is that route and that method only. Everywhere else a
+    // request without a credential is a failed authentication as before,
+    // and its answer is the very same one.
+    let elsewhere = [
+        board.http.get(board.at("/v1/whoami")),
+        board.http.post(board.at("/v1/web/session")),
+        board.http.get(board.at("/v1/web/session/")),
+    ];
+    for request in elsewhere {
+        let response = request.send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.headers()["www-authenticate"], "Bearer");
+        assert_eq!(response.bytes().await.unwrap(), refusal);
+    }
+    assert_eq!(
+        logged(&data_dir, log_kinds::AUTH_FAILED),
+        vec![Some("no token".to_owned()); budget as usize]
+    );
+    // That spent the address's budget, so the next failure is limited.
+    let limited = board.http.get(board.at("/v1/whoami")).send().await.unwrap();
+    expect_rate_limited(limited).await;
+    // The signed-out page load is answered exactly as before, even now: it
+    // says nothing about the state of the budget either.
+    let response = session(None).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(response.headers().get("retry-after").is_none());
+    assert_eq!(response.bytes().await.unwrap(), refusal);
+    // A credential that is presented on that route and is wrong is a
+    // failed authentication like any other: here it meets the limit.
+    for wrong in [
+        board.cookie(&format!("obs_{}", "ab".repeat(32))),
+        board.cookie("garbage"),
+        board.cookie(""),
+    ] {
+        expect_rate_limited(session(Some(wrong)).await).await;
+    }
+    let with_header = board
+        .http
+        .get(board.at("/v1/web/session"))
+        .header("authorization", "Basic abc")
+        .send()
+        .await
+        .unwrap();
+    expect_rate_limited(with_header).await;
+    assert_eq!(
+        logged(&data_dir, log_kinds::AUTH_FAILED).len(),
+        budget as usize
+    );
+    board.stop().await;
+}
+
+#[tokio::test]
+async fn a_wrong_credential_on_the_session_route_is_counted_and_logged() {
+    let board = Net::start_with(|config| config.limits.auth_failures_per_minute = 4).await;
+    let ada = board.sign_in("ada@example.com").await;
+    let data_dir = board.data_dir();
+    operator::revoke_credential(&data_dir, &ada.credential.id).unwrap();
+    let signed_out = board
+        .http
+        .get(board.at("/v1/web/session"))
+        .send()
+        .await
+        .unwrap();
+    let refusal = signed_out.bytes().await.unwrap();
+
+    let requests = [
+        board
+            .http
+            .get(board.at("/v1/web/session"))
+            .header("cookie", board.cookie(&format!("obs_{}", "ab".repeat(32)))),
+        board
+            .http
+            .get(board.at("/v1/web/session"))
+            .header("cookie", board.cookie("garbage")),
+        board
+            .http
+            .get(board.at("/v1/web/session"))
+            .header("cookie", ada.cookie()),
+        board
+            .http
+            .get(board.at("/v1/web/session"))
+            .bearer_auth(format!("obt_{}", "ab".repeat(32))),
+    ];
+    for request in requests {
+        let response = request.send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        // The same answer as the one that was not counted.
+        assert_eq!(response.bytes().await.unwrap(), refusal);
+    }
+    assert_eq!(
+        logged(&data_dir, log_kinds::AUTH_FAILED),
+        [
+            Some("unknown session".to_owned()),
+            Some("malformed session".to_owned()),
+            Some("revoked session".to_owned()),
+            Some("unknown token".to_owned()),
+        ]
+    );
+    let fifth = board
+        .http
+        .get(board.at("/v1/web/session"))
+        .header("cookie", board.cookie("garbage"))
+        .send()
+        .await
+        .unwrap();
+    expect_rate_limited(fifth).await;
+    board.stop().await;
+}
+
+#[tokio::test]
+async fn signing_in_again_replaces_the_session_of_the_same_browser() {
+    let board = Net::start().await;
+    let data_dir = board.data_dir();
+    let first = board.sign_in("ada@example.com").await;
+    // Ada's other browser, and somebody else.
+    let phone = board.sign_in("ada@example.com").await;
+    let bob = board.sign_in("bob@example.com").await;
+    assert_eq!(logged(&data_dir, log_kinds::LOGOUT), []);
+
+    // The browser that holds `first` opens a new sign-in link.
+    let code = board.person("ada@example.com").code;
+    let cookies = format!("theme=dark; {}", first.cookie());
+    let response = board.login_with_cookies(&code, &cookies).await;
+    let second = board.signed_in(response).await;
+    assert_ne!(second.credential.id, first.credential.id);
+    assert_eq!(board.status_of(&second).await, StatusCode::OK);
+    // The earlier session of that browser is gone, and only that one.
+    assert_eq!(board.status_of(&first).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(board.status_of(&phone).await, StatusCode::OK);
+    assert_eq!(board.status_of(&bob).await, StatusCode::OK);
+    let revoked = |id: &str| {
+        operator::list_credentials(&data_dir)
+            .unwrap()
+            .into_iter()
+            .find(|credential| credential.id == id)
+            .unwrap()
+            .revoked_at
+            .is_some()
+    };
+    assert!(revoked(&first.credential.id));
+    assert!(!revoked(&second.credential.id));
+    // It is logged like a logout, for the session that ended.
+    let log = operator::security_log(&data_dir, None).unwrap();
+    let logouts: Vec<_> = log
+        .iter()
+        .filter(|entry| entry.kind == log_kinds::LOGOUT)
+        .collect();
+    assert_eq!(logouts.len(), 1);
+    assert_eq!(logouts[0].principal.as_deref(), Some("ada@example.com"));
+    assert_eq!(
+        logouts[0].credential_id.as_deref(),
+        Some(first.credential.id.as_str())
+    );
+    assert_eq!(
+        logouts[0].detail.as_deref(),
+        Some("session, replaced by a new sign-in")
+    );
+    assert!(logouts[0].client.is_some());
+
+    // A cookie of another person is ignored: Ada signing in on a browser
+    // that holds Bob's session does not end his.
+    let code = board.person("ada@example.com").code;
+    let response = board.login_with_cookies(&code, &bob.cookie()).await;
+    let third = board.signed_in(response).await;
+    assert_eq!(board.status_of(&bob).await, StatusCode::OK);
+    assert_eq!(board.status_of(&second).await, StatusCode::OK);
+    assert_eq!(board.status_of(&third).await, StatusCode::OK);
+
+    // So is one that is no session, one that is unknown, one that is
+    // already revoked, and an agent's token in the cookie.
+    let token = board.enrol("builder").await;
+    for cookie in [
+        board.cookie("garbage"),
+        board.cookie(&format!("obs_{}", "ab".repeat(32))),
+        first.cookie(),
+        board.cookie(&token),
+        String::new(),
+    ] {
+        let code = board.person("ada@example.com").code;
+        let response = board.login_with_cookies(&code, &cookie).await;
+        let another = board.signed_in(response).await;
+        assert_eq!(board.status_of(&another).await, StatusCode::OK);
+    }
+    let whoami = board
+        .http
+        .get(board.at("/v1/whoami"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(whoami.status(), StatusCode::OK);
+    assert_eq!(logged(&data_dir, log_kinds::LOGOUT).len(), 1);
+
+    // A sign-in that fails ends nothing, whatever cookie it carries.
+    for code in [
+        "obw1_nope",
+        &format!("{WEB_CODE_PREFIX}{}", "ab".repeat(32)),
+    ] {
+        let response = board.login_with_cookies(code, &second.cookie()).await;
+        assert!(response.headers().get("set-cookie").is_none());
+        error_of(response, StatusCode::FORBIDDEN, codes::INVITE_INVALID).await;
+    }
+    assert_eq!(board.status_of(&second).await, StatusCode::OK);
+    // And the first of two cookies of that name is the one that counts,
+    // as it does when a request is authenticated.
+    let code = board.person("ada@example.com").code;
+    let cookies = format!("{}; {}", second.cookie(), third.cookie());
+    let response = board.login_with_cookies(&code, &cookies).await;
+    let last = board.signed_in(response).await;
+    assert_eq!(board.status_of(&second).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(board.status_of(&third).await, StatusCode::OK);
+    assert_eq!(board.status_of(&last).await, StatusCode::OK);
+    assert_eq!(board.status_of(&phone).await, StatusCode::OK);
+    assert_eq!(logged(&data_dir, log_kinds::LOGOUT).len(), 2);
+    board.stop().await;
+}
+
+/// A browser's cookies for one host. Like a browser, it keeps them by
+/// name, whatever port set them, and sends all of them to every port.
+#[derive(Default)]
+struct Jar(Vec<(String, String)>);
+
+impl Jar {
+    /// Applies a response's `Set-Cookie`.
+    fn store(&mut self, response: &Response) {
+        let cookie = cookie_set_by(response);
+        let (name, value) = cookie.split(';').next().unwrap().split_once('=').unwrap();
+        self.0.retain(|(held, _)| held != name);
+        if !cookie.ends_with("Max-Age=0") {
+            self.0.push((name.to_owned(), value.to_owned()));
+        }
+    }
+
+    fn header(&self) -> String {
+        let pairs: Vec<String> = self
+            .0
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect();
+        pairs.join("; ")
+    }
+}
+
+#[tokio::test]
+async fn two_boards_on_one_host_keep_their_sessions_apart() {
+    // Two boards on two ports of 127.0.0.1, and one browser.
+    let north = Net::start().await;
+    let south = Net::start().await;
+    assert_ne!(north.addr.port(), south.addr.port());
+    assert_eq!(north.addr.ip(), south.addr.ip());
+    assert_ne!(north.cookie_name(), south.cookie_name());
+    let mut jar = Jar::default();
+    let whoami = |board: &Net, jar: &Jar| {
+        let request = board
+            .http
+            .get(board.at("/v1/whoami"))
+            .header("cookie", jar.header());
+        async move { request.send().await.unwrap() }
+    };
+
+    let code = north.person("ada@example.com").code;
+    let response = north.login_with_cookies(&code, &jar.header()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    jar.store(&response);
+    let on_north: Session = response.json().await.unwrap();
+    assert_eq!(whoami(&north, &jar).await.status(), StatusCode::OK);
+
+    // Signing in to the second board, with the first one's cookie in the
+    // jar, sets a cookie of another name and leaves the first alone.
+    let code = south.person("ada@example.com").code;
+    let response = south.login_with_cookies(&code, &jar.header()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    jar.store(&response);
+    let on_south: Session = response.json().await.unwrap();
+    assert_eq!(jar.0.len(), 2, "one cookie per board: {:?}", jar.0);
+    assert_eq!(jar.0[0].0, north.cookie_name());
+    assert_eq!(jar.0[1].0, south.cookie_name());
+
+    // Both sessions work, each on its own board, with the whole jar sent
+    // to both.
+    for (board, session) in [(&north, &on_north), (&south, &on_south)] {
+        let me: WhoAmI = whoami(board, &jar).await.json().await.unwrap();
+        assert_eq!(me.actor.handle, "ada@example.com");
+        assert_eq!(
+            me.credential.map(|credential| credential.id),
+            session.credential.as_ref().map(|c| c.id.clone())
+        );
+        // A write too, with that board's own anti-CSRF token.
+        let response = board
+            .http
+            .post(board.at(MESSAGES))
+            .header("cookie", jar.header())
+            .header(CSRF_HEADER, session.csrf_token.as_deref().unwrap())
+            .json(&json!({"channel": "dev", "text": "hello"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+    // Neither board took the other's cookie for a failed authentication.
+    for board in [&north, &south] {
+        assert_eq!(logged(&board.data_dir(), log_kinds::AUTH_FAILED), []);
+        assert_eq!(logged(&board.data_dir(), log_kinds::LOGOUT), []);
+    }
+
+    // The other board's cookie alone is no credential at all: the page
+    // load is not counted, and a route that needs a credential says that
+    // none came, not that a wrong one did.
+    let only_south = format!("{}={}", jar.0[1].0, jar.0[1].1);
+    let response = north
+        .http
+        .get(north.at("/v1/web/session"))
+        .header("cookie", &only_south)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(logged(&north.data_dir(), log_kinds::AUTH_FAILED), []);
+    let response = north
+        .http
+        .get(north.at("/v1/whoami"))
+        .header("cookie", &only_south)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        logged(&north.data_dir(), log_kinds::AUTH_FAILED),
+        [Some("no token".to_owned())]
+    );
+    // And a session of the first board under the second one's name is not
+    // one of the second's.
+    let crossed = format!("{}={}", south.cookie_name(), jar.0[0].1);
+    let response = south
+        .http
+        .get(south.at("/v1/whoami"))
+        .header("cookie", &crossed)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        logged(&south.data_dir(), log_kinds::AUTH_FAILED),
+        [Some("unknown session".to_owned())]
+    );
+
+    // Signing out of one board clears that board's cookie only.
+    let response = north
+        .http
+        .post(north.at("/v1/logout"))
+        .header("cookie", jar.header())
+        .header(CSRF_HEADER, on_north.csrf_token.as_deref().unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    jar.store(&response);
+    assert_eq!(jar.0.len(), 1);
+    assert_eq!(jar.0[0].0, south.cookie_name());
+    assert_eq!(whoami(&south, &jar).await.status(), StatusCode::OK);
+    assert_eq!(
+        whoami(&north, &jar).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    // The name follows the port the browser used, which is the one in the
+    // `Host` header: behind a forwarded port it is not the port the server
+    // listens on. Without a port it is 443.
+    for (host, name) in [
+        ("board.example:8443", "__Host-openboard_session_8443"),
+        ("board.example", "__Host-openboard_session_443"),
+        ("[::1]:9000", "__Host-openboard_session_9000"),
+    ] {
+        let code = south.person("ada@example.com").code;
+        let response = south
+            .http
+            .post(south.at("/v1/web/login"))
+            .header("host", host)
+            .json(&json!({ "code": code }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{host}");
+        let cookie = cookie_set_by(&response);
+        let (set, secret) = cookie.split(';').next().unwrap().split_once('=').unwrap();
+        assert_eq!(set, name, "{host}");
+        // It is found again under that name on that host, and under no
+        // other.
+        for (cookie_name, expected) in [
+            (name.to_owned(), StatusCode::OK),
+            (south.cookie_name(), StatusCode::UNAUTHORIZED),
+        ] {
+            let response = south
+                .http
+                .get(south.at("/v1/whoami"))
+                .header("host", host)
+                .header("cookie", format!("{cookie_name}={secret}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{host} {cookie_name}");
+        }
+    }
+    // A Host whose port is not a number names no cookie: nothing a caller
+    // writes there ends up in a cookie's name, and the code is not spent.
+    let code = south.person("ada@example.com").code;
+    for host in [
+        "board.example:x=1; Path=/evil",
+        "board.example:80a",
+        "board.example:",
+        "board.example:99999",
+    ] {
+        let response = south
+            .http
+            .post(south.at("/v1/web/login"))
+            .header("host", host)
+            .json(&json!({ "code": code }))
+            .send()
+            .await
+            .unwrap();
+        assert!(response.headers().get("set-cookie").is_none(), "{host}");
+        error_of(response, StatusCode::BAD_REQUEST, codes::INVALID_REQUEST).await;
+    }
+    let response = south.login_raw(&code).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    north.stop().await;
+    south.stop().await;
 }

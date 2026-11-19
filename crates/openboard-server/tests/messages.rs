@@ -2326,3 +2326,484 @@ async fn the_policy_is_asked_for_every_new_operation() {
     let dir = board.stop().await;
     assert!(verify_log(&dir.path().join("data")).unwrap().is_ok());
 }
+
+// ---------------------------------------------------------------------------
+// Review fixes
+// ---------------------------------------------------------------------------
+
+/// The table of the review finding: a very wide header and many short
+/// rows. With 1500 columns and 1300 rows it is under 10 KB of text.
+fn wide_table(columns: usize, rows: usize) -> String {
+    "|a".repeat(columns) + "|\n" + &"|-".repeat(columns) + "|\n" + &"|x\n".repeat(rows)
+}
+
+#[tokio::test]
+async fn rendered_html_is_bounded_for_a_message_and_for_a_response() {
+    use openboard_api::{
+        HTML_BYTES_PER_TEXT_BYTE, MAX_HTML_BYTES_PER_RESPONSE, MAX_TABLE_COLUMNS,
+        MIN_HTML_LIMIT_BYTES,
+    };
+    let board = Board::start().await;
+    let limit_of = |text: &str| (text.len() * HTML_BYTES_PER_TEXT_BYTE).max(MIN_HTML_LIMIT_BYTES);
+
+    // One message: 10 KB that used to come back as 2.4 MB of empty cells.
+    let table = wide_table(1500, 1300);
+    assert!(table.len() < 10_000);
+    let root = board.thread("wide", &table).await;
+    let response = board
+        .get(&format!("/v1/boards/general/threads/{}?html=true", root.id))
+        .await;
+    let body = response.bytes().await.unwrap();
+    println!(
+        "one wide table: {} bytes of text, {} of response",
+        table.len(),
+        body.len()
+    );
+    assert!(body.len() < 40_000, "{} bytes", body.len());
+    let thread: Thread = serde_json::from_slice(&body).unwrap();
+    let html = thread.root.html.unwrap();
+    assert!(html.len() <= limit_of(&table), "{} bytes", html.len());
+    assert!(!html.contains("<td>"));
+    // Every cell that was written is still there to read.
+    assert_eq!(html.matches("|x").count(), 1300);
+    assert_eq!(thread.root.text, table);
+
+    // A table narrow enough to be drawn, but with more rows than its text
+    // can pay for, comes back whole as escaped plain text.
+    let tall = wide_table(MAX_TABLE_COLUMNS, 3000);
+    let reply = board.reply(&root.id, &tall).await;
+    let small = board
+        .reply(&root.id, "| a | b |\n|---|---|\n| 1 | <2> |")
+        .await;
+    let thread: Thread = board
+        .get_json(&format!("/v1/boards/general/threads/{}?html=true", root.id))
+        .await;
+    let html_of = |id: &str| {
+        let found = thread.replies.iter().find(|reply| reply.id == id).unwrap();
+        found.html.clone().unwrap()
+    };
+    assert_eq!(html_of(&reply.id), format!("<pre>{tall}</pre>"));
+    assert!(html_of(&reply.id).len() <= limit_of(&tall));
+    // An ordinary table is still a table.
+    assert_eq!(
+        html_of(&small.id),
+        "<table><thead><tr><th>a</th><th>b</th></tr></thead>\
+         <tr><td>1</td><td>&lt;2&gt;</td></tr></table>"
+    );
+
+    // The listing of the finding: a hundred such messages, all on one page.
+    for _ in 0..100 {
+        board.thread("flood", &table).await;
+    }
+    let response = board
+        .get("/v1/boards/general/threads?channel=flood&limit=500&html=true")
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.bytes().await.unwrap();
+    println!("100 wide tables: {} bytes of response", body.len());
+    assert!(body.len() < 3_000_000, "{} bytes", body.len());
+    let list: ThreadList = serde_json::from_slice(&body).unwrap();
+    assert_eq!(list.threads.len(), 100);
+
+    // One response: messages that each render to a little under their own
+    // limit. Rendering stops at the response's budget, and the rest of the
+    // page carries the plain fallback.
+    let quotes = "> a\n\n".repeat(2000);
+    let each = "<blockquote><p>a</p></blockquote>".len() * 2000;
+    assert!(each <= limit_of(&quotes));
+    let fit = MAX_HTML_BYTES_PER_RESPONSE.div_ceil(each);
+    let posted = fit + 25;
+    for _ in 0..posted {
+        board.thread("quotes", &quotes).await;
+    }
+    let response = board
+        .get("/v1/boards/general/threads?channel=quotes&limit=500&html=true")
+        .await;
+    let body = response.bytes().await.unwrap();
+    println!(
+        "{posted} messages of quotes: {} bytes of response",
+        body.len()
+    );
+    let list: ThreadList = serde_json::from_slice(&body).unwrap();
+    assert_eq!(list.threads.len(), posted);
+    let fallback = format!("<pre>{}</pre>", quotes.replace('>', "&gt;"));
+    let mut rendered = 0;
+    for (index, summary) in list.threads.iter().enumerate() {
+        let html = summary.root.html.as_deref().unwrap();
+        if index < fit {
+            assert_eq!(html.len(), each, "message {index}");
+            assert!(html.starts_with("<blockquote><p>a</p></blockquote>"));
+            rendered += html.len();
+        } else {
+            assert_eq!(html, fallback, "message {index}");
+        }
+    }
+    assert!(rendered >= MAX_HTML_BYTES_PER_RESPONSE);
+    assert!(rendered < MAX_HTML_BYTES_PER_RESPONSE + limit_of(&quotes));
+    // Asked for fewer at once, every one of them is rendered.
+    let list: ThreadList = board
+        .get_json("/v1/boards/general/threads?channel=quotes&limit=10&html=true")
+        .await;
+    assert!(list
+        .threads
+        .iter()
+        .all(|summary| summary.root.html.as_deref().unwrap().len() == each));
+    // Without `html` nothing is rendered at all.
+    let list: ThreadList = board
+        .get_json("/v1/boards/general/threads?channel=quotes&limit=500")
+        .await;
+    assert!(list
+        .threads
+        .iter()
+        .all(|summary| summary.root.html.is_none()));
+    board.stop().await;
+}
+
+#[tokio::test]
+async fn a_reader_elsewhere_neither_stalls_removals_nor_keeps_what_they_removed() {
+    use std::time::Instant;
+    let board = Board::start().await;
+    let data_dir = board.data_dir();
+    let wal_path = data_dir.join(format!("{DB_FILE_NAME}-wal"));
+    let in_wal = |needle: &str| {
+        let bytes = std::fs::read(&wal_path).unwrap_or_default();
+        contains(&bytes, needle.as_bytes())
+    };
+    let stored = |needle: &str| contains(&raw_storage(&data_dir), needle.as_bytes());
+
+    // With nobody else reading, a label that is replaced or cleared and a
+    // reaction that is taken back are gone from both files at once, with
+    // the message still there.
+    let kept = board.thread("dev", "a message that stays").await;
+    board
+        .labels(
+            &kept.id,
+            json!({"set": {"note": "OCHRE-PYLON first value", "extra": "UMBER-SLUICE value"}}),
+        )
+        .await;
+    board.react(&kept.id, "sable-quiver-reaction").await;
+    for marker in ["OCHRE-PYLON", "UMBER-SLUICE", "sable-quiver-reaction"] {
+        assert!(stored(marker), "{marker} should be stored before removal");
+    }
+    board
+        .labels(&kept.id, json!({"set": {"note": "second value"}}))
+        .await;
+    assert!(!stored("OCHRE-PYLON"), "a replaced label value is stored");
+    board.labels(&kept.id, json!({"clear": ["extra"]})).await;
+    assert!(!stored("UMBER-SLUICE"), "a cleared label value is stored");
+    board.unreact(&kept.id, "sable-quiver-reaction").await;
+    assert!(
+        !stored("sable-quiver-reaction"),
+        "a removed reaction is stored"
+    );
+    assert!(stored("second value"));
+    assert_eq!(
+        std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0),
+        0
+    );
+
+    // What the removals below take away. All of it is written after the
+    // last scrub, so all of it is in the log.
+    board.labels(&kept.id, json!({"clear": ["note"]})).await;
+    let doomed = board.thread("dev", "CRIMSON-ANVIL text to delete").await;
+    let edited = board.thread("dev", "TEAL-COMET before the edit").await;
+    board
+        .labels(&kept.id, json!({"set": {"note": "INDIGO-TRELLIS value"}}))
+        .await;
+    board.react(&kept.id, "pewter-gantry-reaction").await;
+    let markers = [
+        "CRIMSON-ANVIL",
+        "TEAL-COMET",
+        "INDIGO-TRELLIS",
+        "pewter-gantry-reaction",
+    ];
+
+    // Another process starts reading the database and takes its time: a
+    // backup, or an operator command. Its snapshot pins the log.
+    let reader = open_db(&data_dir);
+    reader.execute_batch("BEGIN").unwrap();
+    let seen: i64 = reader
+        .query_row("SELECT count(*) FROM messages", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(seen, 3);
+
+    // Every kind of removal returns promptly all the same. Each used to
+    // wait five seconds for the reader, with every other request behind it.
+    let started = Instant::now();
+    board.delete(&doomed.id).await;
+    board.edit(&edited.id, "after the edit").await;
+    board.labels(&kept.id, json!({"clear": ["note"]})).await;
+    board.unreact(&kept.id, "pewter-gantry-reaction").await;
+    let took = started.elapsed();
+    assert!(took < Duration::from_secs(3), "four removals took {took:?}");
+    // And a request that has nothing to do with them is not held up.
+    let started = Instant::now();
+    let other = board.thread("elsewhere", "unrelated").await;
+    board.read(&other.id).await;
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_secs(1),
+        "an unrelated request took {took:?}"
+    );
+    // The reader still sees its snapshot, which is why the log could not
+    // be emptied: what was removed is still in it.
+    let seen: String = reader
+        .query_row(
+            "SELECT text FROM messages WHERE id = ?1",
+            [&doomed.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(seen.starts_with("CRIMSON-ANVIL"));
+    for marker in markers {
+        assert!(in_wal(marker), "{marker} left the log under a reader");
+    }
+    let events_before = board.kinds().await.len();
+
+    // The reader finishes and keeps its connection open. No edit or delete
+    // follows: the server empties the log by itself.
+    reader.execute_batch("COMMIT").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let left: Vec<&str> = markers
+            .iter()
+            .copied()
+            .filter(|marker| stored(marker))
+            .collect();
+        if left.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{left:?} still in the database files after the reader left"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0),
+        0
+    );
+    assert_eq!(board.kinds().await.len(), events_before);
+    assert!(stored("after the edit"));
+    drop(reader);
+
+    // A reader that is still there when the server stops: the next start
+    // finishes the job.
+    let late = board.thread("dev", "VERMILION-SPAR text to delete").await;
+    let reader = open_db(&data_dir);
+    reader.execute_batch("BEGIN").unwrap();
+    let _: i64 = reader
+        .query_row("SELECT count(*) FROM messages", [], |row| row.get(0))
+        .unwrap();
+    board.delete(&late.id).await;
+    assert!(in_wal("VERMILION-SPAR"));
+    let dir = board.stop().await;
+    reader.execute_batch("COMMIT").unwrap();
+    let board = Board::start_in(dir, |_| {}, None).await;
+    let data_dir = board.data_dir();
+    assert!(
+        !contains(&raw_storage(&data_dir), b"VERMILION-SPAR"),
+        "the text survived a restart"
+    );
+    drop(reader);
+    let dir = board.stop().await;
+    assert!(verify_log(&dir.path().join("data")).unwrap().is_ok());
+}
+
+#[tokio::test]
+async fn a_message_holds_a_bounded_number_of_reaction_names() {
+    use openboard_api::MAX_REACTION_NAMES_PER_MESSAGE;
+    assert_eq!(MAX_REACTION_NAMES_PER_MESSAGE, 50);
+    let board = Board::start().await;
+    let target = board.thread("dev", "react to this").await;
+    for n in 0..MAX_REACTION_NAMES_PER_MESSAGE {
+        board.react(&target.id, &format!("name-{n}")).await;
+    }
+    let events = board.kinds().await.len();
+
+    // One name more is refused, and says why without naming it.
+    let refused = board
+        .react_raw(Method::PUT, &target.id, "one-too-many", None)
+        .await;
+    let error = expect_error(refused, StatusCode::BAD_REQUEST, codes::INVALID_REACTION).await;
+    assert!(error.error.message.contains("at most 50"), "{error:?}");
+    assert!(!format!("{error:?}").contains("one-too-many"));
+    let message = board.read(&target.id).await.root;
+    assert_eq!(message.reactions.len(), MAX_REACTION_NAMES_PER_MESSAGE);
+    assert!(message.reactions.iter().all(|r| r.name != "one-too-many"));
+    assert_eq!(
+        board.kinds().await.len(),
+        events,
+        "a refusal appends no event"
+    );
+
+    // A name the message already has can be given again, and removing
+    // always works: one that is there, and one that is not.
+    assert_eq!(board.react(&target.id, "name-0").await.reactions.len(), 50);
+    assert_eq!(
+        board.unreact(&target.id, "absent").await.reactions.len(),
+        50
+    );
+    assert_eq!(
+        board.unreact(&target.id, "name-7").await.reactions.len(),
+        49
+    );
+    // Which makes room for exactly one new name.
+    assert_eq!(
+        board
+            .react(&target.id, "one-too-many")
+            .await
+            .reactions
+            .len(),
+        50
+    );
+    let refused = board
+        .react_raw(Method::PUT, &target.id, "name-7", None)
+        .await;
+    expect_error(refused, StatusCode::BAD_REQUEST, codes::INVALID_REACTION).await;
+    // The cap is per message.
+    let other = board.thread("dev", "another").await;
+    assert_eq!(board.react(&other.id, "name-7").await.reactions.len(), 1);
+    let dir = board.stop().await;
+    assert!(verify_log(&dir.path().join("data")).unwrap().is_ok());
+}
+
+#[tokio::test]
+async fn an_edit_removes_the_digest_an_idempotency_key_kept() {
+    let board = Board::start().await;
+    let data_dir = board.data_dir();
+    let original = json!({
+        "channel": "dev",
+        "text": "the original text",
+        "idempotency_key": "edit-once"
+    });
+    let fingerprint = || -> String {
+        open_db(&data_dir)
+            .query_row(
+                "SELECT fingerprint FROM idempotency WHERE key = 'edit-once'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    let posted = board.post_as(None, original.clone()).await;
+    assert!(!posted.duplicate);
+    let retry = board.post_as(None, original.clone()).await;
+    assert!(retry.duplicate);
+    assert_eq!(retry.message.id, posted.message.id);
+    // A digest over the original text, in hex.
+    let digest = fingerprint();
+    assert_eq!(digest.len(), 64);
+    assert!(contains(&raw_storage(&data_dir), digest.as_bytes()));
+
+    board
+        .edit(&posted.message.id, "the text after the edit")
+        .await;
+
+    // The digest went with the text it was made from, from the table and
+    // from the files.
+    assert_eq!(fingerprint(), "");
+    assert!(
+        !contains(&raw_storage(&data_dir), digest.as_bytes()),
+        "the digest of the original text is still in the database files"
+    );
+    // The key stays spent. A retry is a conflict, exactly as after a
+    // delete, and posts nothing: not the original request, and not one
+    // with the new text.
+    for body in [
+        original.clone(),
+        json!({"channel": "dev", "text": "the text after the edit", "idempotency_key": "edit-once"}),
+        json!({"channel": "dev", "text": "something else", "idempotency_key": "edit-once"}),
+    ] {
+        let response = board
+            .send(
+                Method::POST,
+                "/v1/boards/general/messages",
+                None,
+                Some(body),
+            )
+            .await;
+        expect_error(response, StatusCode::CONFLICT, codes::IDEMPOTENCY_CONFLICT).await;
+    }
+    let list: ThreadList = board
+        .get_json("/v1/boards/general/threads?channel=dev")
+        .await;
+    assert_eq!(list.threads.len(), 1);
+    assert_eq!(list.threads[0].root.text, "the text after the edit");
+
+    // Deleting afterwards changes nothing about the key.
+    board.delete(&posted.message.id).await;
+    assert_eq!(fingerprint(), "");
+    let response = board
+        .send(
+            Method::POST,
+            "/v1/boards/general/messages",
+            None,
+            Some(original),
+        )
+        .await;
+    expect_error(response, StatusCode::CONFLICT, codes::IDEMPOTENCY_CONFLICT).await;
+    // Another key is unaffected by all of it.
+    let other = json!({"channel": "dev", "text": "another", "idempotency_key": "other"});
+    board.post_as(None, other.clone()).await;
+    assert!(board.post_as(None, other).await.duplicate);
+    board.stop().await;
+}
+
+#[tokio::test]
+async fn an_escaped_mention_is_neither_stored_nor_rendered() {
+    let board = Board::start().await;
+    let html_of = |id: String| {
+        let board = &board;
+        async move {
+            let path = format!("/v1/boards/general/threads/{id}?html=true");
+            let thread: Thread = board.get_json(&path).await;
+            thread.root.html.unwrap()
+        }
+    };
+    let cursor = board.events("").await.cursor;
+
+    // Escaped with a backslash, or written as a character reference.
+    for text in [
+        "not for \\@local, just about them",
+        "not for &#64;local either",
+        "nor &commat;local/reviewer, nor *\\@local*",
+    ] {
+        let posted = board.thread("dev", text).await;
+        assert!(
+            posted.mentions.is_empty(),
+            "{text:?}: {:?}",
+            posted.mentions
+        );
+        let html = html_of(posted.id.clone()).await;
+        assert!(html.contains("@local") && !html.contains("<span"), "{html}");
+        assert!(board.read(&posted.id).await.root.mentions.is_empty());
+    }
+    // Nothing was announced to the one who was not mentioned.
+    let mine = board
+        .events(&format!("after={cursor}&mentions_self=true"))
+        .await;
+    assert!(mine.events.is_empty(), "{:?}", mine.events);
+
+    // An unescaped one beside an escaped one is the only mention, in what
+    // is stored and in what is drawn alike.
+    let posted = board
+        .thread("dev", "\\@local was escaped, @local was not")
+        .await;
+    assert_eq!(posted.mentions.len(), 1);
+    assert_eq!(
+        html_of(posted.id.clone()).await,
+        "<p>@local was escaped, <span class=\"mention\">@local</span> was not</p>"
+    );
+    // An escaped backslash escapes nothing.
+    let posted = board.thread("dev", "a path\\\\@local").await;
+    assert_eq!(posted.mentions.len(), 1);
+    // Editing the escape in takes the mention away.
+    let edited = board.edit(&posted.id, "now \\@local is escaped").await;
+    assert!(edited.mentions.is_empty());
+    assert_eq!(
+        html_of(posted.id.clone()).await,
+        "<p>now @local is escaped</p>"
+    );
+    board.stop().await;
+}

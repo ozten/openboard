@@ -46,17 +46,51 @@
 //!
 //! # The session cookie
 //!
-//! A successful login sets one cookie named [`SESSION_COOKIE`] with the
-//! attributes `Secure; HttpOnly; SameSite=Strict; Path=/` and a `Max-Age`
-//! matching the session's lifetime. Its value is a fresh random secret that
-//! the response body never contains, so script on the page cannot read it.
-//! The board stores only its SHA-256 hash. A session is a credential like an
-//! agent's token: it has an ID, it expires ([`DEFAULT_SESSION_TTL_SECS`]),
-//! the operator can list and revoke it, and `POST /v1/logout` revokes it and
+//! A successful login sets one cookie with the attributes
+//! `Secure; HttpOnly; SameSite=Strict; Path=/` and a `Max-Age` matching the
+//! session's lifetime. Its value is a fresh random secret that the response
+//! body never contains, so script on the page cannot read it. The board
+//! stores only its SHA-256 hash. A session is a credential like an agent's
+//! token: it has an ID, it expires ([`DEFAULT_SESSION_TTL_SECS`]), the
+//! operator can list and revoke it, and `POST /v1/logout` revokes it and
 //! clears the cookie.
+//!
+//! The cookie's name carries the board's port: it is
+//! [`session_cookie_name`] of the port the browser sent the request to, for
+//! example `__Host-openboard_session_7878`. Browsers keep cookies per host
+//! and ignore the port, so two boards on one host share a cookie jar. With
+//! one name for both, signing in to the second would overwrite the session
+//! of the first, and each board would be sent the other's cookie. The port
+//! is taken from the request's `Host` header, and is 443 when that names
+//! none, so it is the port in the browser's address bar even when the
+//! server listens on another one behind a forwarded port. A request whose
+//! `Host` has no usable port has no session cookie.
+//!
+//! A board looks only at the cookie with its own name. A session cookie
+//! with another port in its name belongs to another board: it is ignored
+//! entirely, exactly as if it had not been sent, so it is neither a failed
+//! authentication nor an entry in the security log.
 //!
 //! A request that carries both an `Authorization` header and the cookie is
 //! authenticated by the header alone.
+//!
+//! `GET /v1/web/session` is what the page asks first, signed in or not. A
+//! request to it that presents no credential at all, no `Authorization`
+//! header and no session cookie of this board, gets the same `401` as every
+//! other failed authentication, but is not counted against the client
+//! address's budget of failed authentications and is not written to the
+//! security log, so people who share an address cannot lock each other out
+//! of the sign-in page by loading it. A wrong, expired or revoked credential
+//! is counted there as everywhere, and so is a missing one on every other
+//! route.
+//!
+//! Signing in from a browser that already holds a usable session of the
+//! same person replaces that session: `POST /v1/web/login` revokes the
+//! earlier one in the same step, and the security log records it as a
+//! logout. The earlier session is the one in the cookie the request
+//! carried. A cookie that holds a session of another person, or one that is
+//! unknown, expired or revoked, is ignored, and nothing is revoked when the
+//! code is refused. The person's sessions in other browsers are unaffected.
 //!
 //! # Anti-CSRF
 //!
@@ -79,9 +113,17 @@ use serde::{Deserialize, Serialize};
 use crate::auth::CredentialInfo;
 use crate::Actor;
 
-/// Name of the session cookie. The `__Host-` prefix makes browsers refuse
-/// it unless it is `Secure`, has `Path=/` and names no domain.
-pub const SESSION_COOKIE: &str = "__Host-openboard_session";
+/// What the name of every board's session cookie starts with; the port
+/// follows. The `__Host-` prefix makes browsers refuse the cookie unless it
+/// is `Secure`, has `Path=/` and names no domain.
+pub const SESSION_COOKIE_PREFIX: &str = "__Host-openboard_session_";
+
+/// The name of the session cookie of the board a browser reaches on `port`:
+/// [`SESSION_COOKIE_PREFIX`] followed by the port in decimal. See the
+/// module documentation for why the port is part of the name.
+pub fn session_cookie_name(port: u16) -> String {
+    format!("{SESSION_COOKIE_PREFIX}{port}")
+}
 /// Request header carrying the anti-CSRF token on cookie-authenticated
 /// writes.
 pub const CSRF_HEADER: &str = "x-openboard-csrf";
@@ -128,6 +170,13 @@ pub struct Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_session_cookie_is_named_after_the_port() {
+        assert_eq!(session_cookie_name(7878), "__Host-openboard_session_7878");
+        assert_eq!(session_cookie_name(443), "__Host-openboard_session_443");
+        assert_ne!(session_cookie_name(7878), session_cookie_name(7879));
+    }
 
     #[test]
     fn sign_in_link_puts_the_code_in_the_fragment() {

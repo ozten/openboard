@@ -35,13 +35,14 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post, put};
 use axum::{Json, Router};
 use openboard_api::auth::{JoinRequest, JoinResponse, WhoAmI};
-use openboard_api::web::{LoginRequest, Session, CSRF_HEADER, SESSION_COOKIE};
+use openboard_api::web::{session_cookie_name, LoginRequest, Session, CSRF_HEADER};
 use openboard_api::{
     codes, event_types, ApiError, BoardList, ChannelList, DeleteMessageQuery, EditMessageRequest,
     ErrorBody, Event, EventsQuery, EventsResponse, Health, LabelsRequest, Message,
     PostMessageRequest, PostMessageResponse, ReadOptions, Thread, ThreadList, ThreadsQuery,
     CURSOR_START, DEFAULT_EVENTS_PER_PAGE, DEFAULT_THREADS_PER_PAGE, IDEMPOTENCY_HEADER,
-    MAX_EVENTS_PER_PAGE, MAX_THREADS_PER_PAGE, MAX_WAIT_SECS, PROFILE_HEADER,
+    MAX_EVENTS_PER_PAGE, MAX_HTML_BYTES_PER_RESPONSE, MAX_REACTION_NAMES_PER_MESSAGE,
+    MAX_THREADS_PER_PAGE, MAX_WAIT_SECS, PROFILE_HEADER,
 };
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, watch};
@@ -74,6 +75,9 @@ const STREAM_KEEP_ALIVE: Duration = Duration::from_secs(15);
 /// reader that stalls can have queued when its credential is revoked, and a
 /// revocation discards it.
 const STREAM_BUFFER: usize = 4;
+/// How often the upkeep task tries again to empty the write-ahead log while
+/// a scrub is pending; see `Store::scrub`. Between tries it costs nothing.
+const SCRUB_RETRY_EVERY: Duration = Duration::from_millis(500);
 /// Largest accepted body of an enrolment or sign-in request, which holds
 /// one code.
 const MAX_JOIN_BODY: usize = 4096;
@@ -153,8 +157,10 @@ pub(crate) struct Parts {
 }
 
 /// Upkeep a running server does beside answering requests: it trims the
-/// security log to its retention. It shares the store with the router and
-/// lets go of it when the server stops.
+/// security log to its retention, and it empties the write-ahead log of
+/// removed content when the request that removed it could not, because
+/// another process was reading the database. It shares the store with the
+/// router and lets go of it when the server stops.
 pub(crate) struct Maintenance(Shared);
 
 impl Maintenance {
@@ -164,16 +170,26 @@ impl Maintenance {
         let period = state.retention.check_every.max(Duration::from_millis(10));
         let mut timer = tokio::time::interval_at(Instant::now() + period, period);
         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut scrub =
+            tokio::time::interval_at(Instant::now() + SCRUB_RETRY_EVERY, SCRUB_RETRY_EVERY);
+        scrub.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            tokio::select! {
+            let prune = tokio::select! {
                 () = stopping(&mut stop) => return,
-                _ = timer.tick() => {}
-            }
-            let pruned = state
-                .db(|state| state.store.prune_log(&state.retention))
-                .await;
-            if pruned.is_err() {
-                eprintln!("openboard-server: could not trim the security log");
+                _ = timer.tick() => true,
+                _ = scrub.tick() => false,
+            };
+            if prune {
+                let pruned = state
+                    .db(|state| state.store.prune_log(&state.retention))
+                    .await;
+                if pruned.is_err() {
+                    eprintln!("openboard-server: could not trim the security log");
+                }
+            } else if state.store.scrub_pending() {
+                // Each try gives up at once if the log is still in use, so
+                // it holds the store no longer than a small write does.
+                let _ = state.db(|state| Ok(state.store.scrub())).await;
             }
         }
     }
@@ -483,6 +499,14 @@ impl From<StoreError> for AppError {
             StoreError::TooManyLabels => invalid_label(format!(
                 "a message holds at most {MAX_LABELS_PER_MESSAGE} labels"
             )),
+            StoreError::TooManyReactions => AppError::new(
+                codes::INVALID_REACTION,
+                format!(
+                    "a message holds at most {MAX_REACTION_NAMES_PER_MESSAGE} different \
+                     reactions, and this one would be one more"
+                ),
+            )
+            .next("use one of the reactions the message already has, or remove one first"),
             other => AppError::internal(&other),
         }
     }
@@ -581,7 +605,10 @@ async fn gate(State(state): State<Shared>, mut request: Request, next: Next) -> 
                     client,
                 }
             } else {
-                match state.authenticate(request.headers(), client).await {
+                // The page asks this route who is signed in before it
+                // knows whether anyone is. See `authenticate`.
+                let probe = request.method() == Method::GET && request.uri().path() == SESSION_PATH;
+                match state.authenticate(request.headers(), client, probe).await {
                     Ok((credential, csrf)) => Identity {
                         principal: credential.principal(),
                         credential: Some(credential),
@@ -683,17 +710,62 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     scheme.eq_ignore_ascii_case("bearer").then_some(token)
 }
 
-/// The value of the session cookie, from whichever `Cookie` header holds
-/// it. The first cookie with the session's name counts, and a browser
+/// The port the client sent the request to, as its `Host` header has it:
+/// the digits after the last `:`, or 443 when the header names no port,
+/// which is the port a browser leaves out on a network board. `None` when
+/// there is not exactly one `Host` header, or when what follows the host
+/// name is not one to five digits that make a port number.
+///
+/// This decides the name of the session cookie, so nothing but digits ever
+/// gets from the header into that name.
+fn host_port(headers: &HeaderMap) -> Option<u16> {
+    let mut hosts = headers.get_all(header::HOST).iter();
+    let (Some(host), None) = (hosts.next(), hosts.next()) else {
+        return None;
+    };
+    let host = host.to_str().ok()?;
+    let port = match host.strip_prefix('[') {
+        Some(rest) => {
+            let (_, after) = rest.split_once(']')?;
+            if after.is_empty() {
+                return Some(443);
+            }
+            after.strip_prefix(':')?
+        }
+        None => match host.rsplit_once(':') {
+            Some((name, _)) if name.is_empty() || name.contains(':') => return None,
+            Some((_, port)) => port,
+            None if host.is_empty() => return None,
+            None => return Some(443),
+        },
+    };
+    let digits = !port.is_empty() && port.len() <= 5 && port.bytes().all(|b| b.is_ascii_digit());
+    if digits {
+        port.parse().ok()
+    } else {
+        None
+    }
+}
+
+/// The name of this board's session cookie on this request; see
+/// `openboard_api::web`. `None` when the request names no usable port, and
+/// then it has no session cookie at all.
+fn own_cookie_name(headers: &HeaderMap) -> Option<String> {
+    host_port(headers).map(session_cookie_name)
+}
+
+/// The value of the session cookie called `own`, from whichever `Cookie`
+/// header holds it. The first cookie with that name counts, and a browser
 /// sends at most one, because the `__Host-` prefix ties the cookie to this
 /// exact host and to `Path=/`.
 ///
 /// The header is not ours alone: a browser sends every cookie it holds for
 /// the host, whatever port set them, so it may be long, hold bytes that
 /// are not ASCII and hold pairs that are not well formed. It is read as
-/// bytes, in one pass, without copying; whatever is not the session cookie
-/// is skipped, and a value that is not text is no session.
-fn session_cookie(headers: &HeaderMap) -> Option<&str> {
+/// bytes, in one pass, without copying; whatever is not this board's
+/// session cookie is skipped, the session cookies of boards on other ports
+/// included, and a value that is not text is no session.
+fn session_cookie<'h>(headers: &'h HeaderMap, own: &str) -> Option<&'h str> {
     let trim = |bytes: &[u8]| -> std::ops::Range<usize> {
         let blank = |b: &u8| *b == b' ' || *b == b'\t';
         let start = bytes.iter().position(|b| !blank(b)).unwrap_or(bytes.len());
@@ -709,7 +781,7 @@ fn session_cookie(headers: &HeaderMap) -> Option<&str> {
                 continue;
             };
             let (name, value) = (&pair[..equals], &pair[equals + 1..]);
-            if &name[trim(name)] == SESSION_COOKIE.as_bytes() {
+            if &name[trim(name)] == own.as_bytes() {
                 return std::str::from_utf8(&value[trim(value)]).ok();
             }
         }
@@ -728,23 +800,42 @@ impl AppState {
     /// A request with an `Authorization` header is authenticated by that
     /// header alone, whatever it holds: the cookie is not looked at, not
     /// even when the header is unusable.
+    ///
+    /// `probe` is true for `GET /v1/web/session` and for nothing else. The
+    /// web UI asks that route who is signed in every time the page loads,
+    /// and when nobody is, the request carries no credential at all: no
+    /// `Authorization` header and no session cookie of this board. Such a
+    /// request gets the same `401` as any other, but it is not counted as a
+    /// failed authentication and not logged; otherwise people behind one
+    /// address would use up each other's budget by opening the sign-in
+    /// page. It looks nothing up and its answer never varies, not even with
+    /// the state of that budget, so it cannot be used to learn anything. A
+    /// credential that is presented and is wrong is counted on this route
+    /// as on every other.
     async fn authenticate(
         self: &Arc<Self>,
         headers: &HeaderMap,
         client: Option<IpAddr>,
+        probe: bool,
     ) -> ApiResult<(Credential, Option<String>)> {
         // Text that cannot be a token or a session is refused without a
         // lookup. A credential is found by its digest, never by comparing
         // secrets. The two have different shapes, so a token in the cookie
         // or a session in the header is malformed.
         let by_header = headers.contains_key(header::AUTHORIZATION);
+        let own_cookie = own_cookie_name(headers);
         let (presented, hash) = if by_header {
             let token = bearer_token(headers);
             (token, token.and_then(token_lookup_hash))
         } else {
-            let session = session_cookie(headers);
+            let session = own_cookie
+                .as_deref()
+                .and_then(|own| session_cookie(headers, own));
             (session, session.and_then(session_lookup_hash))
         };
+        if probe && !by_header && presented.is_none() {
+            return Err(AppError::unauthenticated());
+        }
         let outcome = match hash {
             None => None,
             Some(hash) => Some(
@@ -908,14 +999,49 @@ fn client_key(client: Option<IpAddr>) -> IpAddr {
     address_key(client.unwrap_or(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)))
 }
 
+/// Whether a `Host` header names this machine's loopback interface, the
+/// only kind of name a local board answers to.
+///
+/// The whole value has to be one of three spellings, with nothing before,
+/// between or after: `localhost` in any letter case, an IPv4 address in
+/// `127.0.0.0/8` written as four decimal numbers, or `[::1]` in any of its
+/// IPv6 spellings; each optionally followed by `:` and a port of one to
+/// five digits that fits a port number. Anything else is refused, among it
+/// a name that merely starts with one of these (`[::1].evil.example`,
+/// `localhost.evil.example`), a trailing dot, an empty port, user
+/// information, white space, a bracketed IPv4 address and an IPv4-mapped
+/// IPv6 address.
 fn is_loopback_host(host: &str) -> bool {
-    let name = if let Some(rest) = host.strip_prefix('[') {
-        rest.split(']').next().unwrap_or_default()
-    } else {
-        host.rsplit_once(':').map_or(host, |(name, _port)| name)
+    let is_port = |port: &str| {
+        !port.is_empty()
+            && port.len() <= 5
+            && port.bytes().all(|b| b.is_ascii_digit())
+            && port.parse::<u16>().is_ok()
+    };
+    if let Some(rest) = host.strip_prefix('[') {
+        // Brackets hold an IPv6 address and nothing else. After them comes
+        // the end, or a port.
+        let Some((address, after)) = rest.split_once(']') else {
+            return false;
+        };
+        let ends_well = match after.strip_prefix(':') {
+            Some(port) => is_port(port),
+            None => after.is_empty(),
+        };
+        return ends_well
+            && address
+                .parse::<std::net::Ipv6Addr>()
+                .is_ok_and(|ip| ip.is_loopback());
+    }
+    let name = match host.rsplit_once(':') {
+        Some((name, port)) if is_port(port) => name,
+        Some(_) => return false,
+        None => host,
     };
     name.eq_ignore_ascii_case("localhost")
-        || name.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+        || name
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 // ---------------------------------------------------------------------------
@@ -1153,14 +1279,36 @@ fn read_json<T: serde::de::DeserializeOwned>(
     })
 }
 
-/// Renders the message's text into [`Message::html`]. A tombstone has no
-/// text, so its HTML is empty.
-fn add_html(message: &mut Message) {
-    message.html = Some(if message.deleted_at.is_some() {
-        String::new()
-    } else {
-        markdown::render_html(&message.text, &message.mentions)
-    });
+/// Fills [`Message::html`] for the messages of one response, in the order
+/// they appear in it, and keeps the response's HTML bounded.
+///
+/// The renderer bounds one message; see `markdown::html_limit`. This bounds
+/// their sum: once [`MAX_HTML_BYTES_PER_RESPONSE`] bytes have been rendered,
+/// the messages that follow get `markdown::plain_html`, which parses
+/// nothing and is at most six times the text the response carries anyway.
+/// So a response holds at most the budget, one more message's limit, and a
+/// small multiple of its own text, however many messages it has and
+/// whatever they contain.
+#[derive(Default)]
+struct HtmlBudget {
+    /// Bytes of HTML rendered from Markdown so far.
+    rendered: usize,
+}
+
+impl HtmlBudget {
+    /// Renders the message's text into [`Message::html`]. A tombstone has
+    /// no text, so its HTML is empty.
+    fn add_html(&mut self, message: &mut Message) {
+        message.html = Some(if message.deleted_at.is_some() {
+            String::new()
+        } else if self.rendered >= MAX_HTML_BYTES_PER_RESPONSE {
+            markdown::plain_html(&message.text)
+        } else {
+            let html = markdown::render_html(&message.text, &message.mentions);
+            self.rendered = self.rendered.saturating_add(html.len());
+            html
+        });
+    }
 }
 
 fn bad_path() -> AppError {
@@ -1385,6 +1533,7 @@ async fn whoami(
 async fn logout(
     State(state): State<Shared>,
     Extension(identity): Extension<Identity>,
+    headers: HeaderMap,
 ) -> ApiResult<Response> {
     state.require_global(&identity.principal, Action::Session)?;
     let Some(credential) = identity.credential else {
@@ -1399,22 +1548,23 @@ async fn logout(
         .db(move |state| state.store.logout(&credential, client, detail))
         .await?;
     let mut response = StatusCode::NO_CONTENT.into_response();
-    if session {
+    // The cookie that authenticated the request is the one to clear: the
+    // one named after the port the request was sent to.
+    if let (true, Some(name)) = (session, own_cookie_name(&headers)) {
         response
             .headers_mut()
-            .insert(header::SET_COOKIE, session_cookie_header("", 0)?);
+            .insert(header::SET_COOKIE, session_cookie_header(&name, "", 0)?);
     }
     Ok(response)
 }
 
-/// The `Set-Cookie` header that sets the session cookie to `value` for
-/// `max_age` seconds, with the attributes `openboard_api::web` fixes. An
-/// empty value and a zero age clear the cookie. The header is marked
+/// The `Set-Cookie` header that sets the session cookie `name` to `value`
+/// for `max_age` seconds, with the attributes `openboard_api::web` fixes.
+/// An empty value and a zero age clear the cookie. The header is marked
 /// sensitive, so nothing that prints headers shows the value.
-fn session_cookie_header(value: &str, max_age: i64) -> ApiResult<HeaderValue> {
-    let cookie = format!(
-        "{SESSION_COOKIE}={value}; Secure; HttpOnly; SameSite=Strict; Path=/; Max-Age={max_age}"
-    );
+fn session_cookie_header(name: &str, value: &str, max_age: i64) -> ApiResult<HeaderValue> {
+    let cookie =
+        format!("{name}={value}; Secure; HttpOnly; SameSite=Strict; Path=/; Max-Age={max_age}");
     let mut header = HeaderValue::from_str(&cookie)
         .map_err(|_| AppError::internal(&"the session cookie is not a valid header"))?;
     header.set_sensitive(true);
@@ -1429,6 +1579,11 @@ fn session_cookie_header(value: &str, max_age: i64) -> ApiResult<HeaderValue> {
 /// script on the page cannot read it. Failures are counted and answered
 /// exactly as those of [`join`], with which this shares its budget, and an
 /// agent's enrolment code is refused here without being spent.
+///
+/// The cookie is named after the port the request was sent to, so boards
+/// on several ports of one host keep their sessions apart. When the request
+/// already carries this board's cookie with a usable session of the same
+/// person, the new session replaces it; see `Store::web_login`.
 async fn web_login(
     State(state): State<Shared>,
     Extension(identity): Extension<Identity>,
@@ -1441,8 +1596,13 @@ async fn web_login(
         ));
     }
     state.require_global(&identity.principal, Action::SignIn)?;
-    // A declared profile is checked before the code is spent.
+    // A declared profile is checked before the code is spent, and so is
+    // that the cookie can be named.
     let profile = Caller::new(&identity, &headers)?.profile;
+    let cookie_name = own_cookie_name(&headers).ok_or_else(|| {
+        AppError::invalid("the Host header must name the board, with its port in digits if any")
+    })?;
+    let replaces = session_cookie(&headers, &cookie_name).and_then(session_lookup_hash);
     let client = identity.client;
     let request: LoginRequest = match read_code_request(&state, &headers, body, "login request")
         .await
@@ -1452,7 +1612,11 @@ async fn web_login(
     };
     let signed_in = if identity::code_is_well_formed(&request.code, InviteKind::Person) {
         state
-            .db(move |state| state.store.web_login(&request.code, client))
+            .db(move |state| {
+                state
+                    .store
+                    .web_login(&request.code, client, replaces.as_deref())
+            })
             .await?
     } else {
         None
@@ -1477,7 +1641,7 @@ async fn web_login(
     let mut response = Json(session).into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
-        session_cookie_header(&secret, max_age.max(0))?,
+        session_cookie_header(&cookie_name, &secret, max_age.max(0))?,
     );
     Ok(response)
 }
@@ -1955,8 +2119,9 @@ async fn list_threads(
                     .store
                     .threads(&listed_on, &channel, label.as_ref(), before, limit)?;
             if html {
+                let mut budget = HtmlBudget::default();
                 for (_, summary) in &mut page.threads {
-                    add_html(&mut summary.root);
+                    budget.add_html(&mut summary.root);
                 }
             }
             Ok(page)
@@ -2010,8 +2175,11 @@ async fn get_thread(
         .db(move |state| {
             let mut thread = state.store.thread(&read_on, &root)?;
             if let (true, Some(thread)) = (html, &mut thread) {
-                add_html(&mut thread.root);
-                thread.replies.iter_mut().for_each(add_html);
+                let mut budget = HtmlBudget::default();
+                budget.add_html(&mut thread.root);
+                for reply in &mut thread.replies {
+                    budget.add_html(reply);
+                }
             }
             Ok(thread)
         })
@@ -2488,7 +2656,9 @@ mod tests {
         let cookie = |values: &[&[u8]]| {
             let pairs: Vec<(&'static str, &[u8])> =
                 values.iter().map(|value| ("cookie", *value)).collect();
-            session_cookie(&headers(&pairs)).map(str::to_owned)
+            // The name is whatever the board's port makes it; the search is
+            // the same for every name.
+            session_cookie(&headers(&pairs), "__Host-openboard_session").map(str::to_owned)
         };
         let found = Some("obs_abc".to_owned());
         assert_eq!(cookie(&[b"__Host-openboard_session=obs_abc"]), found);
@@ -2550,6 +2720,86 @@ mod tests {
         huge.extend_from_slice(b"__Host-openboard_session=obs_abc");
         assert_eq!(cookie(&[&huge]), found);
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn the_session_cookie_is_named_after_the_port_in_the_host_header() {
+        let port = |host: &[u8]| host_port(&headers(&[("host", host)]));
+        for (host, expected) in [
+            (&b"board.example:7878"[..], 7878),
+            (b"192.168.1.20:7878", 7878),
+            (b"localhost:1", 1),
+            (b"board.example:65535", 65535),
+            (b"board.example:00443", 443),
+            (b"[::1]:7878", 7878),
+            (b"[2001:db8::1]:8443", 8443),
+            // No port: the one a browser leaves out for `https`.
+            (b"board.example", 443),
+            (b"192.168.1.20", 443),
+            (b"[::1]", 443),
+        ] {
+            assert_eq!(port(host), Some(expected), "{:?}", host.escape_ascii());
+        }
+        for host in [
+            &b""[..],
+            b":",
+            b":7878",
+            b"board.example:",
+            b"board.example:port",
+            b"board.example:78a",
+            b"board.example:+78",
+            b"board.example:-1",
+            b"board.example: 78",
+            b"board.example:78 ",
+            b"board.example:65536",
+            b"board.example:123456",
+            b"board.example:7878:7879",
+            b"board.example:7878; x=y",
+            b"board.example:7878=obs_x",
+            b"board.example:\xef\xbc\x97",
+            b"\xff:7878",
+            b"::1:7878",
+            b"[::1]:",
+            b"[::1]7878",
+            b"[::1]:78x",
+            b"[::1",
+        ] {
+            assert_eq!(port(host), None, "{:?}", host.escape_ascii());
+        }
+        // No Host, or more than one, names no port.
+        assert_eq!(host_port(&headers(&[])), None);
+        assert_eq!(
+            host_port(&headers(&[("host", b"a:1"), ("host", b"a:1")])),
+            None
+        );
+
+        // Only this board's cookie is seen. Another board's is skipped as
+        // if it were any other application's.
+        let request = headers(&[
+            ("host", b"board.example:7878"),
+            (
+                "cookie",
+                b"__Host-openboard_session_7879=obs_other; __Host-openboard_session=obs_old; \
+                  __Host-openboard_session_78780=obs_longer; __Host-openboard_session_787=obs_shorter; \
+                  __Host-openboard_session_7878=obs_own; __Host-openboard_session_443=obs_default",
+            ),
+        ]);
+        let own = own_cookie_name(&request).unwrap();
+        assert_eq!(own, "__Host-openboard_session_7878");
+        assert_eq!(session_cookie(&request, &own), Some("obs_own"));
+        let elsewhere = headers(&[
+            ("host", b"board.example:7878"),
+            ("cookie", b"__Host-openboard_session_7879=obs_other"),
+        ]);
+        assert_eq!(session_cookie(&elsewhere, &own), None);
+        // Whatever the Host holds, the name is the prefix and digits.
+        for host in [&b"a:7878"[..], b"a", b"[::1]:9"] {
+            let name = own_cookie_name(&headers(&[("host", host)])).unwrap();
+            let suffix = name
+                .strip_prefix(openboard_api::web::SESSION_COOKIE_PREFIX)
+                .unwrap();
+            assert!(!suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()));
+        }
     }
 
     #[test]
@@ -2721,5 +2971,222 @@ mod tests {
         ] {
             assert!(!is_loopback_host(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn the_host_guard_takes_only_whole_loopback_names() {
+        let accepted = [
+            "localhost",
+            "LocalHost",
+            "LOCALHOST",
+            "localhost:1",
+            "localhost:80",
+            "localhost:65535",
+            "localhost:00080",
+            "127.0.0.1",
+            "127.0.0.1:7878",
+            "127.1.2.3",
+            "127.255.255.254:9",
+            "[::1]",
+            "[::1]:7878",
+            "[::1]:0",
+            "[0:0:0:0:0:0:0:1]",
+            "[0000:0000:0000:0000:0000:0000:0000:0001]:7878",
+            "[::0:1]",
+        ];
+        for host in accepted {
+            assert!(is_loopback_host(host), "{host:?} should be accepted");
+        }
+        let refused = [
+            // Something after the bracket that is not a port.
+            "[::1].evil.com",
+            "[::1].evil.com:7878",
+            "[::1]evil.com",
+            "[::1]:7878.evil.com",
+            "[::1]:7878:evil.com",
+            "[::1]@evil.com",
+            "[::1]/",
+            "[::1] ",
+            "[::1]]",
+            "[::1][::1]",
+            "[::1]:",
+            "[::1]:+80",
+            "[::1]:-1",
+            "[::1]:80a",
+            "[::1]: 80",
+            "[::1]:65536",
+            "[::1]:123456",
+            "[::1]::80",
+            // Brackets around something that is not the IPv6 loopback.
+            "[]",
+            "[",
+            "]",
+            "[::1",
+            "::1]",
+            "[::]",
+            "[::2]",
+            "[::1%lo0]",
+            "[::1%25lo0]",
+            "[ ::1]",
+            "[::1 ]",
+            "[[::1]]",
+            "[localhost]",
+            "[127.0.0.1]",
+            "[127.0.0.1]:7878",
+            "[::ffff:127.0.0.1]",
+            "[::ffff:127.0.0.1]:7878",
+            "[::ffff:7f00:1]",
+            "[::127.0.0.1]",
+            "[0:0:0:0:0:ffff:127.0.0.1]",
+            "[fe80::1]",
+            "[2001:db8::1]",
+            // IPv6 without brackets is not a Host.
+            "::1",
+            "::1:7878",
+            "0:0:0:0:0:0:0:1",
+            "::ffff:127.0.0.1",
+            // Names that only start or end like a loopback one.
+            "localhost.",
+            "localhost.:7878",
+            "localhost.evil.com",
+            "localhost.localdomain",
+            "evil.com.localhost",
+            "evil-localhost",
+            "localhost-evil",
+            "notlocalhost",
+            "127.0.0.1.evil.com",
+            "127.0.0.1.",
+            "127.0.0.1.:80",
+            "evil.com:127.0.0.1",
+            // IPv4 spellings a resolver may take but a Host must not use.
+            "127.1",
+            "127.0.1",
+            "2130706433",
+            "0x7f.0.0.1",
+            "0x7f000001",
+            "0177.0.0.1",
+            "127.0.0.01",
+            "127.0.0.1.1",
+            "127.0.0.256",
+            "128.0.0.1",
+            "126.255.255.255",
+            "0.0.0.0",
+            "0",
+            // Ports.
+            "localhost:",
+            "127.0.0.1:",
+            "localhost:port",
+            "localhost:80a",
+            "localhost:8 0",
+            "localhost:+80",
+            "localhost:-80",
+            "localhost:65536",
+            "localhost:999999",
+            "localhost:0x50",
+            "localhost:80:80",
+            "localhost::80",
+            "127.0.0.1:80:80",
+            ":80",
+            ":",
+            // User information, paths and other parts of a URL.
+            "user@localhost",
+            "user:pass@localhost",
+            "localhost@evil.com",
+            "localhost:80@evil.com",
+            "evil.com@127.0.0.1",
+            "evil.com#@localhost",
+            "localhost/",
+            "localhost/evil.com",
+            "localhost#evil.com",
+            "localhost?evil.com",
+            "localhost\\evil.com",
+            "http://localhost",
+            "//localhost",
+            // White space, control characters and separators.
+            " localhost",
+            "localhost ",
+            "local host",
+            "localhost\t",
+            "\tlocalhost",
+            "localhost\r\n",
+            "localhost\n",
+            "localhost\0",
+            "localhost\0.evil.com",
+            " 127.0.0.1",
+            "127.0.0.1 ",
+            "127.0.0.1 evil.com",
+            "localhost,evil.com",
+            "localhost, evil.com",
+            "evil.com,localhost",
+            "localhost;evil.com",
+            // Letters that only look or fold like ASCII ones.
+            "ⓛocalhost",
+            "localhoſt",
+            "LOCALHOST\u{212a}",
+            "１２７.０.０.１",
+            "127。0。0。1",
+            "",
+        ];
+        for host in refused {
+            assert!(!is_loopback_host(host), "{host:?} should be refused");
+        }
+    }
+
+    fn rendered_message(text: &str) -> Message {
+        Message {
+            id: "msg_1".to_owned(),
+            board: "general".to_owned(),
+            channel: "dev".to_owned(),
+            thread_id: "msg_1".to_owned(),
+            by: Principal::local().actor(None),
+            text: text.to_owned(),
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+            revision: 1,
+            credential_id: None,
+            edited_at: None,
+            deleted_at: None,
+            labels: Default::default(),
+            reactions: Vec::new(),
+            mentions: Vec::new(),
+            html: None,
+        }
+    }
+
+    #[test]
+    fn the_html_of_one_response_is_bounded() {
+        // Each message renders to a little under its own limit.
+        let text = "> a\n\n".repeat(2000);
+        let each = markdown::render_html(&text, &[]).len();
+        assert!(each > 6 * text.len() && each <= markdown::html_limit(&text));
+        let fit = MAX_HTML_BYTES_PER_RESPONSE.div_ceil(each);
+
+        let mut budget = HtmlBudget::default();
+        let mut rendered = 0;
+        let mut total = 0;
+        for index in 0..fit + 200 {
+            let mut message = rendered_message(&text);
+            budget.add_html(&mut message);
+            let html = message.html.expect("every message carries HTML");
+            total += html.len();
+            if index < fit {
+                assert!(html.starts_with("<blockquote>"), "message {index}");
+                rendered += html.len();
+            } else {
+                // Past the budget: the whole text, escaped, and no parsing.
+                assert_eq!(html, markdown::plain_html(&text), "message {index}");
+            }
+        }
+        assert!(rendered >= MAX_HTML_BYTES_PER_RESPONSE);
+        assert!(rendered < MAX_HTML_BYTES_PER_RESPONSE + markdown::html_limit(&text));
+        // What follows the budget costs a small multiple of its own text.
+        assert!(total - rendered <= 200 * (6 * text.len() + 11));
+
+        // A tombstone has no HTML and uses none of the budget.
+        let mut budget = HtmlBudget::default();
+        let mut tombstone = rendered_message("");
+        tombstone.deleted_at = Some("2026-01-02T00:00:00Z".to_owned());
+        budget.add_html(&mut tombstone);
+        assert_eq!(tombstone.html.as_deref(), Some(""));
+        assert_eq!(budget.rendered, 0);
     }
 }

@@ -5,12 +5,13 @@ use std::fmt;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use openboard_api::{
     event_types, Actor, BoardInfo, ChannelInfo, Event, LabelsRequest, Mention, Message, Reaction,
-    Thread, ThreadSummary,
+    Thread, ThreadSummary, MAX_REACTION_NAMES_PER_MESSAGE,
 };
 use rusqlite::types::Value;
 use rusqlite::{
@@ -44,6 +45,10 @@ pub(crate) const OLDEST_IDENTITY_SCHEMA: i64 = 2;
 pub(crate) const MAX_LABELS_PER_MESSAGE: usize = 32;
 /// Most mentions kept for one message. Candidates beyond it stay plain text.
 pub(crate) const MAX_MENTIONS_PER_MESSAGE: usize = 50;
+/// How long a statement waits for a lock another process holds. The scrub
+/// of the write-ahead log is the exception: it never waits; see
+/// [`truncate_wal`].
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The schema milestone M0 shipped, `user_version` 1. It is never edited:
 /// later versions are reached by running the migrations below on top of it,
@@ -208,6 +213,10 @@ CREATE TABLE mentions (
 ) WITHOUT ROWID;
 ";
 
+/// The detail of the logout entry written for a session that a new sign-in
+/// of the same person, from the same browser, took the place of.
+pub(crate) const SESSION_REPLACED: &str = "session, replaced by a new sign-in";
+
 const MESSAGE_COLUMNS: &str = "m.id, m.channel, m.thread_id, m.text, m.created_at, m.revision, \
                                a.id, a.kind, a.handle, a.profile, m.credential_id, \
                                m.edited_at, m.deleted_at";
@@ -231,6 +240,8 @@ pub(crate) enum StoreError {
     LabelConflict(String),
     /// The change would leave the message with too many labels.
     TooManyLabels,
+    /// The reaction would be one name more than a message holds.
+    TooManyReactions,
     /// Another server holds the lock on the data directory.
     DataDirInUse,
     Sqlite(rusqlite::Error),
@@ -247,6 +258,7 @@ impl fmt::Display for StoreError {
             StoreError::RevisionConflict => f.write_str("revision conflict"),
             StoreError::LabelConflict(_) => f.write_str("label conflict"),
             StoreError::TooManyLabels => f.write_str("too many labels"),
+            StoreError::TooManyReactions => f.write_str("too many reactions"),
             StoreError::DataDirInUse => f.write_str("the data directory is in use"),
             StoreError::Sqlite(error) => write!(f, "sqlite: {error}"),
             StoreError::Other(detail) => f.write_str(detail),
@@ -414,6 +426,10 @@ pub(crate) struct ModePlan {
 pub(crate) struct Store {
     data_dir: PathBuf,
     conn: Mutex<Connection>,
+    /// True while removed content may still be in the write-ahead log: a
+    /// scrub was due and could not empty it. Written under the connection
+    /// lock; read without it. See [`Store::scrub`].
+    scrub_pending: AtomicBool,
     /// Holds the exclusive lock on the data directory. Closing the file
     /// releases it, so it is declared after the connection and outlives it.
     _lock: File,
@@ -437,13 +453,13 @@ impl Store {
         let lock = lock_data_dir(data_dir)?;
         make_private(data_dir).map_err(StoreError::Other)?;
         let mut conn = Connection::open(data_dir.join(DB_FILE_NAME))?;
-        conn.busy_timeout(Duration::from_secs(5))?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         // Deleted and replaced content is overwritten with zeros in the
         // database file, so the text of a deleted message does not linger
-        // in free space. See also `scrub_wal`.
+        // in free space. See also `Store::scrub`.
         conn.pragma_update(None, "secure_delete", "ON")?;
 
         // Migrations are forward-only and run here, in one transaction, so
@@ -474,11 +490,52 @@ impl Store {
         }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
+        // A server that was killed, or stopped while something else read
+        // the database, can have left removed content in the log. It goes
+        // now, or as soon as the log can be emptied.
+        let scrubbed = truncate_wal(&conn, data_dir);
         Ok(Self {
             data_dir: data_dir.to_path_buf(),
             conn: Mutex::new(conn),
+            scrub_pending: AtomicBool::new(!scrubbed),
             _lock: lock,
         })
+    }
+
+    /// Whether removed content may still be in the write-ahead log, because
+    /// the scrub after its removal could not empty the log. Costs nothing,
+    /// so it can be asked often.
+    pub(crate) fn scrub_pending(&self) -> bool {
+        self.scrub_pending.load(Ordering::Acquire)
+    }
+
+    /// Moves the write-ahead log into the database file and empties it, if
+    /// that can be done without waiting. Returns whether the log is empty.
+    ///
+    /// `secure_delete` overwrites removed content in the database file, but
+    /// the log still holds the pages as they were before, and SQLite would
+    /// only overwrite those as later writes happen to reuse the space. So
+    /// every removal of content is followed by this, under the same lock
+    /// and straight after its commit: an edit, a delete, a label that is
+    /// cleared or replaced, a reaction that is taken back.
+    ///
+    /// The log cannot be emptied while another process reads the database:
+    /// a backup, or an operator command. This never waits for that, because
+    /// it runs with the store's only connection held and every request
+    /// would wait with it. It notes instead that a scrub is pending, and
+    /// the server's upkeep task calls it again until it succeeds; see
+    /// [`Store::scrub_pending`]. It also runs when the store opens and when
+    /// it closes.
+    pub(crate) fn scrub(&self) -> bool {
+        let conn = self.conn();
+        self.scrub_wal(&conn)
+    }
+
+    /// [`Store::scrub`] for a caller that holds the connection.
+    fn scrub_wal(&self, conn: &Connection) -> bool {
+        let emptied = truncate_wal(conn, &self.data_dir);
+        self.scrub_pending.store(!emptied, Ordering::Release);
+        emptied
     }
 
     fn conn(&self) -> MutexGuard<'_, Connection> {
@@ -615,22 +672,37 @@ impl Store {
         code: &str,
         client: Option<IpAddr>,
     ) -> Result<Option<(String, Credential)>> {
-        self.redeem(code, InviteKind::Agent, log_kinds::ENROL_SUCCEEDED, client)
+        self.redeem(
+            code,
+            InviteKind::Agent,
+            log_kinds::ENROL_SUCCEEDED,
+            client,
+            None,
+        )
     }
 
     /// Swaps a person's sign-in code for a browser session. Returns the
     /// cookie value, which exists nowhere else, and the session's
     /// credential. Logged like [`Store::join`].
+    ///
+    /// `replaces` is the digest of the session cookie the sign-in request
+    /// carried, if it carried one. When that is a usable session of the
+    /// same person, the new session takes its place: the earlier one is
+    /// revoked in the same transaction and logged as a logout. A session of
+    /// anyone else, or one that is unknown, expired or revoked, is left
+    /// exactly as it is, and so is everything when the code is refused.
     pub(crate) fn web_login(
         &self,
         code: &str,
         client: Option<IpAddr>,
+        replaces: Option<&str>,
     ) -> Result<Option<(String, Credential)>> {
         self.redeem(
             code,
             InviteKind::Person,
             log_kinds::WEB_LOGIN_SUCCEEDED,
             client,
+            replaces,
         )
     }
 
@@ -640,10 +712,12 @@ impl Store {
         kind: InviteKind,
         succeeded: &str,
         client: Option<IpAddr>,
+        replaces: Option<&str>,
     ) -> Result<Option<(String, Credential)>> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let redeemed = identity::redeem(&tx, code, kind, now_ms()).map_err(StoreError::Other)?;
+        let now = now_ms();
+        let redeemed = identity::redeem(&tx, code, kind, now).map_err(StoreError::Other)?;
         if let Some((_, credential)) = &redeemed {
             identity::log(
                 &tx,
@@ -655,6 +729,28 @@ impl Store {
                     detail: None,
                 },
             )?;
+            let earlier = match replaces {
+                None => None,
+                Some(hash) => identity::find_credential_by_hash(&tx, hash)?,
+            }
+            .filter(|earlier| {
+                earlier.principal_id == credential.principal_id
+                    && earlier.id != credential.id
+                    && earlier.usable_at(now)
+            });
+            if let Some(earlier) = earlier {
+                identity::revoke_credential(&tx, &earlier.id, now)?;
+                identity::log(
+                    &tx,
+                    &LogEntry {
+                        kind: log_kinds::LOGOUT,
+                        principal: Some(&earlier.handle),
+                        credential_id: Some(&earlier.id),
+                        client,
+                        detail: Some(SESSION_REPLACED),
+                    },
+                )?;
+            }
         }
         tx.commit()?;
         Ok(redeemed)
@@ -790,7 +886,7 @@ impl Store {
                         ))
                     },
                 )?;
-                fill_message(&tx, &mut message)?;
+                fill_messages(&tx, &mut [&mut message])?;
                 return Ok(Posted {
                     board: board.clone(),
                     message,
@@ -903,7 +999,8 @@ impl Store {
     }
 
     /// Replaces a message's text. The earlier text is not kept: it is
-    /// overwritten in the database file.
+    /// overwritten in the database file, and the digest of it that an
+    /// idempotency key kept is removed, as [`Store::delete`] removes it.
     pub(crate) fn edit(
         &self,
         board: &BoardRef,
@@ -929,6 +1026,7 @@ impl Store {
         )?;
         let resolved = resolve_mentions(&tx, mentions)?;
         write_mentions(&tx, message_id, &resolved)?;
+        forget_fingerprint(&tx, message_id)?;
         upsert_actor(&tx, by)?;
         let seq = append_event(
             &tx,
@@ -940,7 +1038,7 @@ impl Store {
         )?;
         let message = load_message(&tx, board, message_id)?;
         tx.commit()?;
-        scrub_wal(&conn);
+        self.scrub_wal(&conn);
         Ok(Changed {
             message,
             seq: Some(seq),
@@ -978,13 +1076,7 @@ impl Store {
                 [message_id],
             )?;
         }
-        // The fingerprint is a digest of the text. With it gone, the key
-        // can never be matched again, and never posts the text a second
-        // time either.
-        tx.execute(
-            "UPDATE idempotency SET fingerprint = '' WHERE message_id = ?1",
-            [message_id],
-        )?;
+        forget_fingerprint(&tx, message_id)?;
         upsert_actor(&tx, by)?;
         let seq = append_event(
             &tx,
@@ -996,7 +1088,7 @@ impl Store {
         )?;
         let message = load_message(&tx, board, message_id)?;
         tx.commit()?;
-        scrub_wal(&conn);
+        self.scrub_wal(&conn);
         Ok(Changed {
             message,
             seq: Some(seq),
@@ -1044,6 +1136,10 @@ impl Store {
             let message = load_message(&tx, board, message_id)?;
             return Ok(Changed { message, seq: None });
         }
+        // A value that is cleared or replaced is content that goes away.
+        let removes = before
+            .iter()
+            .any(|(key, value)| after.get(key) != Some(value));
         for key in before.keys().filter(|key| !after.contains_key(*key)) {
             tx.execute(
                 "DELETE FROM labels WHERE message_id = ?1 AND key = ?2",
@@ -1070,6 +1166,9 @@ impl Store {
         )?;
         let message = load_message(&tx, board, message_id)?;
         tx.commit()?;
+        if removes {
+            self.scrub_wal(&conn);
+        }
         Ok(Changed {
             message,
             seq: Some(seq),
@@ -1078,6 +1177,10 @@ impl Store {
 
     /// Adds (`add`) or removes the principal's reaction `name`. `handle` is
     /// the principal's handle, without any profile.
+    ///
+    /// A message holds at most [`MAX_REACTION_NAMES_PER_MESSAGE`] different
+    /// names. A name that is already on the message can always be joined,
+    /// and a reaction can always be removed.
     pub(crate) fn react(
         &self,
         board: &BoardRef,
@@ -1094,6 +1197,15 @@ impl Store {
             return Err(StoreError::MessageDeleted);
         }
         let changed = if add {
+            let (present, names): (bool, i64) = tx.query_row(
+                "SELECT EXISTS (SELECT 1 FROM reactions WHERE message_id = ?1 AND name = ?2),
+                        (SELECT count(DISTINCT name) FROM reactions WHERE message_id = ?1)",
+                params![message_id, name],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            if !present && names >= MAX_REACTION_NAMES_PER_MESSAGE as i64 {
+                return Err(StoreError::TooManyReactions);
+            }
             tx.execute(
                 "INSERT OR IGNORE INTO reactions (message_id, name, principal_id, handle)
                  VALUES (?1, ?2, ?3, ?4)",
@@ -1120,6 +1232,10 @@ impl Store {
         )?;
         let message = load_message(&tx, board, message_id)?;
         tx.commit()?;
+        if !add {
+            // The name that was taken back is content that goes away.
+            self.scrub_wal(&conn);
+        }
         Ok(Changed {
             message,
             seq: Some(seq),
@@ -1218,9 +1334,11 @@ impl Store {
         let mut threads = rows.collect::<rusqlite::Result<Vec<_>>>()?;
         let more = threads.len() > limit as usize;
         threads.truncate(limit as usize);
-        for (_, summary) in &mut threads {
-            fill_message(conn, &mut summary.root)?;
-        }
+        let mut roots: Vec<&mut Message> = threads
+            .iter_mut()
+            .map(|(_, summary)| &mut summary.root)
+            .collect();
+        fill_messages(conn, &mut roots)?;
         Ok(ThreadPage { threads, more })
     }
 
@@ -1240,9 +1358,7 @@ impl Store {
         if messages.first().is_none_or(|first| first.id != root_id) {
             return Ok(None);
         }
-        for message in &mut messages {
-            fill_message(conn, message)?;
-        }
+        fill_messages(conn, &mut messages.iter_mut().collect::<Vec<_>>())?;
         let root = messages.remove(0);
         Ok(Some(Thread {
             root,
@@ -1517,49 +1633,99 @@ fn message_from_row(row: &Row<'_>, at: usize, board: &str) -> rusqlite::Result<M
     })
 }
 
-/// Adds what is stored beside a message's row: its labels, reactions and
-/// mentions. A tombstone has none.
-fn fill_message(conn: &Connection, message: &mut Message) -> Result<()> {
-    if message.deleted_at.is_some() {
+/// Adds what is stored beside the rows of `messages`: their labels,
+/// reactions and mentions. A tombstone has none.
+///
+/// It runs three statements however many messages there are, one for each
+/// kind of thing, so reading a long thread or a full page of threads holds
+/// the store's connection for three statements and not three per message.
+/// The IDs travel as one JSON array, which no number of them outgrows.
+fn fill_messages(conn: &Connection, messages: &mut [&mut Message]) -> Result<()> {
+    let at: std::collections::HashMap<String, usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| message.deleted_at.is_none())
+        .map(|(index, message)| (message.id.clone(), index))
+        .collect();
+    if at.is_empty() {
         return Ok(());
     }
-    message.labels = labels_of(conn, &message.id)?;
-    let mut stmt = conn.prepare_cached(
-        "SELECT name, handle FROM reactions WHERE message_id = ?1 ORDER BY name, id",
-    )?;
-    let rows = stmt.query_map([&message.id], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?;
-    for row in rows {
-        let (name, handle) = row?;
-        match message.reactions.last_mut() {
+    let ids = serde_json::to_string(&at.keys().collect::<Vec<_>>())
+        .map_err(|error| StoreError::Other(format!("cannot list message IDs: {error}")))?;
+    const WANTED: &str = "message_id IN (SELECT value FROM json_each(?1))";
+
+    count_fill_statement();
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT message_id, key, value FROM labels WHERE {WANTED}"
+    ))?;
+    let mut rows = stmt.query([&ids])?;
+    while let Some(row) = rows.next()? {
+        let id: String = row.get(0)?;
+        if let Some(index) = at.get(&id) {
+            messages[*index].labels.insert(row.get(1)?, row.get(2)?);
+        }
+    }
+
+    count_fill_statement();
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT message_id, name, handle FROM reactions WHERE {WANTED}
+         ORDER BY message_id, name, id"
+    ))?;
+    let mut rows = stmt.query([&ids])?;
+    while let Some(row) = rows.next()? {
+        let id: String = row.get(0)?;
+        let Some(index) = at.get(&id) else {
+            continue;
+        };
+        let (name, handle): (String, String) = (row.get(1)?, row.get(2)?);
+        let reactions = &mut messages[*index].reactions;
+        match reactions.last_mut() {
             Some(last) if last.name == name => last.by.push(handle),
-            _ => message.reactions.push(Reaction {
+            _ => reactions.push(Reaction {
                 name,
                 by: vec![handle],
             }),
         }
     }
-    let mut stmt = conn.prepare_cached(
-        "SELECT handle, kind, profile FROM mentions WHERE message_id = ?1 ORDER BY position",
-    )?;
-    let rows = stmt.query_map([&message.id], |row| {
-        let kind: String = row.get(1)?;
+
+    count_fill_statement();
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT message_id, handle, kind, profile FROM mentions WHERE {WANTED}
+         ORDER BY message_id, position"
+    ))?;
+    let mut rows = stmt.query([&ids])?;
+    while let Some(row) = rows.next()? {
+        let id: String = row.get(0)?;
+        let Some(index) = at.get(&id) else {
+            continue;
+        };
+        let kind: String = row.get(2)?;
         let kind = parse_actor_kind(&kind).ok_or_else(|| {
             rusqlite::Error::FromSqlConversionFailure(
-                1,
+                2,
                 rusqlite::types::Type::Text,
                 "unknown principal kind".into(),
             )
         })?;
-        Ok(Mention {
-            handle: row.get(0)?,
+        messages[*index].mentions.push(Mention {
+            handle: row.get(1)?,
             kind,
-            profile: row.get(2)?,
-        })
-    })?;
-    message.mentions = rows.collect::<rusqlite::Result<_>>()?;
+            profile: row.get(3)?,
+        });
+    }
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Statements [`fill_messages`] has run on this thread.
+    static FILL_STATEMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts one statement of [`fill_messages`], in tests only.
+fn count_fill_statement() {
+    #[cfg(test)]
+    FILL_STATEMENTS.with(|count| count.set(count.get() + 1));
 }
 
 fn labels_of(
@@ -1581,7 +1747,7 @@ fn load_message(conn: &Connection, board: &BoardRef, message_id: &str) -> Result
         params![board.id, message_id],
         |row| message_from_row(row, 0, &board.name),
     )?;
-    fill_message(conn, &mut message)?;
+    fill_messages(conn, &mut [&mut message])?;
     Ok(message)
 }
 
@@ -1788,16 +1954,61 @@ fn write_mentions(
     Ok(())
 }
 
-/// Moves the write-ahead log into the database file and empties it.
+/// Removes the digest of a message's original text that an idempotency key
+/// kept, when that text goes away. The key stays, spent: with the digest
+/// gone it can never be matched again, so a retry is refused as a conflict
+/// and never posts the text a second time.
+fn forget_fingerprint(conn: &Connection, message_id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE idempotency SET fingerprint = '' WHERE message_id = ?1 AND fingerprint <> ''",
+        [message_id],
+    )?;
+    Ok(())
+}
+
+/// Tries to move the write-ahead log into the database file and empty it,
+/// without waiting for anyone. Returns whether the log is now empty.
 ///
-/// `secure_delete` overwrites removed text in the database file, but the
-/// log still holds the pages as they were before, and SQLite would only
-/// overwrite those as later writes happen to reuse the space. Running this
-/// after text is removed leaves no copy in either file. It is best effort:
-/// while another process reads the database the log cannot be emptied, and
-/// it is emptied by the next removal instead.
-fn scrub_wal(conn: &Connection) {
-    let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+/// The statement runs with no busy timeout. Where another connection
+/// stands in the way, SQLite then moves what it can and reports that it
+/// was held up, in the first column of the row the statement returns,
+/// instead of calling the busy handler for as long as the timeout lasts.
+/// That row is what decides the outcome, together with the length of the
+/// log file itself; an error counts as not emptied.
+fn truncate_wal(conn: &Connection, data_dir: &Path) -> bool {
+    if conn.busy_timeout(Duration::ZERO).is_err() {
+        return false;
+    }
+    let held_up = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+        row.get::<_, i64>(0)
+    });
+    if conn.busy_timeout(BUSY_TIMEOUT).is_err() {
+        eprintln!("openboard-server: could not restore the database's busy timeout");
+    }
+    let wal = data_dir.join(format!("{DB_FILE_NAME}-wal"));
+    let empty = match std::fs::metadata(&wal) {
+        Ok(found) => found.len() == 0,
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    };
+    matches!(held_up, Ok(0)) && empty
+}
+
+impl Drop for Store {
+    /// The last scrub, as the store closes. Closing the connection empties
+    /// the log too, but only when no other process has the database open.
+    fn drop(&mut self) {
+        let conn = self
+            .conn
+            .get_mut()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let emptied = truncate_wal(conn, &self.data_dir);
+        if !emptied && self.scrub_pending() {
+            eprintln!(
+                "openboard-server: another process was reading the database, so content \
+                 removed from the board may remain in its write-ahead log until the next start"
+            );
+        }
+    }
 }
 
 fn actor_from_row(row: &Row<'_>, at: usize) -> rusqlite::Result<Actor> {
@@ -1935,6 +2146,167 @@ fn lock_data_dir(data_dir: &Path) -> Result<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn local_writer() -> Writer {
+        let local = crate::authz::Principal::local();
+        Writer {
+            actor: local.actor(None),
+            principal_id: local.id.clone(),
+            credential_id: None,
+        }
+    }
+
+    fn post(store: &Store, board: &BoardRef, thread: Option<&str>, text: &str) -> Message {
+        let by = local_writer();
+        let post = NewPost {
+            channel: "dev".to_owned(),
+            thread_id: thread.map(str::to_owned),
+            actor: by.actor,
+            principal_id: by.principal_id,
+            credential_id: None,
+            text: text.to_owned(),
+            idempotency: None,
+            mentions: MentionInput {
+                candidates: crate::markdown::mention_candidates(text),
+                local: true,
+            },
+        };
+        store
+            .post(PostTarget::Board(board.clone()), post)
+            .unwrap()
+            .message
+    }
+
+    /// Runs `read` and returns how many statements it spent on labels,
+    /// reactions and mentions.
+    fn fill_statements<T>(read: impl FnOnce() -> T) -> (T, usize) {
+        FILL_STATEMENTS.set(0);
+        let result = read();
+        (result, FILL_STATEMENTS.get())
+    }
+
+    #[test]
+    fn a_read_loads_labels_reactions_and_mentions_in_three_statements() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let board = store.ensure_board("general").unwrap();
+        let by = local_writer();
+        let label = |id: &str, key: &str, value: &str| {
+            let request = LabelsRequest {
+                set: [(key.to_owned(), value.to_owned())].into(),
+                ..LabelsRequest::default()
+            };
+            store.label(&board, id, &by, &request).unwrap();
+        };
+        let react = |id: &str, name: &str| {
+            store.react(&board, id, &by, "local", name, true).unwrap();
+        };
+
+        let root = post(&store, &board, None, "the root, for @local");
+        label(&root.id, "status", "open");
+        react(&root.id, "eyes");
+        let replies = 60;
+        let mut deleted = String::new();
+        for n in 0..replies {
+            let text = if n % 2 == 0 {
+                format!("reply {n} to @local")
+            } else {
+                format!("reply {n}")
+            };
+            let reply = post(&store, &board, Some(&root.id), &text);
+            if n % 3 == 0 {
+                label(&reply.id, "n", &n.to_string());
+                label(&reply.id, "kind", "third");
+            }
+            if n % 4 == 0 {
+                react(&reply.id, "zz");
+                react(&reply.id, &format!("r{n}"));
+                react(&reply.id, "aa");
+            }
+            if n == 7 {
+                label(&reply.id, "gone", "with the message");
+                store.delete(&board, &reply.id, &by, None).unwrap();
+                deleted = reply.id;
+            }
+        }
+
+        let (thread, statements) = fill_statements(|| store.thread(&board, &root.id));
+        let thread = thread.unwrap().unwrap();
+        assert_eq!(thread.replies.len(), replies);
+        assert_eq!(
+            statements,
+            3,
+            "a thread of {} messages",
+            thread.replies.len() + 1
+        );
+
+        // Everything landed on the message it belongs to, in order.
+        assert_eq!(thread.root.labels["status"], "open");
+        assert_eq!(thread.root.reactions.len(), 1);
+        assert_eq!(thread.root.mentions.len(), 1);
+        for (n, reply) in thread.replies.iter().enumerate() {
+            assert!(reply.text.is_empty() || reply.text.starts_with(&format!("reply {n}")));
+            if reply.id == deleted {
+                assert!(reply.deleted_at.is_some());
+                assert!(reply.labels.is_empty() && reply.reactions.is_empty());
+                assert!(reply.mentions.is_empty());
+                continue;
+            }
+            let labels: Vec<(&str, &str)> = reply
+                .labels
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str()))
+                .collect();
+            if n % 3 == 0 {
+                assert_eq!(labels, [("kind", "third"), ("n", n.to_string().as_str())]);
+            } else {
+                assert!(labels.is_empty(), "reply {n}: {labels:?}");
+            }
+            let names: Vec<&str> = reply.reactions.iter().map(|r| r.name.as_str()).collect();
+            if n % 4 == 0 {
+                assert_eq!(names, ["aa", format!("r{n}").as_str(), "zz"], "reply {n}");
+                assert!(reply.reactions.iter().all(|r| r.by == ["local"]));
+            } else {
+                assert!(names.is_empty(), "reply {n}: {names:?}");
+            }
+            let mentioned: Vec<&str> = reply.mentions.iter().map(|m| m.handle.as_str()).collect();
+            if n % 2 == 0 {
+                assert_eq!(mentioned, ["local"], "reply {n}");
+            } else {
+                assert!(mentioned.is_empty(), "reply {n}");
+            }
+            // The same as reading the message on its own.
+            assert_eq!(
+                *reply,
+                load_message(&store.conn(), &board, &reply.id).unwrap()
+            );
+        }
+
+        // A page of threads costs the same three statements.
+        for n in 0..40 {
+            let other = post(&store, &board, None, &format!("thread {n} @local"));
+            label(&other.id, "n", &n.to_string());
+        }
+        let channel = ChannelSel::Exact("dev".to_owned());
+        let (page, statements) =
+            fill_statements(|| store.threads(&board, &channel, None, None, 500));
+        let page = page.unwrap();
+        assert_eq!(page.threads.len(), 41);
+        assert_eq!(statements, 3, "a page of {} threads", page.threads.len());
+        for (_, summary) in &page.threads[..40] {
+            assert_eq!(summary.root.labels.len(), 1);
+            assert_eq!(summary.root.mentions.len(), 1);
+            assert!(summary.root.text.ends_with("@local"));
+        }
+        assert_eq!(page.threads[40].1.root.id, root.id);
+        assert_eq!(page.threads[40].1.root.labels["status"], "open");
+
+        // Nothing to load, nothing asked.
+        let lone = post(&store, &board, None, "soon gone");
+        store.delete(&board, &lone.id, &by, None).unwrap();
+        let (_, statements) = fill_statements(|| store.thread(&board, &lone.id));
+        assert_eq!(statements, 0);
+    }
 
     #[test]
     fn cursors_round_trip_and_are_board_scoped() {

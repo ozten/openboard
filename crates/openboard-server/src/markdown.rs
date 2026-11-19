@@ -24,8 +24,25 @@
 //!
 //! The emitter is a loop over a flat event stream with its own stack, so
 //! deeply nested input cannot overflow the call stack, and elements nested
-//! deeper than [`MAX_NESTING`] are written without their tags, so the output
-//! stays proportional to the input.
+//! deeper than [`MAX_NESTING`] are written without their tags.
+//!
+//! # Size
+//!
+//! Markdown can ask for far more HTML than it has text: every row of a
+//! table gets a cell for every column of its header, and a `>` is one byte
+//! that opens a 25-byte element. Two rules keep the output proportional to
+//! the input, whatever the input is:
+//!
+//! - The HTML of one message is at most [`html_limit`] bytes. The emitter
+//!   stops at the first event that takes it past that, and the message is
+//!   shown whole by [`plain_html`] instead: its text, escaped, in one
+//!   `<pre>`. Nothing is rendered and then thrown away, and nothing of the
+//!   text is lost.
+//! - Tables are recognised only in a text where no line holds more than
+//!   [`MAX_TABLE_COLUMNS`] + 1 `|` characters, which is what a table of
+//!   [`MAX_TABLE_COLUMNS`] columns needs. A wider one is shown as the text
+//!   it was written as. This bounds the parser too, which builds a node per
+//!   cell before the emitter sees any of them.
 //!
 //! # Mentions
 //!
@@ -34,8 +51,13 @@
 //! is written, [`mention_candidates`] lists what the text addresses and the
 //! store keeps those that name a principal; when it is rendered, a
 //! candidate that the store kept is wrapped in `<span class="mention">`.
+//!
+//! An `@` the author escaped is not a mention and is no part of one:
+//! `\@name`, or the `@` written as a character reference such as `&#64;`.
+//! The parser hands over text with escapes already resolved, so the walk
+//! looks at the source bytes each piece of text came from.
 
-use openboard_api::Mention;
+use openboard_api::{Mention, HTML_BYTES_PER_TEXT_BYTE, MAX_TABLE_COLUMNS, MIN_HTML_LIMIT_BYTES};
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, LinkType, Options, Parser, Tag};
 
 /// Elements nested deeper than this are written without their tags.
@@ -61,17 +83,77 @@ pub(crate) struct Candidate {
 /// at most [`MAX_MENTION_CANDIDATES`]. Handles and profiles are distinct
 /// without regard to ASCII case.
 pub(crate) fn mention_candidates(text: &str) -> Vec<Candidate> {
-    let mut renderer = Renderer::new(None);
+    let mut renderer = Renderer::new(None, usize::MAX);
     renderer.run(text);
     renderer.candidates
 }
 
 /// Renders Markdown `text` to HTML through the allowlist described in the
 /// module documentation. `mentions` are the message's resolved mentions.
+///
+/// The result is at most [`html_limit`] bytes. A text whose rendering would
+/// be larger comes back as [`plain_html`].
 pub(crate) fn render_html(text: &str, mentions: &[Mention]) -> String {
-    let mut renderer = Renderer::new(Some(mentions));
-    renderer.run(text);
-    renderer.out
+    let mut renderer = Renderer::new(Some(mentions), html_limit(text));
+    if renderer.run(text) {
+        renderer.out
+    } else {
+        // Dropped before the fallback is built, so the two never coexist.
+        drop(renderer);
+        plain_html(text)
+    }
+}
+
+/// The most HTML, in bytes, the text of one message renders to:
+/// [`HTML_BYTES_PER_TEXT_BYTE`] times its length, and never less than
+/// [`MIN_HTML_LIMIT_BYTES`], so a short message keeps all its formatting.
+pub(crate) fn html_limit(text: &str) -> usize {
+    text.len()
+        .saturating_mul(HTML_BYTES_PER_TEXT_BYTE)
+        .max(MIN_HTML_LIMIT_BYTES)
+}
+
+/// The whole text as escaped plain text in one `<pre>`: what a message is
+/// shown as when its Markdown is not rendered. It is at most six times the
+/// text plus the two tags, which is always within [`html_limit`].
+pub(crate) fn plain_html(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + text.len() / 8 + 11);
+    out.push_str("<pre>");
+    escape_into(&mut out, text);
+    out.push_str("</pre>");
+    out
+}
+
+/// The parser options for `text`. Both walks over a text use them, so the
+/// mentions found when it is written are those wrapped when it is rendered.
+fn options_for(text: &str) -> Options {
+    let widest = text
+        .split('\n')
+        .map(|line| line.bytes().filter(|b| *b == b'|').count())
+        .max()
+        .unwrap_or(0);
+    if widest > MAX_TABLE_COLUMNS + 1 {
+        Options::ENABLE_STRIKETHROUGH
+    } else {
+        Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH
+    }
+}
+
+/// Whether the `@` that starts a piece of parser text was escaped in the
+/// source. `start` is where the piece begins in `source`. An unescaped `@`
+/// is the byte there and has an even number of backslashes before it; after
+/// `\@` the piece begins at the `@` with the backslash before it, and for
+/// a character reference it begins at the `&`.
+fn at_is_escaped(source: &[u8], start: usize) -> bool {
+    if source.get(start) != Some(&b'@') {
+        return true;
+    }
+    let backslashes = source[..start]
+        .iter()
+        .rev()
+        .take_while(|b| **b == b'\\')
+        .count();
+    backslashes % 2 == 1
 }
 
 /// What closing an element has to undo.
@@ -93,6 +175,8 @@ struct Open {
 
 struct Renderer<'m> {
     out: String,
+    /// The most bytes `out` may hold; see [`html_limit`].
+    limit: usize,
     /// `None` when only the candidates are wanted.
     mentions: Option<&'m [Mention]>,
     candidates: Vec<Candidate>,
@@ -100,33 +184,49 @@ struct Renderer<'m> {
     /// Adjacent text events, joined, so a mention split by the parser is
     /// still seen whole.
     pending: String,
+    /// Where in `pending` an `@` stands that the author escaped, in
+    /// ascending order.
+    escaped: Vec<usize>,
     code_blocks: usize,
     anchors: usize,
     in_table_head: bool,
 }
 
 impl<'m> Renderer<'m> {
-    fn new(mentions: Option<&'m [Mention]>) -> Self {
+    fn new(mentions: Option<&'m [Mention]>, limit: usize) -> Self {
         Self {
             out: String::new(),
+            limit,
             mentions,
             candidates: Vec::new(),
             stack: Vec::new(),
             pending: String::new(),
+            escaped: Vec::new(),
             code_blocks: 0,
             anchors: 0,
             in_table_head: false,
         }
     }
 
-    fn run(&mut self, text: &str) {
-        let options = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH;
-        for event in Parser::new_ext(text, options) {
+    /// Walks `text`. Returns false, with the output unfinished, as soon as
+    /// the output is larger than the limit: one event past it at most, and
+    /// an event writes no more than its own text, escaped.
+    fn run(&mut self, text: &str) -> bool {
+        let source = text.as_bytes();
+        for (event, range) in Parser::new_ext(text, options_for(text)).into_offset_iter() {
             match event {
-                Event::Text(text) => self.pending.push_str(&text),
+                Event::Text(piece) => {
+                    if piece.starts_with('@') && at_is_escaped(source, range.start) {
+                        self.escaped.push(self.pending.len());
+                    }
+                    self.pending.push_str(&piece);
+                }
                 other => {
                     self.flush_text();
                     self.event(other);
+                    if !self.within_limit() {
+                        return false;
+                    }
                 }
             }
         }
@@ -136,6 +236,17 @@ impl<'m> Renderer<'m> {
         while let Some(open) = self.stack.pop() {
             self.out.push_str(open.close);
         }
+        self.within_limit()
+    }
+
+    /// Whether the output still fits. When only the candidates are wanted
+    /// the output is not kept at all.
+    fn within_limit(&mut self) -> bool {
+        if self.mentions.is_none() {
+            self.out.clear();
+            return true;
+        }
+        self.out.len() <= self.limit
     }
 
     fn event(&mut self, event: Event<'_>) {
@@ -305,12 +416,13 @@ impl<'m> Renderer<'m> {
             return;
         }
         let text = std::mem::take(&mut self.pending);
+        let escaped = std::mem::take(&mut self.escaped);
         if self.code_blocks > 0 {
             escape_into(&mut self.out, &text);
             return;
         }
         let mut written = 0;
-        for found in scan_mentions(&text) {
+        for found in scan_mentions(&text, &escaped) {
             let handle = &text[found.handle.clone()];
             let profile = found.profile.clone().map(|range| &text[range]);
             self.note(handle, profile);
@@ -433,15 +545,24 @@ pub(crate) fn is_handle_byte(b: u8) -> bool {
 /// the longest run of handle characters after it, less any trailing
 /// punctuation. When the run is directly followed by `/` and a profile
 /// name, that is the profile.
-fn scan_mentions(text: &str) -> Vec<Found> {
+///
+/// `escaped` holds, in ascending order, the positions of every `@` the
+/// author escaped. Such an `@` starts no mention and ends the handle of one
+/// before it.
+fn scan_mentions(text: &str, escaped: &[usize]) -> Vec<Found> {
     let bytes = text.as_bytes();
+    let is_escaped = |at: usize| escaped.binary_search(&at).is_ok();
     let mut found = Vec::new();
     let mut at = 0;
     while let Some(offset) = bytes[at..].iter().position(|b| *b == b'@') {
         let start = at + offset;
         let run_start = start + 1;
+        if is_escaped(start) {
+            at = run_start;
+            continue;
+        }
         let mut run_end = run_start;
-        while run_end < bytes.len() && is_handle_byte(bytes[run_end]) {
+        while run_end < bytes.len() && is_handle_byte(bytes[run_end]) && !is_escaped(run_end) {
             run_end += 1;
         }
         // Whatever happens, the scan continues after this run.
@@ -1223,7 +1344,7 @@ mod tests {
             let took = started.elapsed();
             assert!(took < Duration::from_secs(5), "{label:?} took {took:?}");
             assert!(
-                html.len() <= input.len() * 40 + 64,
+                html.len() <= html_limit(input),
                 "{label:?}: {} bytes of HTML from {} of input",
                 html.len(),
                 input.len()
@@ -1231,6 +1352,236 @@ mod tests {
             assert!(found.len() <= MAX_MENTION_CANDIDATES);
             assert_allowlisted(&label, &html);
         }
+    }
+
+    /// The message of the review finding: a table with a very wide header
+    /// and many short rows, 10 KB that used to render to 2.4 MB.
+    fn wide_table(columns: usize, rows: usize) -> String {
+        "|a".repeat(columns) + "|\n" + &"|-".repeat(columns) + "|\n" + &"|x\n".repeat(rows)
+    }
+
+    #[test]
+    fn a_wide_table_is_not_drawn_and_nothing_is_built_for_it() {
+        let text = wide_table(1500, 1300);
+        assert!(text.len() < 10_000);
+        let started = Instant::now();
+        let events = Parser::new_ext(&text, options_for(&text)).count();
+        let html = html(&text);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        // Not one node per cell: the parser never saw a table.
+        assert!(events < 20_000, "{events} events");
+        assert!(html.len() <= html_limit(&text), "{} bytes", html.len());
+        assert!(!html.contains("<td>") && !html.contains("<table>"));
+        assert_allowlisted("wide table", &html);
+        // All of the text is still there, as text.
+        assert_eq!(html.matches("|a").count(), 1500);
+        assert_eq!(html.matches("|x").count(), 1300);
+
+        // The widest table that is drawn, and the narrowest that is not.
+        let drawn = wide_table(MAX_TABLE_COLUMNS, 2);
+        assert_eq!(
+            render_html(&drawn, &[]).matches("<th>").count(),
+            MAX_TABLE_COLUMNS
+        );
+        let refused = wide_table(MAX_TABLE_COLUMNS + 1, 2);
+        assert!(!render_html(&refused, &[]).contains("<table>"));
+        // One wide line anywhere turns tables off for the whole text, so
+        // the two walks over a text always agree.
+        let mixed = format!("| a |\n|---|\n| @b |\n\n{}", "|".repeat(40));
+        assert!(!render_html(&mixed, &[]).contains("<table>"));
+        assert_eq!(candidates(&mixed), [("b".to_owned(), None)]);
+    }
+
+    #[test]
+    fn html_over_the_limit_falls_back_to_the_whole_text_in_a_pre() {
+        // The widest table that is still drawn, with as many rows as fit:
+        // about a hundred times its text if it were rendered.
+        let text = wide_table(MAX_TABLE_COLUMNS, 3000);
+        let html = html(&text);
+        assert_eq!(html, plain_html(&text));
+        assert!(html.len() <= html_limit(&text));
+        assert!(html.starts_with("<pre>|a|a") && html.ends_with("|x\n</pre>"));
+        assert_allowlisted("fallback", &html);
+
+        // The fallback escapes like everything else and marks no mention.
+        let hostile = format!(
+            "{}<script>alert('x')</script> & @a \"q\"",
+            ">a\n\n".repeat(600)
+        );
+        let html = render_html(&hostile, &[mention("a", None)]);
+        assert_eq!(
+            html,
+            format!(
+                "<pre>{}&lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt; &amp; @a &quot;q&quot;</pre>",
+                "&gt;a\n\n".repeat(600)
+            )
+        );
+
+        // The emitter stops at the limit instead of rendering everything
+        // and measuring afterwards.
+        let mut renderer = Renderer::new(Some(&[]), html_limit(&text));
+        assert!(!renderer.run(&text));
+        let one_row = MAX_TABLE_COLUMNS * "<td></td>".len() + 64;
+        assert!(
+            renderer.out.len() <= html_limit(&text) + one_row,
+            "stopped at {} bytes",
+            renderer.out.len()
+        );
+
+        // The limit is a multiple of the text with a floor, and the
+        // fallback always fits in it, even for text that is all escapes.
+        assert_eq!(html_limit(""), MIN_HTML_LIMIT_BYTES);
+        assert_eq!(html_limit(&"a".repeat(10_000)), 80_000);
+        for length in [0, 1, 2, 100, 682, 683, 684, 5000] {
+            let text = "\"".repeat(length);
+            assert!(plain_html(&text).len() <= html_limit(&text), "{length}");
+        }
+        // A short message keeps its formatting whatever its ratio.
+        assert_eq!(
+            render_html(">>>a", &[]),
+            "<blockquote><blockquote><blockquote><p>a</p></blockquote></blockquote></blockquote>"
+        );
+    }
+
+    #[test]
+    fn no_shape_of_markdown_renders_past_the_limit() {
+        let size = 10_000;
+        let fill = |unit: &str| unit.repeat(size / unit.len());
+        let mentions = [mention("a", None)];
+        let shapes = [
+            (
+                "quotes at the nesting cap",
+                fill(&(">".repeat(32) + "a\n\n")),
+            ),
+            ("quotes", fill(">a\n\n")),
+            ("spaced quotes", fill("> a\n\n")),
+            (
+                "lists at the nesting cap",
+                fill(&("- ".repeat(32) + "a\n\n")),
+            ),
+            ("empty list items", fill("-\n")),
+            ("ordered items", fill("1.\n")),
+            ("emphasis runs", fill("*a* ")),
+            ("strong runs", fill("**a** ")),
+            ("strikethrough runs", fill("~~a~~ ")),
+            ("code spans", fill("`a` ")),
+            ("email autolinks", fill("<a@b> ")),
+            ("address autolinks", fill("<http://a> ")),
+            ("links", fill("[a](http://b) ")),
+            ("images", fill("![a](http://b) ")),
+            ("mentions", fill("@a ")),
+            ("mentions with a profile", fill("@a/b ")),
+            ("empty headings", fill("#\n")),
+            ("rules", fill("***\n")),
+            ("hard breaks", fill("a\\\n")),
+            ("code blocks", fill("```\n```\n")),
+            ("quotation marks", fill("\"")),
+            (
+                "a table at the column cap",
+                wide_table(MAX_TABLE_COLUMNS, 3000),
+            ),
+            ("a narrow table", "|a|\n|-|\n".to_owned() + &fill("|\n")),
+            ("the review's table", wide_table(1500, 1300)),
+        ];
+        let mut worst = 0.0_f64;
+        for (name, text) in &shapes {
+            let started = Instant::now();
+            let html = render_html(text, &mentions);
+            assert!(started.elapsed() < Duration::from_secs(5), "{name}");
+            assert!(
+                html.len() <= html_limit(text),
+                "{name}: {} bytes from {}",
+                html.len(),
+                text.len()
+            );
+            assert_allowlisted(name, &html);
+            let factor = html.len() as f64 / text.len() as f64;
+            println!(
+                "{name}: {} -> {} bytes, {factor:.1}x",
+                text.len(),
+                html.len()
+            );
+            worst = worst.max(factor);
+        }
+        assert!(worst <= HTML_BYTES_PER_TEXT_BYTE as f64, "{worst}");
+    }
+
+    #[test]
+    fn an_escaped_at_sign_is_not_a_mention() {
+        for input in [
+            "\\@bob",
+            "hi \\@bob.",
+            "&#64;bob",
+            "&#x40;bob",
+            "&commat;bob",
+            "*\\@bob*",
+            "> \\@bob",
+            "- \\@bob",
+            "| \\@bob |\n|---|",
+            "# \\@bob",
+            "[\\@bob](https://example.com)",
+            "a\n\\@bob",
+            "(\\@bob)",
+            "\\\\\\@bob",
+            "\\@bob/reviewer",
+            "\\@\\@bob",
+        ] {
+            assert!(candidates(input).is_empty(), "input {input:?}");
+            let html = render_html(input, &[mention("bob", None)]);
+            assert!(!html.contains("<span"), "{html} for {input:?}");
+            assert!(html.contains("@bob"), "{html} for {input:?}");
+        }
+        // The escape is gone from the output, as Markdown has it.
+        assert_eq!(
+            render_html("hi \\@bob", &[mention("bob", None)]),
+            "<p>hi @bob</p>"
+        );
+        // A backslash that is itself escaped escapes nothing, and neither
+        // does one that is no escape at all.
+        for input in [
+            "\\\\@bob",
+            "a \\\\@bob",
+            "\\\\\\\\@bob",
+            "\\\n@bob",
+            "\\a @bob",
+        ] {
+            assert_eq!(candidates(input), [("bob".to_owned(), None)], "{input:?}");
+            let html = render_html(input, &[mention("bob", None)]);
+            assert!(
+                html.contains("<span class=\"mention\">@bob</span>"),
+                "{html} for {input:?}"
+            );
+        }
+        // Only the escaped one is affected.
+        assert_eq!(
+            candidates("\\@amy and @bob, &#64;cy and @dee"),
+            [("bob".to_owned(), None), ("dee".to_owned(), None)]
+        );
+        assert_eq!(
+            render_html("\\@bob and @bob", &[mention("bob", None)]),
+            "<p>@bob and <span class=\"mention\">@bob</span></p>"
+        );
+        // An escaped `@` ends the handle before it and starts none.
+        assert_eq!(
+            candidates("@ada\\@example.com @ada&#64;example.com"),
+            [("ada".to_owned(), None)]
+        );
+        assert_eq!(
+            render_html("@ada\\@example.com", &[mention("ada", None)]),
+            "<p><span class=\"mention\">@ada</span>@example.com</p>"
+        );
+        // Unescaped, the same text is one handle, as before.
+        assert_eq!(
+            candidates("@ada@example.com"),
+            [("ada@example.com".to_owned(), None)]
+        );
+        // In code a backslash is a backslash, and there are no mentions.
+        assert!(candidates("`\\@bob`").is_empty());
+        // Many escapes in one run of text stay cheap.
+        let many = "\\@a ".repeat(5000) + "@b";
+        let started = Instant::now();
+        assert_eq!(candidates(&many), [("b".to_owned(), None)]);
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

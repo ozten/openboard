@@ -334,9 +334,23 @@ impl Credential {
         }
     }
 
-    fn usable_at(&self, now_ms: i64) -> bool {
+    pub(crate) fn usable_at(&self, now_ms: i64) -> bool {
         self.revoked_ms.is_none() && now_ms < self.expires_ms
     }
+}
+
+/// The credential a secret's digest belongs to, whatever state it is in.
+/// Unlike [`authenticate`] this changes nothing.
+pub(crate) fn find_credential_by_hash(
+    conn: &Connection,
+    token_hash: &str,
+) -> rusqlite::Result<Option<Credential>> {
+    conn.query_row(
+        &format!("SELECT {CREDENTIAL_COLUMNS} FROM {CREDENTIAL_FROM} WHERE c.token_hash = ?1"),
+        [token_hash],
+        credential_from_row,
+    )
+    .optional()
 }
 
 const CREDENTIAL_COLUMNS: &str = "c.id, c.principal_id, p.handle, p.kind, c.created_ms, \
