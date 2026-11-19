@@ -1,0 +1,260 @@
+name: Release
+
+# Builds the release binaries for a version tag and publishes them as a
+# GitHub Release. docs/upgrading.md ("Cutting a release") is the maintainer's
+# side of this; the logic lives in scripts/release/ so it can be run locally.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "An existing tag to build and release, for example v0.1.0"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # The tag is input from outside. It reaches scripts only through this
+  # variable, never by being written into a script's text.
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  verify:
+    name: tag matches version, changelog has notes
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - name: Check the tag's form
+        run: |
+          if ! printf '%s\n' "$RELEASE_TAG" | grep -Eqx 'v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?'; then
+            echo "::error::'$RELEASE_TAG' is not a release tag; expected vMAJOR.MINOR.PATCH, for example v0.1.0"
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          persist-credentials: false
+
+      - name: Check the tag against the workspace version
+        id: version
+        run: |
+          version=$(sh scripts/release/check-tag.sh "$RELEASE_TAG" Cargo.toml)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # Every 0.x version and every version with a suffix is a pre-release.
+          case $version in
+            0.*|*-*) echo "prerelease=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+          echo "releasing $version from $(git rev-parse HEAD)"
+
+      - name: Check that CHANGELOG.md has this version's notes
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: sh scripts/release/changelog-section.sh "$VERSION" CHANGELOG.md
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          persist-credentials: false
+
+      # Installs the toolchain and components pinned in rust-toolchain.toml.
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install
+          rustc --version
+          cargo --version
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Every target is built on a runner of its own architecture, so
+          # nothing is cross-compiled and each binary is run where it was
+          # built. The Linux builds link musl statically and so run on any
+          # distribution.
+          - target: aarch64-apple-darwin
+            os: macos-15
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+    env:
+      TARGET: ${{ matrix.target }}
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          persist-credentials: false
+
+      # Installs the toolchain pinned in rust-toolchain.toml, then the target.
+      # No build cache is used: a release is built from nothing.
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install
+          rustup target add "$TARGET"
+          rustc --version
+          cargo --version
+
+      # musl-gcc, for the C in ring and the bundled SQLite.
+      - name: Install musl tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+          musl-gcc --version
+
+      - name: Build
+        run: sh scripts/release/build.sh "$TARGET"
+
+      - name: Smoke test
+        run: |
+          EXPECT_COMMIT=$(git rev-parse --short=12 HEAD)
+          export EXPECT_COMMIT
+          case $TARGET in
+            *-linux-musl) sh scripts/release/smoke-test.sh "target/$TARGET/release" "$VERSION" static ;;
+            *) sh scripts/release/smoke-test.sh "target/$TARGET/release" "$VERSION" ;;
+          esac
+
+      - name: Package
+        run: sh scripts/release/package.sh "$VERSION" "$TARGET" dist
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: archive-${{ matrix.target }}
+          path: dist/openboard-*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  attest:
+    name: checksums and build provenance
+    needs: [verify, test, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # The only job that can sign. It runs no build and no dependency code:
+    # it hashes the archives the build jobs produced and attests to them.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: archive-*
+          path: dist
+          merge-multiple: true
+
+      - name: Check that every archive is there
+        run: |
+          for target in aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-musl x86_64-unknown-linux-musl; do
+            if [ ! -f "dist/openboard-$VERSION-$target.tar.gz" ]; then
+              echo "::error::dist/openboard-$VERSION-$target.tar.gz is missing"
+              exit 1
+            fi
+          done
+
+      - name: Write SHA256SUMS
+        run: sh scripts/release/checksums.sh write dist
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: dist/SHA256SUMS
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: checksums
+          path: dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: publish the GitHub Release
+    needs: [verify, test, build, attest]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # The only job that can write to the repository.
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+      PRERELEASE: ${{ needs.verify.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Check the archives against SHA256SUMS
+        run: sh scripts/release/checksums.sh check dist
+
+      - name: Write the release notes
+        run: |
+          sh scripts/release/release-notes.sh "$RELEASE_TAG" CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md"
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if gh release view "$RELEASE_TAG" > /dev/null 2>&1; then
+            echo "::error::a release for $RELEASE_TAG already exists. Published archives are never replaced: delete the release first if it must be rebuilt, or cut a new patch version"
+            exit 1
+          fi
+          set -- "$RELEASE_TAG" dist/openboard-*.tar.gz dist/SHA256SUMS \
+            --verify-tag --title "Openboard $RELEASE_TAG" --notes-file "$RUNNER_TEMP/notes.md"
+          if [ "$PRERELEASE" = true ]; then
+            set -- "$@" --prerelease
+          fi
+          gh release create "$@"
