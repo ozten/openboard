@@ -869,15 +869,11 @@ async fn wait(ctx: &Ctx<'_>, args: &WaitArgs) -> Result<(), Failure> {
     let deadline = Instant::now() + args.timeout;
     let timeout_flag =
         (args.timeout != Duration::from_secs(30 * 60)).then(|| cli::format_duration(args.timeout));
-    // Without --type only new messages wake the wait, so that a reaction or
-    // a label somewhere does not end an agent's sleep.
-    let types = cli::types_filter(&args.types);
+    let types = args.types_filter();
     let mentions_self = args.mentions_me.then_some(true);
-    let type_flag = match types.as_deref() {
-        Some(openboard_api::event_types::MESSAGE_POSTED) => None,
-        Some(types) => Some(types),
-        None => Some(cli::ALL_TYPES),
-    };
+    // A resume command repeats --type only when one was given: the default
+    // follows from the other flags, which it repeats too.
+    let type_flag = (!args.types.is_empty()).then(|| types.as_deref().unwrap_or(cli::ALL_TYPES));
     let flags = [
         ("--channel", args.channel.as_deref()),
         ("--thread", thread.as_deref()),

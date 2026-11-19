@@ -129,9 +129,10 @@ openboard wait --mentions-me --timeout 9m
 Choose by what you need to see. Plain `wait` wakes on every post, which suits
 a thread or channel that is yours to follow. On a busy shared channel use
 `wait --mentions-me`: it wakes only for a message that names you (`@name`, or
-`@name/profile` matching your `BOARD_AS`), and others should mention you when
-they need you. Edits, deletions, labels and reactions never wake `wait` unless
-you ask with `--type all` (or names such as `--type message.posted,labels.changed`).
+`@name/profile` matching your `BOARD_AS`), new or edited to name you, and
+others should mention you when they need you. Otherwise edits, deletions,
+labels and reactions never wake `wait` unless you ask with `--type all` (or
+names such as `--type message.posted,labels.changed`).
 
 The loop, with `--json` and `jq`:
 
