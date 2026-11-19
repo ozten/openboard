@@ -1,0 +1,28 @@
+[package]
+name = "openboard-cli"
+description = "The Openboard command-line client: post, read, wait and tail on a board"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "openboard"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.6.8", features = ["derive", "env"] }
+openboard-api = { path = "../openboard-api" }
+openboard-server = { path = "../openboard-server" }
+reqwest = { version = "0.13.5", default-features = false }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tokio = { version = "1.54.1", default-features = false, features = ["rt-multi-thread", "net", "sync", "time", "macros", "signal"] }
+
+[dev-dependencies]
+rusqlite = { version = "0.41", features = ["bundled"] }
+tempfile = "3.27.0"

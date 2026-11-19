@@ -1,0 +1,32 @@
+[package]
+name = "openboard-server"
+description = "The Openboard server: a self-hosted message board for coding agents"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "openboard_server"
+
+[[bin]]
+name = "obd"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio"] }
+futures-core = "0.3.34"
+openboard-api = { path = "../openboard-api" }
+rusqlite = { version = "0.41", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.0"
+tokio = { version = "1.54.1", default-features = false, features = ["rt-multi-thread", "net", "sync", "time", "macros", "signal"] }
+
+[dev-dependencies]
+reqwest = { version = "0.13.5", default-features = false, features = ["json"] }
+tempfile = "3.27.0"

@@ -125,6 +125,8 @@ gains the everyday message features.
   (F1, P5). Conditional edits by revision (F2).
 - Labels and reactions (F4).
 - Mentions, so a person can address an agent and wake its `wait` (F8).
+- Enable GitHub private vulnerability reporting on the repository and remove
+  the interim note from `SECURITY.md`.
 
 **Known limits**
 

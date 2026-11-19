@@ -1,0 +1,816 @@
+//! `openboard`: the command-line client for an Openboard board, and the way
+//! to run a local one.
+//!
+//! The CLI makes no network connection except to the configured board URL:
+//! no telemetry, no update checks, no proxy lookups.
+
+use std::io::{IsTerminal, Read, Write};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+use clap::Parser;
+use openboard_api::{
+    Event, EventsQuery, Message, PostMessageRequest, ThreadsQuery, CURSOR_START, MAX_WAIT_SECS,
+};
+use openboard_server::ServeError;
+use serde::Serialize;
+use tokio::sync::watch;
+
+mod cli;
+mod client;
+mod error;
+mod render;
+mod sse;
+
+use cli::{AdminCommand, Cli, Command, Global, ReadArgs, ServeArgs, TailArgs, WaitArgs};
+use client::Client;
+use error::{codes, Failure, Resume, EXIT_FAILURE, EXIT_USAGE};
+
+/// The event stream sends a keep-alive every 15 seconds. This much silence
+/// means the connection is dead.
+const STREAM_SILENCE: Duration = Duration::from_secs(45);
+/// Failed reconnects in a row before `tail` gives up (about a minute).
+const MAX_RECONNECTS: u32 = 8;
+
+fn main() {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let cli = match Cli::try_parse_from(&args) {
+        Ok(cli) => cli,
+        Err(error) => {
+            let _ = error.print();
+            if !error.use_stderr() {
+                // --help and --version.
+                std::process::exit(0);
+            }
+            let wants_json = args
+                .iter()
+                .skip(1)
+                .take_while(|arg| *arg != "--")
+                .any(|arg| arg == "--json");
+            if wants_json {
+                let text = error.render().to_string();
+                let message = text
+                    .lines()
+                    .next()
+                    .unwrap_or("invalid command line")
+                    .trim_start_matches("error: ");
+                let failure =
+                    Failure::usage(message).next("run `openboard --help` to see the commands");
+                let _ = write_stdout(&failure.to_json());
+            }
+            std::process::exit(i32::from(EXIT_USAGE));
+        }
+    };
+
+    let json = cli.global.json;
+    let code = match run(cli) {
+        Ok(()) => 0,
+        Err(failure) => {
+            if !failure.no_stderr {
+                eprintln!("{}", failure.to_human());
+            }
+            if json && !failure.no_stdout {
+                let _ = write_stdout(&failure.to_json());
+            }
+            failure.exit
+        }
+    };
+    // Exiting here, rather than returning, skips waiting for idle runtime
+    // threads. All output has been flushed.
+    std::process::exit(i32::from(code));
+}
+
+fn run(cli: Cli) -> Result<(), Failure> {
+    // Stdin is read before the async runtime starts, so a pipe that never
+    // closes is interrupted by the default signal handling.
+    let text = match &cli.command {
+        Command::Post(args) => Some(message_text(args.text.as_deref())?),
+        Command::Reply(args) => Some(message_text(args.text.as_deref())?),
+        _ => None,
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| {
+            Failure::new(
+                codes::IO,
+                format!("cannot start the async runtime: {error}"),
+            )
+        })?;
+    runtime.block_on(dispatch(cli, text))
+}
+
+/// The message text: the argument, or stdin for `-` or a missing argument
+/// with piped input.
+fn message_text(arg: Option<&str>) -> Result<String, Failure> {
+    let text = match arg {
+        Some(text) if text != "-" => text.to_owned(),
+        _ => {
+            let mut stdin = std::io::stdin();
+            if arg.is_none() && stdin.is_terminal() {
+                return Err(Failure::usage("no message text was given").next(
+                    "pass the text as an argument, or pipe it on stdin: `echo \"text\" | \
+                     openboard post <channel>`",
+                ));
+            }
+            let mut text = String::new();
+            stdin.read_to_string(&mut text).map_err(|error| {
+                Failure::new(
+                    codes::IO,
+                    format!("cannot read the message from stdin: {error}"),
+                )
+                .next("send the message as UTF-8 text")
+            })?;
+            text.trim_end_matches(['\r', '\n']).to_owned()
+        }
+    };
+    if text.trim().is_empty() {
+        return Err(Failure::usage("the message text is empty")
+            .next("pass the text as an argument, or pipe it on stdin"));
+    }
+    Ok(text)
+}
+
+/// Writes one line to stdout and flushes it, so a reader on a pipe sees it
+/// at once.
+fn write_stdout(line: &str) -> Result<(), Failure> {
+    let mut stdout = std::io::stdout().lock();
+    match writeln!(stdout, "{line}").and_then(|()| stdout.flush()) {
+        Ok(()) => Ok(()),
+        // The reader went away, as in `openboard tail | head -1`.
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {
+            std::process::exit(i32::from(EXIT_FAILURE))
+        }
+        Err(error) => Err(Failure::new(
+            codes::IO,
+            format!("cannot write to stdout: {error}"),
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Signals
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sig {
+    Int,
+    Term,
+}
+
+impl Sig {
+    fn name(self) -> &'static str {
+        match self {
+            Sig::Int => "SIGINT",
+            Sig::Term => "SIGTERM",
+        }
+    }
+
+    /// 128 plus the signal number, as shells report it.
+    fn exit_code(self) -> u8 {
+        match self {
+            Sig::Int => 130,
+            Sig::Term => 143,
+        }
+    }
+}
+
+/// Starts listening for SIGINT and SIGTERM. The receiver holds the first
+/// signal seen. A second signal exits at once, in case shutdown hangs.
+fn listen_for_signals() -> Result<watch::Receiver<Option<Sig>>, Failure> {
+    let (tx, rx) = watch::channel(None);
+    let failed = |error: std::io::Error| {
+        Failure::new(codes::IO, format!("cannot listen for signals: {error}"))
+    };
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut interrupt = signal(SignalKind::interrupt()).map_err(failed)?;
+        let mut terminate = signal(SignalKind::terminate()).map_err(failed)?;
+        tokio::spawn(async move {
+            loop {
+                let sig = tokio::select! {
+                    got = interrupt.recv() => got.map(|()| Sig::Int),
+                    got = terminate.recv() => got.map(|()| Sig::Term),
+                };
+                let Some(sig) = sig else { return };
+                if tx.send_replace(Some(sig)).is_some() {
+                    std::process::exit(i32::from(sig.exit_code()));
+                }
+            }
+        });
+    }
+    #[cfg(not(unix))]
+    {
+        // Registers the handler now; the task then waits on it.
+        let mut ctrl_c = Box::pin(tokio::signal::ctrl_c());
+        let _ = failed;
+        tokio::spawn(async move {
+            loop {
+                if ctrl_c.as_mut().await.is_err() {
+                    return;
+                }
+                if tx.send_replace(Some(Sig::Int)).is_some() {
+                    std::process::exit(i32::from(Sig::Int.exit_code()));
+                }
+                ctrl_c = Box::pin(tokio::signal::ctrl_c());
+            }
+        });
+    }
+    Ok(rx)
+}
+
+async fn signalled(signals: &mut watch::Receiver<Option<Sig>>) -> Sig {
+    let seen = signals
+        .wait_for(Option::is_some)
+        .await
+        .map(|sig| *sig)
+        .ok()
+        .flatten();
+    match seen {
+        Some(sig) => sig,
+        // The listener is gone, so no signal can arrive.
+        None => std::future::pending().await,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch
+// ---------------------------------------------------------------------------
+
+/// What a client command needs.
+struct Ctx<'a> {
+    global: &'a Global,
+    client: Client,
+    /// Where `wait` or `tail` can continue from, kept current so a signal
+    /// or failure can report it.
+    resume: Mutex<Option<Resume>>,
+}
+
+impl Ctx<'_> {
+    fn json(&self) -> bool {
+        self.global.json
+    }
+
+    fn resume(&self) -> Option<Resume> {
+        self.resume
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+
+    /// Records `cursor` as the resume point for `verb` with `flags`.
+    fn set_resume(&self, verb: &str, cursor: &str, flags: &[(&str, Option<&str>)]) -> Resume {
+        let resume = Resume {
+            cursor: cursor.to_owned(),
+            command: self.command_line(verb, cursor, flags),
+        };
+        *self
+            .resume
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(resume.clone());
+        resume
+    }
+
+    /// The command line that runs `verb` again from `cursor`, with every
+    /// non-default global flag spelled out so it works from any shell.
+    fn command_line(&self, verb: &str, cursor: &str, flags: &[(&str, Option<&str>)]) -> String {
+        let mut parts = vec!["openboard".to_owned()];
+        let mut flag = |name: &str, value: &str| {
+            parts.push(name.to_owned());
+            if !value.is_empty() {
+                parts.push(shell_quote(value));
+            }
+        };
+        if self.global.url() != cli::DEFAULT_URL {
+            flag("--url", self.global.url());
+        }
+        if self.global.board() != openboard_api::DEFAULT_BOARD {
+            flag("--board", self.global.board());
+        }
+        if let Some(profile) = self.global.profile() {
+            flag("--as", profile);
+        }
+        flag(verb, "");
+        flag("--after", cursor);
+        for (name, value) in flags {
+            if let Some(value) = value {
+                flag(name, value);
+            }
+        }
+        parts.join(" ")
+    }
+
+    fn print<T: Serialize>(
+        &self,
+        value: &T,
+        human: impl FnOnce() -> String,
+    ) -> Result<(), Failure> {
+        if self.json() {
+            write_stdout(&to_json(value)?)
+        } else {
+            write_stdout(&human())
+        }
+    }
+}
+
+fn to_json<T: Serialize>(value: &T) -> Result<String, Failure> {
+    serde_json::to_string(value)
+        .map_err(|error| Failure::new(codes::IO, format!("cannot encode the output: {error}")))
+}
+
+/// Quotes a value for a POSIX shell when it needs it.
+fn shell_quote(value: &str) -> String {
+    let plain = !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_-./:=@%+,".contains(c));
+    if plain {
+        value.to_owned()
+    } else {
+        format!("'{}'", value.replace('\'', r"'\''"))
+    }
+}
+
+async fn dispatch(cli: Cli, text: Option<String>) -> Result<(), Failure> {
+    let mut signals = listen_for_signals()?;
+    let global = &cli.global;
+    match &cli.command {
+        Command::Serve(args) => return serve(global.json, args, signals).await,
+        Command::Admin(AdminCommand::VerifyLog(args)) => {
+            return tokio::select! {
+                biased;
+                sig = signalled(&mut signals) => Err(interrupted(sig)),
+                result = verify_log(global.json, args.data_dir.clone()) => result,
+            };
+        }
+        _ => {}
+    }
+
+    let ctx = Ctx {
+        global,
+        client: Client::new(global.url(), global.board(), global.profile())?,
+        resume: Mutex::new(None),
+    };
+    let command = async {
+        match &cli.command {
+            Command::Post(args) => {
+                let request = PostMessageRequest {
+                    channel: Some(args.channel.clone()),
+                    thread_id: None,
+                    text: text.unwrap_or_default(),
+                    idempotency_key: args.key.clone(),
+                };
+                post(&ctx, &request).await
+            }
+            Command::Reply(args) => {
+                let request = PostMessageRequest {
+                    channel: None,
+                    thread_id: Some(args.target.clone()),
+                    text: text.unwrap_or_default(),
+                    idempotency_key: args.key.clone(),
+                };
+                post(&ctx, &request).await
+            }
+            Command::Read(args) => read(&ctx, args).await,
+            Command::Channels => {
+                let list = ctx.client.channels().await?;
+                ctx.print(&list, || render::channels(&list, global.board()))
+            }
+            Command::Wait(args) => wait(&ctx, args).await,
+            Command::Tail(args) => tail(&ctx, args).await,
+            Command::Serve(_) | Command::Admin(_) => Ok(()),
+        }
+    };
+    tokio::select! {
+        biased;
+        sig = signalled(&mut signals) => {
+            let mut failure = interrupted(sig).resume(ctx.resume().as_ref());
+            // `tail --json` is a stream of events; an error object would not
+            // belong in it, and being interrupted is how a tail ends.
+            failure.no_stdout = matches!(cli.command, Command::Tail(_));
+            Err(failure)
+        }
+        result = command => result,
+    }
+}
+
+fn interrupted(sig: Sig) -> Failure {
+    Failure::new(codes::INTERRUPTED, format!("stopped by {}", sig.name())).exit(sig.exit_code())
+}
+
+// ---------------------------------------------------------------------------
+// Commands
+// ---------------------------------------------------------------------------
+
+async fn serve(
+    json: bool,
+    args: &ServeArgs,
+    signals: watch::Receiver<Option<Sig>>,
+) -> Result<(), Failure> {
+    let mut config = openboard_server::Config::new(&args.data_dir);
+    config.bind = args.bind;
+    config.port = args.port;
+    config.max_message_chars = args.max_message_chars;
+
+    let server = openboard_server::bind(config).await.map_err(|error| {
+        let message = error.to_string();
+        match error {
+            ServeError::NonLoopbackBind(_) => Failure::new(codes::NON_LOOPBACK_BIND, message)
+                .next("use --bind 127.0.0.1 or --bind ::1"),
+            ServeError::Bind { .. } => Failure::new(codes::SERVE_FAILED, message).next(
+                "another board may already be running there; choose a port with --port, or \
+                 --port 0 for any free one",
+            ),
+            ServeError::DataDirInUse(_) => Failure::new(codes::SERVE_FAILED, message).next(
+                "use the board that is already running, stop it first, or give this one its \
+                 own --data-dir",
+            ),
+            ServeError::Storage(_) => Failure::new(codes::SERVE_FAILED, message)
+                .next("check that --data-dir is a writable directory"),
+            ServeError::Io(_) => Failure::new(codes::SERVE_FAILED, message),
+        }
+    })?;
+
+    let url = format!("http://{}", server.local_addr());
+    if json {
+        #[derive(Serialize)]
+        struct Listening<'a> {
+            url: &'a str,
+            data_dir: String,
+        }
+        write_stdout(&to_json(&Listening {
+            url: &url,
+            data_dir: args.data_dir.display().to_string(),
+        })?)?;
+    } else {
+        write_stdout(&format!(
+            "listening on {url} (data in {})",
+            args.data_dir.display()
+        ))?;
+    }
+
+    let mut stop = signals.clone();
+    server
+        .run(async move {
+            signalled(&mut stop).await;
+        })
+        .await
+        .map_err(|error| Failure::new(codes::SERVE_FAILED, error.to_string()))?;
+
+    let sig = *signals.borrow();
+    match sig {
+        Some(sig) => {
+            eprintln!("openboard: board stopped by {}", sig.name());
+            // A signal is how a board is stopped, so this is not reported as
+            // an error; only the exit code says how it ended.
+            let mut failure = interrupted(sig);
+            failure.no_stdout = true;
+            failure.no_stderr = true;
+            Err(failure)
+        }
+        None => Ok(()),
+    }
+}
+
+async fn verify_log(json: bool, data_dir: std::path::PathBuf) -> Result<(), Failure> {
+    let dir = data_dir.clone();
+    let report = tokio::task::spawn_blocking(move || openboard_server::verify_log(&dir))
+        .await
+        .map_err(|error| Failure::new(codes::VERIFY_FAILED, error.to_string()))?
+        .map_err(|error| {
+            Failure::new(codes::VERIFY_FAILED, error.to_string())
+                .next("pass --data-dir with the directory given to `openboard serve`")
+        })?;
+
+    let failure = (!report.is_ok()).then(|| {
+        let broken: Vec<&str> = report
+            .boards
+            .iter()
+            .filter(|board| board.broken.is_some())
+            .map(|board| board.board.as_str())
+            .collect();
+        Failure::new(
+            codes::LOG_BROKEN,
+            format!(
+                "the event hash chain is broken on {} of {} board(s): {}",
+                broken.len(),
+                report.boards.len(),
+                broken.join(", ")
+            ),
+        )
+        .next(
+            "do not trust events at or after the broken entry; restore the data directory from \
+             a backup",
+        )
+    });
+
+    if json {
+        let boards: Vec<serde_json::Value> = report
+            .boards
+            .iter()
+            .map(|board| {
+                serde_json::json!({
+                    "board": board.board,
+                    "verified_events": board.verified_events,
+                    "broken": board.broken.as_ref().map(|broken| serde_json::json!({
+                        "position": broken.position,
+                        "reason": broken.reason,
+                    })),
+                })
+            })
+            .collect();
+        let mut document = serde_json::json!({ "ok": report.is_ok(), "boards": boards });
+        if let Some(failure) = &failure {
+            // One document: the report, with the error beside it.
+            let error: serde_json::Value =
+                serde_json::from_str(&failure.to_json()).unwrap_or_default();
+            document["error"] = error["error"].clone();
+        }
+        write_stdout(&document.to_string())?;
+    } else {
+        for board in &report.boards {
+            match &board.broken {
+                None => write_stdout(&format!(
+                    "ok      {}: {} events",
+                    board.board, board.verified_events
+                ))?,
+                Some(broken) => write_stdout(&format!(
+                    "BROKEN  {}: entry {}: {} ({} earlier events verified)",
+                    board.board, broken.position, broken.reason, board.verified_events
+                ))?,
+            }
+        }
+        if failure.is_none() {
+            write_stdout(&format!(
+                "event log verified: {} board(s)",
+                report.boards.len()
+            ))?;
+        }
+    }
+    match failure {
+        Some(mut failure) => {
+            failure.no_stdout = true;
+            Err(failure)
+        }
+        None => Ok(()),
+    }
+}
+
+async fn post(ctx: &Ctx<'_>, request: &PostMessageRequest) -> Result<(), Failure> {
+    let response = ctx.client.post_message(request).await.map_err(|failure| {
+        // A lost answer leaves the caller unsure whether the post landed.
+        let transport = [
+            codes::CONNECTION_FAILED,
+            codes::REQUEST_TIMEOUT,
+            codes::REQUEST_FAILED,
+        ]
+        .contains(&failure.code.as_str());
+        match (&request.idempotency_key, transport, failure.next.clone()) {
+            (Some(_), true, Some(next)) => {
+                failure.next(format!("{next}; retrying with the same --key is safe"))
+            }
+            _ => failure,
+        }
+    })?;
+    ctx.print(&response, || render::posted(&response))
+}
+
+async fn read(ctx: &Ctx<'_>, args: &ReadArgs) -> Result<(), Failure> {
+    if let Some(id) = &args.thread {
+        let thread = ctx.client.thread(id).await?;
+        return ctx.print(&thread, || render::thread(&thread));
+    }
+    let channel = args.channel.clone().unwrap_or_default();
+    let list = ctx
+        .client
+        .threads(&ThreadsQuery {
+            channel: channel.clone(),
+            limit: args.limit,
+            cursor: args.cursor.clone(),
+        })
+        .await?;
+    ctx.print(&list, || render::thread_list(&list, &channel))
+}
+
+/// The root ID of the thread holding `id`, so event filters accept any
+/// message ID. Fails early when there is no such thread.
+async fn thread_root(ctx: &Ctx<'_>, id: Option<&str>) -> Result<Option<String>, Failure> {
+    match id {
+        Some(id) => Ok(Some(ctx.client.thread(id).await?.root.id)),
+        None => Ok(None),
+    }
+}
+
+/// What `wait --json` prints.
+#[derive(Serialize)]
+struct Waited<'a> {
+    event: &'a Event,
+    message: &'a Message,
+    /// Pass as `--after` to see only what happens next.
+    cursor: &'a str,
+}
+
+async fn wait(ctx: &Ctx<'_>, args: &WaitArgs) -> Result<(), Failure> {
+    let thread = thread_root(ctx, args.thread.as_deref()).await?;
+    // In local mode every caller is the principal `local`, so a profile's
+    // handle is `local/<profile>`.
+    let not_from = match ctx.global.profile() {
+        Some(profile) if !args.include_self => Some(format!("local/{profile}")),
+        _ => None,
+    };
+    let timeout_flag =
+        (args.timeout != Duration::from_secs(30 * 60)).then(|| cli::format_duration(args.timeout));
+    let flags = [
+        ("--channel", args.channel.as_deref()),
+        ("--thread", thread.as_deref()),
+        ("--timeout", timeout_flag.as_deref()),
+        ("--include-self", args.include_self.then_some("")),
+    ];
+
+    let deadline = Instant::now() + args.timeout;
+    let mut after = args.after.clone();
+    if after.is_none() {
+        // "From now" is decided by the server when a request arrives. Ask
+        // once without holding, so the starting cursor is known before the
+        // first long-poll and an interrupted wait can still say where to
+        // resume.
+        let now = ctx
+            .client
+            .events(&EventsQuery {
+                channel: args.channel.clone(),
+                thread: thread.clone(),
+                not_from: not_from.clone(),
+                limit: Some(1),
+                ..EventsQuery::default()
+            })
+            .await?;
+        ctx.set_resume("wait", &now.cursor, &flags);
+        after = Some(now.cursor);
+    }
+    loop {
+        // The server holds one request for at most MAX_WAIT_SECS, so a
+        // longer wait is a chain of requests, each passing the cursor the
+        // one before returned. Nothing posted between requests is missed.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let hold = remaining
+            .as_secs()
+            .saturating_add(u64::from(remaining.subsec_nanos() > 0))
+            .min(MAX_WAIT_SECS);
+        let asked = Instant::now();
+        let response = ctx
+            .client
+            .events(&EventsQuery {
+                after: after.clone(),
+                channel: args.channel.clone(),
+                thread: thread.clone(),
+                not_from: not_from.clone(),
+                wait: Some(hold),
+                limit: Some(1),
+            })
+            .await
+            .map_err(|failure| failure.resume(ctx.resume().as_ref()))?;
+
+        if let Some(event) = response.events.first() {
+            // Resume just past this event, not past everything scanned.
+            let resume = ctx.set_resume("wait", &event.cursor, &flags);
+            let found = ctx
+                .client
+                .thread(&event.thread_id)
+                .await
+                .map_err(|failure| failure.resume(Some(&resume)))?;
+            let message = std::iter::once(&found.root)
+                .chain(&found.replies)
+                .find(|message| message.id == event.message_id)
+                .ok_or_else(|| {
+                    Failure::new(
+                        openboard_api::codes::NOT_FOUND,
+                        format!("message {} is no longer in its thread", event.message_id),
+                    )
+                    .resume(Some(&resume))
+                })?;
+            return ctx.print(
+                &Waited {
+                    event,
+                    message,
+                    cursor: &event.cursor,
+                },
+                || render::waited(event, message, &resume.command),
+            );
+        }
+
+        let resume = ctx.set_resume("wait", &response.cursor, &flags);
+        after = Some(response.cursor);
+        if Instant::now() >= deadline {
+            return Err(Failure::new(
+                codes::TIMEOUT,
+                format!(
+                    "no matching event within {}",
+                    cli::format_duration(args.timeout)
+                ),
+            )
+            .resume(Some(&resume)));
+        }
+        // A board that is shutting down answers at once. Do not spin on it.
+        if hold > 0 && asked.elapsed() < Duration::from_millis(200) {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+}
+
+async fn tail(ctx: &Ctx<'_>, args: &TailArgs) -> Result<(), Failure> {
+    let thread = thread_root(ctx, args.thread.as_deref()).await?;
+    let filter = EventsQuery {
+        channel: args.channel.clone(),
+        thread: thread.clone(),
+        ..EventsQuery::default()
+    };
+    let flags = [
+        ("--channel", args.channel.as_deref()),
+        ("--thread", thread.as_deref()),
+    ];
+
+    // Fix the starting cursor before streaming, so a reconnect always has a
+    // cursor to continue from, even if no event has arrived yet.
+    let mut cursor = match (&args.after, args.from_start) {
+        (Some(after), _) => after.clone(),
+        (None, true) => CURSOR_START.to_owned(),
+        (None, false) => {
+            ctx.client
+                .events(&EventsQuery {
+                    limit: Some(1),
+                    ..filter.clone()
+                })
+                .await?
+                .cursor
+        }
+    };
+    let mut connected = false;
+    let mut failures = 0u32;
+    loop {
+        let query = EventsQuery {
+            after: Some(cursor.clone()),
+            ..filter.clone()
+        };
+        match ctx.client.event_stream(&query).await {
+            Ok(mut response) => {
+                // The board accepted the cursor, so it is safe to resume from.
+                ctx.set_resume("tail", &cursor, &flags);
+                connected = true;
+                failures = 0;
+                let mut parser = sse::SseParser::default();
+                loop {
+                    let chunk = match tokio::time::timeout(STREAM_SILENCE, response.chunk()).await {
+                        Ok(Ok(Some(chunk))) => chunk,
+                        // Ended, failed or went silent: reconnect.
+                        Ok(Ok(None)) | Ok(Err(_)) | Err(_) => break,
+                    };
+                    for data in parser.push(&chunk) {
+                        let event: Event = serde_json::from_str(&data).map_err(|error| {
+                            Failure::new(
+                                codes::BAD_RESPONSE,
+                                format!("the event stream sent an event this client cannot read: {error}"),
+                            )
+                            .resume(ctx.resume().as_ref())
+                        })?;
+                        if ctx.json() {
+                            write_stdout(&to_json(&event)?)?;
+                        } else {
+                            write_stdout(&render::event_line(&event))?;
+                        }
+                        cursor.clone_from(&event.cursor);
+                        ctx.set_resume("tail", &cursor, &flags);
+                    }
+                }
+                eprintln!("openboard: the event stream ended; reconnecting after {cursor}");
+            }
+            Err(failure) => {
+                let transient = [
+                    codes::CONNECTION_FAILED,
+                    codes::REQUEST_TIMEOUT,
+                    codes::REQUEST_FAILED,
+                ]
+                .contains(&failure.code.as_str());
+                failures += 1;
+                if !connected || !transient || failures > MAX_RECONNECTS {
+                    return Err(failure.resume(ctx.resume().as_ref()));
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(1 << failures.min(3))).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shell_quote;
+
+    #[test]
+    fn shell_quoting() {
+        assert_eq!(shell_quote("ev_ab12_4f"), "ev_ab12_4f");
+        assert_eq!(shell_quote("research/web/"), "research/web/");
+        assert_eq!(shell_quote("Team Board"), "'Team Board'");
+        assert_eq!(shell_quote("it's"), r"'it'\''s'");
+        assert_eq!(shell_quote(""), "''");
+    }
+}
