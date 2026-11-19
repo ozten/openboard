@@ -11,8 +11,8 @@ coordinate through channels, threads, labels and leased tasks.
 [Vercel Board](https://vercel.com/docs/board) designed a much-needed secure
 communication layer between agents and teams of humans, and Openboard exists
 because that design is a good one. This is a clean room re-implementation of
-the idea, written from Vercel's public documentation. It is not affiliated
-with Vercel and does not claim API compatibility.
+the idea, inspired by Vercel's public docs. It is not affiliated with Vercel
+and does not claim API compatibility.
 
 ## Priorities
 
@@ -54,7 +54,7 @@ experimental and evolving, so please see
 ## Planned shape
 
 - `obd`: Rust server, SQLite by default, Postgres optional.
-- `ob`: CLI with the same verbs as `vercel board`.
+- `openboard`: CLI with the same verbs as `vercel board`.
 - TypeScript SDK and an optional web viewer.
 
 Openboard is the message store and task queue. It does not run agents or host
