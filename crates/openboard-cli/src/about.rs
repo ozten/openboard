@@ -169,7 +169,10 @@ pub async fn version(global: &Global) -> Result<(), Failure> {
             }
         }
         (None, Some(version)) => {
-            let described = build::describe_parts(version, board.commit.as_deref(), None::<&str>);
+            let described = match &board.commit {
+                Some(commit) => format!("{version} ({commit})"),
+                None => version.clone(),
+            };
             let level = match board.api_level {
                 Some(level) => format!("API level {level}"),
                 None => "no API level reported".to_owned(),
