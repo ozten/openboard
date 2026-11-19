@@ -16,7 +16,8 @@ use openboard_api::{
 };
 use openboard_server::operator::{self, log_kinds, InviteOptions, OperatorError};
 use openboard_server::{
-    verify_log, Config, Limits, Mode, ServeError, CERT_FILE_NAME, DB_FILE_NAME, KEY_FILE_NAME,
+    verify_log, Config, Limits, LogRetention, Mode, ServeError, CERT_FILE_NAME, DB_FILE_NAME,
+    KEY_FILE_NAME,
 };
 use reqwest::{Client, RequestBuilder, Response, StatusCode};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -135,6 +136,7 @@ fn roomy(config: &mut Config) {
         auth_failures_per_minute: 100_000,
         max_waiters: 100,
         credential_recheck: Duration::from_millis(100),
+        ..Limits::default()
     };
 }
 
@@ -1242,16 +1244,39 @@ async fn joins_and_failed_authentication_are_limited_per_address() {
     })
     .await;
     let invite = board.invite("alice");
+    let wrong = "0".repeat(64);
     for _ in 0..2 {
-        let response = board.join_raw("wrong").await;
+        let response = board.join_raw(&wrong).await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
+    // A good code does not use up the budget, which counts failures only.
     let joined: JoinResponse = board.join_raw(&invite.code).await.json().await.unwrap();
-    // The budget counts every attempt, so even a good code must now wait.
-    let spare = board.invite("bob");
-    expect_rate_limited(board.join_raw(&spare.code).await).await;
+    let response = board.join_raw("not even shaped like a code").await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    // Three failures: this address is over its budget. Junk is turned away,
+    // in whatever shape it comes.
+    expect_rate_limited(board.join_raw(&wrong).await).await;
     expect_rate_limited(board.join_raw("wrong").await).await;
-    assert_eq!(operator::list_invites(&board.data_dir()).unwrap().len(), 1);
+    let response = board
+        .http
+        .post(board.at("/v1/join"))
+        .header("content-type", "application/json")
+        .body("{nope")
+        .send()
+        .await
+        .unwrap();
+    expect_rate_limited(response).await;
+    // An agent behind the same address with a real invite still gets in,
+    // once: a used code is junk like any other.
+    let spare = board.invite("bob");
+    let response = board.join_raw(&spare.code).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let second: JoinResponse = response.json().await.unwrap();
+    assert_eq!(second.credential.principal, "bob");
+    expect_rate_limited(board.join_raw(&spare.code).await).await;
+    assert!(operator::list_invites(&board.data_dir())
+        .unwrap()
+        .is_empty());
 
     for _ in 0..4 {
         assert_eq!(board.status("garbage").await, StatusCode::UNAUTHORIZED);
@@ -1266,7 +1291,8 @@ async fn joins_and_failed_authentication_are_limited_per_address() {
     let log = operator::security_log(&board.data_dir(), None).unwrap();
     let count = |kind: &str| log.iter().filter(|entry| entry.kind == kind).count();
     assert_eq!(count(log_kinds::AUTH_FAILED), 4);
-    assert_eq!(count(log_kinds::ENROL_FAILED), 2);
+    assert_eq!(count(log_kinds::ENROL_FAILED), 3);
+    assert_eq!(count(log_kinds::ENROL_SUCCEEDED), 2);
     assert_eq!(count(log_kinds::RATE_LIMITED), 2);
     board.stop().await;
 }
@@ -1464,15 +1490,218 @@ async fn the_security_log_records_what_happened_without_secrets() {
 
 #[tokio::test]
 async fn failed_authentication_cannot_flood_the_security_log() {
+    // One address alone stops at its share, far below the budget of all.
     let board = Net::start().await;
-    for _ in 0..150 {
+    let limits = Limits::default();
+    let share = limits.failure_log_per_address_per_minute as usize;
+    assert!(share * 4 < limits.failure_log_per_minute as usize);
+    for _ in 0..share + 30 {
         assert_eq!(board.status("garbage").await, StatusCode::UNAUTHORIZED);
     }
-    let log = kinds(&board.data_dir());
-    let count = |kind: &str| log.iter().filter(|k| k.as_str() == kind).count();
-    assert_eq!(count(log_kinds::AUTH_FAILED), 120);
+    let log = operator::security_log(&board.data_dir(), None).unwrap();
+    let count = |kind: &str| log.iter().filter(|entry| entry.kind == kind).count();
+    assert_eq!(count(log_kinds::AUTH_FAILED), share);
     assert_eq!(count(log_kinds::LOG_SUPPRESSED), 1);
-    assert_eq!(log.len(), 122, "{log:?}");
+    assert_eq!(log.len(), share + 2, "{log:?}");
+    let marker = log.last().unwrap();
+    assert_eq!(marker.kind, log_kinds::LOG_SUPPRESSED);
+    assert_eq!(marker.client.as_deref(), Some("127.0.0.0"));
+    board.stop().await;
+}
+
+#[tokio::test]
+async fn one_address_cannot_use_up_the_failure_log_for_another() {
+    let Some(board) = start_dual(|config| {
+        config.limits.failure_log_per_address_per_minute = 5;
+        config.limits.failure_log_per_minute = 9;
+    })
+    .await
+    else {
+        return;
+    };
+    let fail = |host: &'static str| {
+        let url = format!("https://{host}:{}/v1/whoami", board.addr.port());
+        let request = board.http.get(url).bearer_auth("garbage");
+        async move {
+            assert_eq!(
+                request.send().await.unwrap().status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+    };
+    // A noisy address: its share of entries, one marker, then nothing.
+    for _ in 0..40 {
+        fail("127.0.0.1").await;
+    }
+    // Another address is still logged, until the budget of all is spent.
+    for _ in 0..10 {
+        fail("[::1]").await;
+    }
+    let log = operator::security_log(&board.data_dir(), None).unwrap();
+    let entries: Vec<(&str, Option<&str>)> = log
+        .iter()
+        .skip_while(|entry| entry.kind != log_kinds::AUTH_FAILED)
+        .map(|entry| (entry.kind.as_str(), entry.client.as_deref()))
+        .collect();
+    let (noisy, other) = (Some("127.0.0.0"), Some("::"));
+    let mut expected = vec![(log_kinds::AUTH_FAILED, noisy); 5];
+    expected.push((log_kinds::LOG_SUPPRESSED, noisy));
+    expected.extend([(log_kinds::AUTH_FAILED, other); 3]);
+    // Nine entries so far: the budget of all clients. One marker, and the
+    // rest of the minute is dropped.
+    expected.push((log_kinds::LOG_SUPPRESSED, None));
+    assert_eq!(entries, expected);
+    board.stop().await;
+}
+
+/// Makes the security log entries of the given types look years old, the
+/// way only someone with the database file could.
+fn backdate_log(data_dir: &Path, kinds: &[&str]) {
+    let kinds = kinds
+        .iter()
+        .map(|kind| format!("'{kind}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let conn = open_db(data_dir);
+    conn.busy_timeout(Duration::from_secs(5)).unwrap();
+    conn.execute_batch(&format!(
+        "BEGIN IMMEDIATE;
+         DROP TRIGGER security_log_is_append_only_update;
+         UPDATE security_log SET at = '2020-01-01T00:00:00.000Z' WHERE kind IN ({kinds});
+         CREATE TRIGGER security_log_is_append_only_update BEFORE UPDATE ON security_log
+         BEGIN SELECT RAISE(ABORT, 'the security log is append-only'); END;
+         COMMIT;"
+    ))
+    .unwrap();
+}
+
+#[tokio::test]
+async fn the_security_log_is_trimmed_by_age_and_by_count() {
+    let board = Net::start().await;
+    for name in ["alice", "bob", "carol"] {
+        board.enrol(name).await;
+    }
+    let dir = board.stop().await;
+    let data_dir = data_dir_of(&dir);
+    let before = operator::security_log(&data_dir, None).unwrap();
+    // server.started, then invite.created and enrol.succeeded for each.
+    assert_eq!(before.len(), 7);
+
+    // By count, at start-up: the newest three are kept, and the removal is
+    // itself on record.
+    let board = Net::start_in(dir, |config| config.security_log.max_entries = 3).await;
+    let log = operator::security_log(&board.data_dir(), None).unwrap();
+    let summary: Vec<(i64, &str, Option<&str>)> = log
+        .iter()
+        .map(|entry| (entry.id, entry.kind.as_str(), entry.detail.as_deref()))
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            (6, log_kinds::INVITE_CREATED, before[5].detail.as_deref()),
+            (7, log_kinds::ENROL_SUCCEEDED, None),
+            (8, log_kinds::SERVER_STARTED, Some("mode=network")),
+            (
+                9,
+                log_kinds::LOG_PRUNED,
+                Some("5 entries removed by retention")
+            ),
+        ]
+    );
+    let dir = board.stop().await;
+
+    // By age, while running: entries from long ago go at the next check.
+    let old = [
+        log_kinds::INVITE_CREATED,
+        log_kinds::ENROL_SUCCEEDED,
+        log_kinds::SERVER_STARTED,
+        log_kinds::LOG_PRUNED,
+    ];
+    backdate_log(&data_dir, &old);
+    let board = Net::start_in(dir, |config| {
+        config.security_log = LogRetention {
+            max_age: Duration::from_secs(3600),
+            max_entries: 1000,
+            check_every: Duration::from_millis(200),
+        };
+    })
+    .await;
+    // The start trimmed the four old entries and logged itself.
+    let kinds_now = kinds(&board.data_dir());
+    assert_eq!(
+        kinds_now,
+        [log_kinds::SERVER_STARTED, log_kinds::LOG_PRUNED]
+    );
+    board.enrol("dave").await;
+    backdate_log(&board.data_dir(), &old[2..]);
+    let mut trimmed = Vec::new();
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        trimmed = kinds(&board.data_dir());
+        if trimmed.last().map(String::as_str) == Some(log_kinds::LOG_PRUNED) {
+            break;
+        }
+    }
+    assert_eq!(
+        trimmed,
+        [
+            log_kinds::INVITE_CREATED,
+            log_kinds::ENROL_SUCCEEDED,
+            log_kinds::LOG_PRUNED
+        ]
+    );
+    let dir = board.stop().await;
+
+    // Trimming is the only way an entry goes: the log still refuses
+    // changes, and nothing is trimmed when nothing is beyond the bounds.
+    let conn = open_db(&data_dir);
+    assert!(conn.execute("DELETE FROM security_log", []).is_err());
+    assert!(conn
+        .execute("UPDATE security_log SET kind = 'x'", [])
+        .is_err());
+    drop(conn);
+    let board = Net::start_in(dir, |_| {}).await;
+    let log = kinds(&board.data_dir());
+    assert_eq!(log.len(), 4, "{log:?}");
+    assert_eq!(log[3], log_kinds::SERVER_STARTED);
+    board.stop().await;
+}
+
+#[tokio::test]
+async fn last_used_follows_use_at_the_configured_interval() {
+    let last_used = |board: &Net, id: &str| {
+        operator::list_credentials(&board.data_dir())
+            .unwrap()
+            .into_iter()
+            .find(|credential| credential.id == id)
+            .unwrap()
+            .last_used_at
+    };
+    // With a short interval, a later request moves the time on.
+    let board = Net::start_with(|config| {
+        config.limits.last_used_interval = Duration::from_millis(200);
+    })
+    .await;
+    let (token, credential) = board.enrol("alice").await;
+    assert_eq!(last_used(&board, &credential.id), None);
+    assert_eq!(board.status(&token).await, StatusCode::OK);
+    let first = last_used(&board, &credential.id).expect("set by the first use");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(last_used(&board, &credential.id).as_ref(), Some(&first));
+    assert_eq!(board.status(&token).await, StatusCode::OK);
+    let second = last_used(&board, &credential.id).unwrap();
+    assert!(second > first, "{second} is later than {first}");
+    board.stop().await;
+
+    // With the default of a minute it is deliberately coarse: a request
+    // soon after the first one does not write.
+    let board = Net::start().await;
+    let (token, credential) = board.enrol("alice").await;
+    assert_eq!(board.status(&token).await, StatusCode::OK);
+    let first = last_used(&board, &credential.id).expect("set by the first use");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(board.status(&token).await, StatusCode::OK);
+    assert_eq!(last_used(&board, &credential.id), Some(first));
     board.stop().await;
 }
 
@@ -1876,4 +2105,596 @@ async fn verify_log_detects_a_tampered_credential() {
     assert_eq!(broken_at("hash_version = 3"), Some(2));
     // Putting everything back heals it.
     assert_eq!(broken_at("hash_version = 2"), None);
+}
+
+// ---------------------------------------------------------------------------
+// Hardening: revocation under backlog, file modes, connection limits, modes
+// ---------------------------------------------------------------------------
+
+/// A raw TLS 1.3 connection to the board that trusts its pinned certificate.
+async fn raw_tls(
+    board: &Net,
+    addr: SocketAddr,
+    recv_buffer: Option<u32>,
+) -> std::io::Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
+    let digest = parse_fingerprint(&board.fingerprint).unwrap();
+    let connector =
+        tokio_rustls::TlsConnector::from(Arc::new(tls_config(digest, &[&rustls::version::TLS13])));
+    let socket = if addr.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()?
+    } else {
+        tokio::net::TcpSocket::new_v6()?
+    };
+    if let Some(size) = recv_buffer {
+        socket.set_recv_buffer_size(size)?;
+    }
+    let tcp = socket.connect(addr).await?;
+    connector
+        .connect(ServerName::try_from("localhost").unwrap(), tcp)
+        .await
+}
+
+/// The board's loopback address in IPv4, whatever it is bound to.
+fn v4(board: &Net) -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], board.addr.port()))
+}
+
+/// The board's loopback address in IPv6. Only a board from [`start_dual`]
+/// listens there.
+fn v6(board: &Net) -> SocketAddr {
+    SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, board.addr.port()))
+}
+
+/// A network board listening on every address, so that a test can reach it
+/// from two client addresses, `127.0.0.1` and `::1`. `None`, after a note on
+/// stderr, on a host without an IPv6 loopback or a dual-stack `::`.
+async fn start_dual(tweak: impl FnOnce(&mut Config)) -> Option<Net> {
+    if std::net::TcpListener::bind("[::1]:0").is_err() {
+        eprintln!("skipped: this host has no IPv6 loopback address");
+        return None;
+    }
+    let board = Net::start_with(|config| {
+        config.bind = "::".parse().unwrap();
+        config.public_url = Some("https://192.0.2.7:7878".to_owned());
+        tweak(config);
+    })
+    .await;
+    if tokio::net::TcpStream::connect(v4(&board)).await.is_err() {
+        eprintln!("skipped: `::` does not accept IPv4 connections on this host");
+        board.stop().await;
+        return None;
+    }
+    Some(board)
+}
+
+/// Appends `count` events to the default board straight in the database, as
+/// copies of its first event. Their hashes do not chain, which reading the
+/// log does not look at; it is the cheapest way to a long backlog.
+fn write_backlog(data_dir: &Path, count: i64) {
+    let conn = open_db(data_dir);
+    conn.busy_timeout(Duration::from_secs(5)).unwrap();
+    conn.execute_batch(&format!(
+        "BEGIN IMMEDIATE;
+         INSERT INTO events (board_id, seq, kind, channel, thread_id, message_id, actor_id, at,
+                             prev_hash, hash, credential_id, hash_version)
+         WITH RECURSIVE n(i) AS (SELECT 2 UNION ALL SELECT i + 1 FROM n WHERE i <= {count})
+         SELECT e.board_id, n.i, e.kind, e.channel, e.thread_id, 'msg_backlog_' || n.i,
+                e.actor_id, e.at, e.hash, e.hash, e.credential_id, e.hash_version
+         FROM n JOIN events e ON e.seq = 1
+         WHERE e.board_id = (SELECT id FROM boards WHERE name_key = 'general');
+         UPDATE boards SET head_seq = {count} + 1 WHERE name_key = 'general';
+         COMMIT;"
+    ))
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_stalled_stream_with_a_backlog_ends_on_revocation() {
+    const BACKLOG: i64 = 20_000;
+    let board =
+        Net::start_with(|config| config.limits.credential_recheck = Duration::from_millis(200))
+            .await;
+    let (alice, credential) = board.enrol("alice").await;
+    let (bob, _) = board.enrol("bob").await;
+    board.thread(&bob, "a", "before").await;
+    let data_dir = board.data_dir();
+    tokio::task::spawn_blocking(move || write_backlog(&data_dir, BACKLOG))
+        .await
+        .unwrap();
+
+    // A reader that asks for the whole log, one event a page, and then does
+    // not read: the server fills the socket and has to wait.
+    let mut reader = raw_tls(&board, board.addr, Some(4096)).await.unwrap();
+    let request = format!(
+        "GET /v1/boards/general/events/stream?after=start&limit=1 HTTP/1.1\r\n\
+         Host: localhost\r\nAuthorization: Bearer {alice}\r\nConnection: close\r\n\r\n"
+    );
+    reader.write_all(request.as_bytes()).await.unwrap();
+    reader.flush().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    let data_dir = board.data_dir();
+    tokio::task::spawn_blocking(move || operator::revoke_credential(&data_dir, &credential.id))
+        .await
+        .unwrap()
+        .unwrap();
+    // Well past the re-check interval, an event the reader must never see.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let after = board.thread(&bob, "a", "after the revocation").await;
+
+    // Now the reader drains everything the server will ever send it.
+    let mut received = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(60), reader.read_to_end(&mut received))
+        .await
+        .expect("the stream ends");
+    let text = String::from_utf8_lossy(&received);
+    assert!(text.starts_with("HTTP/1.1 200"), "{:.200}", text);
+    let delivered = text.matches("\"message_id\"").count();
+    assert!(delivered >= 1, "the stream was being served");
+    assert!(
+        !text.contains(&after.message.id),
+        "an event posted after the revocation was delivered ({delivered} events in all)"
+    );
+    // Only what was already on its way when the credential was revoked.
+    assert!(
+        (delivered as i64) < BACKLOG / 2,
+        "{delivered} events were delivered to a revoked credential"
+    );
+    assert_eq!(board.status(&bob).await, StatusCode::OK);
+    drop(reader);
+    board.stop().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_existing_data_directory_and_its_database_are_made_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    let chmod = |path: &Path, mode: u32| {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    let private = |data_dir: &Path, open: bool, network: bool| {
+        assert_eq!(mode(data_dir), 0o700, "the data directory");
+        let wal = format!("{DB_FILE_NAME}-wal");
+        let shm = format!("{DB_FILE_NAME}-shm");
+        let mut expected = vec![DB_FILE_NAME, openboard_server::LOCK_FILE_NAME];
+        if open {
+            expected.extend([wal.as_str(), shm.as_str()]);
+        }
+        if network {
+            expected.push(KEY_FILE_NAME);
+        }
+        for name in expected {
+            let path = data_dir.join(name);
+            assert!(path.is_file(), "{name} exists");
+            assert_eq!(mode(&path), 0o600, "{name}");
+        }
+        // Whatever else is there, nothing but the public certificate is
+        // readable by anyone else.
+        for entry in std::fs::read_dir(data_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.file_name().unwrap() != CERT_FILE_NAME {
+                assert_eq!(mode(&path) & 0o077, 0, "{}", path.display());
+            }
+        }
+    };
+    let offline_tools = |data_dir: &Path| {
+        let info = operator::board_info(data_dir).unwrap();
+        operator::security_log(data_dir, None).unwrap();
+        operator::list_credentials(data_dir).unwrap();
+        if info.mode == Mode::Network {
+            operator::create_invite(data_dir, "alice", &InviteOptions::default()).unwrap();
+        }
+        assert!(verify_log(data_dir).unwrap().is_ok());
+    };
+
+    for network in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let data_dir = data_dir_of(&dir);
+        std::fs::create_dir(&data_dir).unwrap();
+        chmod(&data_dir, 0o755);
+        let mut config = Config::new(&data_dir);
+        config.port = 0;
+        config.network = network;
+
+        let server = openboard_server::bind(config.clone()).await.unwrap();
+        private(&data_dir, true, network);
+        // The operator functions and the verifier open the database a
+        // second time. They work in the private directory and loosen nothing.
+        offline_tools(&data_dir);
+        private(&data_dir, true, network);
+        drop(server);
+        offline_tools(&data_dir);
+        private(&data_dir, false, network);
+
+        // A directory and a database that were loosened afterwards, as a
+        // database written by an older version is, are tightened again.
+        chmod(&data_dir, 0o755);
+        chmod(&data_dir.join(DB_FILE_NAME), 0o644);
+        chmod(&data_dir.join(openboard_server::LOCK_FILE_NAME), 0o644);
+        offline_tools(&data_dir);
+        let server = openboard_server::bind(config).await.unwrap();
+        private(&data_dir, true, network);
+        drop(server);
+    }
+
+    // A database path that is a symbolic link is refused, and what it
+    // points at is neither created nor touched.
+    let dir = TempDir::new().unwrap();
+    let data_dir = data_dir_of(&dir);
+    std::fs::create_dir(&data_dir).unwrap();
+    let elsewhere = dir.path().join("elsewhere.db");
+    std::os::unix::fs::symlink(&elsewhere, data_dir.join(DB_FILE_NAME)).unwrap();
+    let mut config = Config::new(&data_dir);
+    config.port = 0;
+    let error = openboard_server::bind(config.clone()).await.unwrap_err();
+    assert!(matches!(error, ServeError::Storage(_)), "{error}");
+    assert!(error.to_string().contains("symbolic link"), "{error}");
+    assert!(!elsewhere.exists());
+    // The data directory itself may be one.
+    std::fs::remove_file(data_dir.join(DB_FILE_NAME)).unwrap();
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&data_dir, &link).unwrap();
+    config.data_dir = link;
+    let server = openboard_server::bind(config).await.unwrap();
+    assert!(data_dir.join(DB_FILE_NAME).is_file());
+    assert_eq!(mode(&data_dir), 0o700);
+    drop(server);
+}
+
+#[tokio::test]
+async fn silent_connections_from_one_address_do_not_hold_up_another() {
+    let Some(board) = start_dual(|_| {}).await else {
+        return;
+    };
+    // One address opens far more connections than it may have handshakes
+    // pending, and says nothing on any of them.
+    let mut silent = Vec::new();
+    for _ in 0..300 {
+        silent.push(tokio::net::TcpStream::connect(v4(&board)).await.unwrap());
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let started = std::time::Instant::now();
+    let url = format!("https://[::1]:{}/v1/health", board.addr.port());
+    let response = tokio::time::timeout(Duration::from_secs(2), board.http.get(url).send())
+        .await
+        .expect("another address is served without waiting")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(started.elapsed() < Duration::from_secs(2));
+
+    // The silent connections are hung up on when the handshake time is
+    // over, and then their own address is served again too.
+    let mut first = silent.swap_remove(0);
+    let mut answer = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(8), first.read_to_end(&mut answer))
+        .await
+        .expect("a connection that never starts a handshake is closed");
+    assert!(answer.is_empty());
+    let response = board.http.get(board.at("/v1/health")).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    drop(silent);
+    board.stop().await;
+}
+
+/// Reads until the peer closes the connection. Panics if it does not within
+/// `within`. Returns what arrived first.
+async fn closed_within<S: tokio::io::AsyncRead + Unpin>(
+    stream: &mut S,
+    within: Duration,
+) -> Vec<u8> {
+    let mut received = Vec::new();
+    let _ = tokio::time::timeout(within, stream.read_to_end(&mut received))
+        .await
+        .expect("the server closes the connection");
+    received
+}
+
+#[tokio::test]
+async fn a_connection_that_does_not_send_a_request_head_is_closed() {
+    let quick = |config: &mut Config| {
+        config.limits.header_read_timeout = Duration::from_millis(400);
+    };
+    let board = Net::start_with(quick).await;
+    let (token, _) = board.enrol("alice").await;
+    let within = Duration::from_secs(5);
+
+    // Nothing after the handshake.
+    let mut idle = raw_tls(&board, board.addr, None).await.unwrap();
+    // Half a request head, then nothing.
+    let mut half = raw_tls(&board, board.addr, None).await.unwrap();
+    half.write_all(b"GET /v1/health HTTP/1.1\r\nHost: local")
+        .await
+        .unwrap();
+    half.flush().await.unwrap();
+    // A whole request, answered, and then the connection is left idle.
+    let mut kept = raw_tls(&board, board.addr, None).await.unwrap();
+    kept.write_all(b"GET /v1/health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .unwrap();
+    // A slow enrolment: the head arrives, the body never does.
+    let mut slow = raw_tls(&board, board.addr, None).await.unwrap();
+    slow.write_all(
+        b"POST /v1/join HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+          Content-Length: 80\r\nConnection: close\r\n\r\n{\"code\":",
+    )
+    .await
+    .unwrap();
+    slow.flush().await.unwrap();
+
+    let started = std::time::Instant::now();
+    let answer = closed_within(&mut idle, within).await;
+    assert!(!String::from_utf8_lossy(&answer).contains("200 OK"));
+    let answer = closed_within(&mut half, within).await;
+    assert!(!String::from_utf8_lossy(&answer).contains("200 OK"));
+    let answer = closed_within(&mut kept, within).await;
+    assert!(String::from_utf8_lossy(&answer).starts_with("HTTP/1.1 200 OK"));
+    let answer = closed_within(&mut slow, within).await;
+    assert!(
+        String::from_utf8_lossy(&answer).starts_with("HTTP/1.1 408"),
+        "{}",
+        String::from_utf8_lossy(&answer)
+    );
+    assert!(started.elapsed() < within);
+
+    // A long-poll and a stream outlast the timeout many times over: it
+    // times the request head, not the response.
+    let stream = board
+        .get(&token, "/v1/boards/general/events/stream")
+        .send()
+        .await
+        .unwrap();
+    let stream = tokio::spawn(drain(stream));
+    let started = std::time::Instant::now();
+    let response = board
+        .get(&token, "/v1/boards/general/events?wait=2")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(started.elapsed() >= Duration::from_millis(1900));
+    assert!(!stream.is_finished());
+    board.thread(&token, "a", "still listening").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!stream.is_finished());
+    let dir = board.stop().await;
+    let sent = stream.await.unwrap();
+    assert!(sent.contains("data:"), "{sent}");
+    drop(dir);
+
+    // A local board has the same timeout.
+    let dir = TempDir::new().unwrap();
+    let mut config = Config::new(data_dir_of(&dir));
+    config.port = 0;
+    quick(&mut config);
+    let server = openboard_server::bind(config).await.unwrap();
+    let addr = server.local_addr();
+    let (stop, stopped) = oneshot::channel::<()>();
+    let task = tokio::spawn(server.run(async {
+        let _ = stopped.await;
+    }));
+    let mut half = tokio::net::TcpStream::connect(addr).await.unwrap();
+    half.write_all(b"GET /v1/health HTTP/1.1\r\nHost: local")
+        .await
+        .unwrap();
+    let answer = closed_within(&mut half, within).await;
+    assert!(!String::from_utf8_lossy(&answer).contains("200 OK"));
+    let http = Client::builder().no_proxy().build().unwrap();
+    let response = http
+        .get(format!("http://{addr}/v1/health"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    stop.send(()).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn connections_are_capped_per_address_and_in_total() {
+    let Some(board) = start_dual(|config| {
+        config.limits.max_connections_per_address = 3;
+        config.limits.max_connections = 5;
+        // Idle connections stay, so the test decides when they go.
+        config.limits.header_read_timeout = Duration::from_secs(60);
+    })
+    .await
+    else {
+        return;
+    };
+    let within = Duration::from_secs(2);
+    // Whether a new connection from this address gets a handshake. One
+    // over a cap is closed straight away, without one.
+    let admitted = |addr: SocketAddr| {
+        let board = &board;
+        async move {
+            tokio::time::timeout(within, raw_tls(board, addr, None))
+                .await
+                .expect("an answer either way, promptly")
+                .ok()
+        }
+    };
+
+    let mut held = Vec::new();
+    for _ in 0..3 {
+        held.push(admitted(v4(&board)).await.expect("within the cap"));
+    }
+    // The address is full. Another address is served as ever.
+    assert!(admitted(v4(&board)).await.is_none());
+    assert!(admitted(v4(&board)).await.is_none());
+    let other = Client::builder()
+        .no_proxy()
+        .pool_max_idle_per_host(0)
+        .use_preconfigured_tls(tls_config(
+            parse_fingerprint(&board.fingerprint).unwrap(),
+            rustls::ALL_VERSIONS,
+        ))
+        .build()
+        .unwrap();
+    let health = format!("https://[::1]:{}/v1/health", board.addr.port());
+    let response = other.get(&health).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    drop(response);
+    // The connections that are open are unharmed.
+    let kept = &mut held[0];
+    kept.write_all(b"GET /v1/health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .unwrap();
+    let mut answer = [0u8; 15];
+    kept.read_exact(&mut answer).await.unwrap();
+    assert_eq!(&answer, b"HTTP/1.1 200 OK");
+
+    // Two more from the other address fill the board: five in all. The
+    // connection of the request above takes a moment to be gone.
+    let mut more = Vec::new();
+    for _ in 0..50 {
+        match admitted(v6(&board)).await {
+            Some(connection) => more.push(connection),
+            None => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+        if more.len() == 2 {
+            break;
+        }
+    }
+    assert_eq!(more.len(), 2);
+    assert!(admitted(v6(&board)).await.is_none());
+    assert!(other.get(&health).send().await.is_err());
+
+    // Places come back when connections close.
+    drop(more);
+    let mut freed = false;
+    for _ in 0..50 {
+        if other.get(&health).send().await.is_ok() {
+            freed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(freed);
+    held.pop();
+    let mut freed = false;
+    for _ in 0..50 {
+        if let Some(connection) = admitted(v4(&board)).await {
+            held.push(connection);
+            freed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(freed);
+    drop(held);
+    board.stop().await;
+}
+
+fn delete_mode_record(data_dir: &Path) {
+    let changed = open_db(data_dir)
+        .execute("DELETE FROM meta WHERE key = 'mode'", [])
+        .unwrap();
+    assert_eq!(changed, 1);
+}
+
+#[tokio::test]
+async fn a_network_directory_without_its_mode_record_is_still_a_network_board() {
+    // With credentials: the rows give it away, even with the certificate
+    // gone and the mode forged to local.
+    let board = Net::start().await;
+    let fingerprint = board.fingerprint.clone();
+    let (token, _) = board.enrol("alice").await;
+    let dir = board.stop().await;
+    let data_dir = data_dir_of(&dir);
+    delete_mode_record(&data_dir);
+    assert_eq!(
+        operator::board_info(&data_dir).unwrap().mode,
+        Mode::Network,
+        "the operator functions see through it too"
+    );
+    let mut config = Config::new(&data_dir);
+    config.port = 0;
+    // Asking for a non-loopback local board is refused as for any network
+    // directory: with the public URL error, not by binding without TLS.
+    config.bind = "0.0.0.0".parse().unwrap();
+    let error = openboard_server::bind(config.clone()).await.unwrap_err();
+    assert!(matches!(error, ServeError::PublicUrlRequired(_)), "{error}");
+    let board = Net::start_in(dir, |config| config.network = false).await;
+    assert_eq!(board.fingerprint, fingerprint);
+    let plain = Client::builder().no_proxy().build().unwrap();
+    assert!(plain
+        .get(format!("http://127.0.0.1:{}/v1/health", board.addr.port()))
+        .send()
+        .await
+        .is_err());
+    assert_eq!(board.status(&token).await, StatusCode::OK);
+    assert_eq!(board.status("garbage").await, StatusCode::UNAUTHORIZED);
+    let dir = board.stop().await;
+    let info = operator::board_info(&data_dir).unwrap();
+    assert_eq!(info.mode, Mode::Network);
+    let recorded: String = open_db(&data_dir)
+        .query_row("SELECT value FROM meta WHERE key = 'mode'", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(recorded, MODE_NETWORK, "the record is repaired");
+    assert!(kinds(&data_dir).contains(&log_kinds::MODE_REPAIRED.to_owned()));
+
+    open_db(&data_dir)
+        .execute("UPDATE meta SET value = 'local' WHERE key = 'mode'", [])
+        .unwrap();
+    std::fs::remove_file(data_dir.join(CERT_FILE_NAME)).unwrap();
+    std::fs::remove_file(data_dir.join(KEY_FILE_NAME)).unwrap();
+    let mut config = Config::new(&data_dir);
+    config.port = 0;
+    let server = openboard_server::bind(config).await.unwrap();
+    assert_eq!(server.mode(), Mode::Network);
+    drop(server);
+    drop(dir);
+
+    // Without any agent yet: the certificate gives it away.
+    let board = Net::start().await;
+    let dir = board.stop().await;
+    let data_dir = data_dir_of(&dir);
+    delete_mode_record(&data_dir);
+    let mut config = Config::new(&data_dir);
+    config.port = 0;
+    let server = openboard_server::bind(config).await.unwrap();
+    assert_eq!(server.mode(), Mode::Network);
+    assert!(server.url().starts_with("https://"));
+    drop(server);
+}
+
+#[tokio::test]
+async fn a_start_that_cannot_bind_does_not_upgrade_a_local_directory() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let dir = TempDir::new().unwrap();
+    let data_dir = data_dir_of(&dir);
+    let mut config = Config::new(&data_dir);
+    config.port = 0;
+    let server = openboard_server::bind(config.clone()).await.unwrap();
+    assert_eq!(server.mode(), Mode::Local);
+    drop(server);
+
+    // The port is taken, so the network start fails.
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut upgrade = config.clone();
+    upgrade.network = true;
+    upgrade.port = taken.local_addr().unwrap().port();
+    let error = openboard_server::bind(upgrade.clone()).await.unwrap_err();
+    assert!(matches!(error, ServeError::Bind { .. }), "{error}");
+
+    // Nothing about the directory says network afterwards.
+    assert_eq!(operator::board_info(&data_dir).unwrap().mode, Mode::Local);
+    assert!(!data_dir.join(CERT_FILE_NAME).exists());
+    assert!(!data_dir.join(KEY_FILE_NAME).exists());
+    assert!(!kinds(&data_dir).contains(&log_kinds::MODE_UPGRADED.to_owned()));
+    let server = openboard_server::bind(config).await.unwrap();
+    assert_eq!(server.mode(), Mode::Local);
+    assert!(server.url().starts_with("http://"));
+    drop(server);
+
+    // With the port free the same start upgrades it.
+    drop(taken);
+    let server = openboard_server::bind(upgrade).await.unwrap();
+    assert_eq!(server.mode(), Mode::Network);
+    assert!(kinds(&data_dir).contains(&log_kinds::MODE_UPGRADED.to_owned()));
+    drop(server);
 }

@@ -964,6 +964,8 @@ dependencies = [
  "axum",
  "futures-core",
  "getrandom 0.4.3",
+ "hyper",
+ "hyper-util",
  "openboard-api",
  "rcgen",
  "reqwest",
@@ -975,6 +977,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-rustls",
+ "tower-service",
 ]
 
 [[package]]

@@ -12,11 +12,12 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::IpAddr;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::rejection::{BytesRejection, PathRejection, QueryRejection};
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Extension, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -38,22 +39,27 @@ use tokio::time::Instant;
 
 use crate::authz::{Action, Authorizer, Principal};
 use crate::chain::hex;
-use crate::identity::{log_kinds, token_lookup_hash, AuthOutcome, Credential, LogEntry};
-use crate::limits::{
-    address_key, Hit, Limits, RateTable, WaiterGuard, Waiters, FAILURE_LOG_PER_MINUTE,
-};
+use crate::identity::{self, log_kinds, token_lookup_hash, AuthOutcome, Credential, LogEntry};
+use crate::limits::{address_key, Hit, Limits, LogRetention, RateTable, WaiterGuard, Waiters};
 use crate::names::{self, ChannelSel};
+use crate::serve::ClientAddr;
 use crate::store::{
     event_cursor, parse_cursor, thread_cursor, BoardRef, EventFilter, NewPost, PostTarget, Store,
     StoreError,
 };
-use crate::tls::ClientAddr;
 use crate::Mode;
 
 /// Longest idempotency key, in bytes.
 const MAX_IDEMPOTENCY_KEY_LEN: usize = 255;
 /// How often the event stream sends a comment to keep the connection open.
 const STREAM_KEEP_ALIVE: Duration = Duration::from_secs(15);
+/// Events an event stream may have ready beyond the one being written. They
+/// have passed the credential check, so this is kept small: it is what a
+/// reader that stalls can have queued when its credential is revoked, and a
+/// revocation discards it.
+const STREAM_BUFFER: usize = 4;
+/// Largest accepted body of an enrolment request, which holds one code.
+const MAX_JOIN_BODY: usize = 4096;
 
 /// Wakes event waiters when a board's log grows. It holds one entry per
 /// board that exists, never one for a name that was merely asked about.
@@ -97,12 +103,15 @@ pub(crate) struct AppState {
     limits: Limits,
     /// Requests per credential.
     requests: RateTable<String>,
-    /// Enrolment attempts per client address.
+    retention: LogRetention,
+    /// Failed enrolment attempts per client address.
     joins: RateTable<IpAddr>,
     /// Failed authentications per client address.
     auth_failures: RateTable<IpAddr>,
     /// Failure entries written to the security log, over all clients.
     failure_log: RateTable<()>,
+    /// Failure entries written to the security log, per client address.
+    failure_log_by_address: RateTable<IpAddr>,
     /// Open long-polls and streams per credential.
     waiters: Arc<Waiters>,
     /// Turns true when the server starts shutting down.
@@ -121,11 +130,39 @@ pub(crate) struct Parts {
     pub mode: Mode,
     pub max_message_chars: usize,
     pub limits: Limits,
+    pub retention: LogRetention,
     pub shutdown: watch::Receiver<bool>,
     pub in_use: mpsc::Sender<()>,
 }
 
-pub(crate) fn router(parts: Parts) -> Router {
+/// Upkeep a running server does beside answering requests: it trims the
+/// security log to its retention. It shares the store with the router and
+/// lets go of it when the server stops.
+pub(crate) struct Maintenance(Shared);
+
+impl Maintenance {
+    /// Runs until `stop` turns true or its sender is gone.
+    pub(crate) async fn run(self, mut stop: watch::Receiver<bool>) {
+        let state = self.0;
+        let period = state.retention.check_every.max(Duration::from_millis(10));
+        let mut timer = tokio::time::interval_at(Instant::now() + period, period);
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                () = stopping(&mut stop) => return,
+                _ = timer.tick() => {}
+            }
+            let pruned = state
+                .db(|state| state.store.prune_log(&state.retention))
+                .await;
+            if pruned.is_err() {
+                eprintln!("openboard-server: could not trim the security log");
+            }
+        }
+    }
+}
+
+pub(crate) fn router(parts: Parts) -> (Router, Maintenance) {
     let max_message_chars = parts.max_message_chars;
     let state = Arc::new(AppState {
         store: parts.store,
@@ -134,10 +171,12 @@ pub(crate) fn router(parts: Parts) -> Router {
         mode: parts.mode,
         max_message_chars,
         limits: parts.limits,
+        retention: parts.retention,
         requests: RateTable::new(),
         joins: RateTable::new(),
         auth_failures: RateTable::new(),
         failure_log: RateTable::new(),
+        failure_log_by_address: RateTable::new(),
         waiters: Arc::new(Waiters::default()),
         shutdown: parts.shutdown,
         _in_use: parts.in_use,
@@ -146,7 +185,7 @@ pub(crate) fn router(parts: Parts) -> Router {
     let body_limit = max_message_chars
         .saturating_mul(12)
         .saturating_add(16 * 1024);
-    Router::new()
+    let router = Router::new()
         .route(HEALTH_PATH, get(health))
         .route(JOIN_PATH, post(join))
         .route("/v1/whoami", get(whoami))
@@ -163,7 +202,8 @@ pub(crate) fn router(parts: Parts) -> Router {
         // The outermost layer: it runs before routing, extraction and
         // every handler.
         .layer(middleware::from_fn_with_state(Arc::clone(&state), gate))
-        .with_state(state)
+        .with_state(Arc::clone(&state));
+    (router, Maintenance(state))
 }
 
 /// The two routes a network board answers without a token.
@@ -420,8 +460,12 @@ impl AppState {
         let outcome = match presented.and_then(token_lookup_hash) {
             None => None,
             Some(hash) => Some(
-                self.db(move |state| state.store.authenticate(&hash))
-                    .await?,
+                self.db(move |state| {
+                    state
+                        .store
+                        .authenticate(&hash, state.limits.last_used_interval)
+                })
+                .await?,
             ),
         };
         let (reason, known) = match outcome {
@@ -462,11 +506,11 @@ impl AppState {
             }
             Hit::Limited { retry_after, first } => {
                 if first {
-                    self.log(
+                    self.log_capped(
                         log_kinds::RATE_LIMITED,
                         None,
                         client,
-                        Some("failed authentication"),
+                        "failed authentication",
                     )
                     .await;
                 }
@@ -501,9 +545,12 @@ impl AppState {
         }
     }
 
-    /// Logs a failed authentication or enrolment, within a budget shared by
-    /// all clients so that failures cannot fill the disk. When the budget
-    /// for the minute is spent, one entry says so and the rest are dropped.
+    /// Logs a failed authentication or enrolment, within two budgets, so
+    /// that failures cannot fill the disk and no client can use up the log
+    /// for the others. Each client address has its own share for the
+    /// minute; when it is spent, one entry says so and the address's
+    /// further failures are dropped. Everything that passes is then counted
+    /// against the budget of all clients together.
     async fn log_failure(
         self: &Arc<Self>,
         kind: &'static str,
@@ -511,8 +558,34 @@ impl AppState {
         client: Option<IpAddr>,
         reason: &'static str,
     ) {
-        match self.failure_log.hit((), FAILURE_LOG_PER_MINUTE) {
-            Hit::Allowed => self.log(kind, credential, client, Some(reason)).await,
+        let share = self.limits.failure_log_per_address_per_minute;
+        match self.failure_log_by_address.hit(client_key(client), share) {
+            Hit::Allowed => self.log_capped(kind, credential, client, reason).await,
+            Hit::Limited { first: true, .. } => {
+                self.log_capped(
+                    log_kinds::LOG_SUPPRESSED,
+                    None,
+                    client,
+                    "further failures from this address this minute are not logged",
+                )
+                .await;
+            }
+            Hit::Limited { .. } => {}
+        }
+    }
+
+    /// Logs an entry that a client without a credential can cause, within
+    /// the budget of all clients together. When that is spent for the
+    /// minute, one entry says so and the rest are dropped.
+    async fn log_capped(
+        self: &Arc<Self>,
+        kind: &'static str,
+        credential: Option<&Credential>,
+        client: Option<IpAddr>,
+        detail: &'static str,
+    ) {
+        match self.failure_log.hit((), self.limits.failure_log_per_minute) {
+            Hit::Allowed => self.log(kind, credential, client, Some(detail)).await,
             Hit::Limited { first: true, .. } => {
                 self.log(
                     log_kinds::LOG_SUPPRESSED,
@@ -728,55 +801,43 @@ async fn health(
 }
 
 /// `POST /v1/join`: swaps a single-use enrolment code for a token.
+///
+/// Only failures count against the client address's budget, and a valid
+/// code is accepted whatever that budget says: the code is a long random
+/// single-use secret, so letting it through gives a guesser nothing, while
+/// refusing it would let junk from one address lock out an agent that
+/// shares the address. Once the address is over its budget every failure is
+/// answered with `rate_limited`. What a refused attempt costs is bounded:
+/// a small body read within a time limit and, for text shaped like a code,
+/// one indexed lookup.
 async fn join(
     State(state): State<Shared>,
     Extension(identity): Extension<Identity>,
     headers: HeaderMap,
-    body: Result<Bytes, BytesRejection>,
+    body: Body,
 ) -> ApiResult<Response> {
     if state.mode == Mode::Local {
         return Err(AppError::invalid(
             "this is a local board: it has no enrolment and needs no token",
         ));
     }
-    // Counted before anything is read, successful or not.
-    if let Hit::Limited { retry_after, first } = state
-        .joins
-        .hit(client_key(identity.client), state.limits.joins_per_minute)
-    {
-        if first {
-            state
-                .log(
-                    log_kinds::RATE_LIMITED,
-                    None,
-                    identity.client,
-                    Some("enrolment"),
-                )
-                .await;
-        }
-        return Err(AppError::rate_limited(retry_after));
-    }
     state.require_global(&identity.principal, Action::Enrol)?;
-    if !is_json(&headers) {
-        return Err(
-            AppError::invalid("the request body must be sent as application/json")
-                .status(StatusCode::UNSUPPORTED_MEDIA_TYPE),
-        );
-    }
-    let body = body.map_err(|_| AppError::invalid("the request body could not be read"))?;
-    // The error never quotes the body, which may hold a code.
-    let request: JoinRequest = serde_json::from_slice(&body)
-        .map_err(|_| AppError::invalid("the request body is not a valid join request"))?;
-
     let client = identity.client;
-    let joined = state
-        .db(move |state| state.store.join(&request.code, client))
-        .await?;
-    let Some((token, credential)) = joined else {
+    let request = match read_join_request(&state, &headers, body).await {
+        Ok(request) => request,
+        Err(malformed) => return Err(state.join_failed(client, None, malformed).await),
+    };
+    let joined = if identity::code_is_well_formed(&request.code) {
         state
-            .log_failure(log_kinds::ENROL_FAILED, None, client, "unusable code")
-            .await;
-        return Err(AppError::invite_invalid());
+            .db(move |state| state.store.join(&request.code, client))
+            .await?
+    } else {
+        None
+    };
+    let Some((token, credential)) = joined else {
+        return Err(state
+            .join_failed(client, Some("unusable code"), AppError::invite_invalid())
+            .await);
     };
     let response = JoinResponse {
         token,
@@ -784,6 +845,64 @@ async fn join(
     };
     // The token is in this response and nowhere else. Nothing may keep it.
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(response)).into_response())
+}
+
+/// Reads the body of an enrolment request. The caller is not authenticated,
+/// so the body is small and has to arrive within the time a request head
+/// has.
+async fn read_join_request(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: Body,
+) -> ApiResult<JoinRequest> {
+    if !is_json(headers) {
+        return Err(
+            AppError::invalid("the request body must be sent as application/json")
+                .status(StatusCode::UNSUPPORTED_MEDIA_TYPE),
+        );
+    }
+    let unreadable = || AppError::invalid("the request body could not be read");
+    let reading = axum::body::to_bytes(body, MAX_JOIN_BODY);
+    let body = tokio::time::timeout(state.limits.header_read_timeout, reading)
+        .await
+        .map_err(|_| unreadable().status(StatusCode::REQUEST_TIMEOUT))?
+        .map_err(|_| unreadable())?;
+    // The error never quotes the body, which may hold a code.
+    serde_json::from_slice(&body)
+        .map_err(|_| AppError::invalid("the request body is not a valid join request"))
+}
+
+impl AppState {
+    /// Counts a failed enrolment attempt against its client address and
+    /// returns the answer: `refusal` while the address is within its
+    /// budget, `rate_limited` once it is over. `reason` is logged for an
+    /// attempt that presented a code.
+    async fn join_failed(
+        self: &Arc<Self>,
+        client: Option<IpAddr>,
+        reason: Option<&'static str>,
+        refusal: AppError,
+    ) -> AppError {
+        match self
+            .joins
+            .hit(client_key(client), self.limits.joins_per_minute)
+        {
+            Hit::Allowed => {
+                if let Some(reason) = reason {
+                    self.log_failure(log_kinds::ENROL_FAILED, None, client, reason)
+                        .await;
+                }
+                refusal
+            }
+            Hit::Limited { retry_after, first } => {
+                if first {
+                    self.log_capped(log_kinds::RATE_LIMITED, None, client, "enrolment")
+                        .await;
+                }
+                AppError::rate_limited(retry_after)
+            }
+        }
+    }
 }
 
 /// `GET /v1/whoami`: the caller as the board records it.
@@ -1121,6 +1240,12 @@ struct EventScan {
     /// Position every earlier event has been considered up to.
     after: i64,
     wake: watch::Receiver<i64>,
+    /// When the caller's credential was last read as usable. It starts at
+    /// the request's own authentication.
+    checked_at: Instant,
+    /// True after the scan has waited for something to happen, which is
+    /// when a revocation is most likely to have gone unnoticed.
+    waited: bool,
 }
 
 impl EventScan {
@@ -1134,6 +1259,8 @@ impl EventScan {
         query: &EventsQuery,
         resume: Option<&str>,
     ) -> ApiResult<Self> {
+        // The gate authenticated the request before it got here.
+        let checked_at = Instant::now();
         let caller = Caller::new(identity, headers)?;
         let board = state.board(&caller, board).await?;
         let channel = match &query.channel {
@@ -1189,6 +1316,8 @@ impl EventScan {
             limit,
             after,
             wake,
+            checked_at,
+            waited: false,
         })
     }
 
@@ -1227,29 +1356,56 @@ impl EventScan {
         event_cursor(&self.board.tag, self.after)
     }
 
-    /// Whether the caller's credential may still be used, read from the
-    /// database, because a revocation is written by another process. Always
-    /// true on a local board.
-    async fn credential_usable(&self) -> ApiResult<bool> {
-        match &self.caller.credential_id {
-            None => Ok(true),
-            Some(id) => {
-                let id = id.clone();
-                self.state
-                    .db(move |state| state.store.credential_usable(&id))
-                    .await
-            }
+    /// How long a credential check stays good; see
+    /// [`Limits::credential_recheck`].
+    fn recheck_period(&self) -> Duration {
+        self.state
+            .limits
+            .credential_recheck
+            .max(Duration::from_millis(10))
+    }
+
+    /// Reads from the database whether the caller's credential may still be
+    /// used, because a revocation is written by another process. Always
+    /// true on a local board. An error counts as unusable.
+    async fn recheck(&mut self) -> bool {
+        let Some(id) = self.caller.credential_id.clone() else {
+            return true;
+        };
+        // Taken before the read, so the check is never credited with being
+        // newer than it is.
+        let asked_at = Instant::now();
+        let usable = self
+            .state
+            .db(move |state| state.store.credential_usable(&id))
+            .await
+            .unwrap_or(false);
+        if usable {
+            self.checked_at = asked_at;
+            self.waited = false;
         }
+        usable
+    }
+
+    /// Whether events may be sent to the caller now. Nothing is sent unless
+    /// this said yes just before. It reads the credential again when the
+    /// scan has waited since the last check, or when that check is older
+    /// than [`Limits::credential_recheck`]; otherwise the last check stands,
+    /// so paging through a backlog does not read it for every page.
+    async fn may_deliver(&mut self) -> bool {
+        if self.caller.credential_id.is_none() {
+            return true;
+        }
+        if !self.waited && self.checked_at.elapsed() < self.recheck_period() {
+            return true;
+        }
+        self.recheck().await
     }
 
     /// Ticks every [`Limits::credential_recheck`], starting one period from
     /// now, however often the scan is woken in between.
     fn recheck_timer(&self) -> tokio::time::Interval {
-        let period = self
-            .state
-            .limits
-            .credential_recheck
-            .max(Duration::from_millis(10));
+        let period = self.recheck_period();
         let mut timer = tokio::time::interval_at(Instant::now() + period, period);
         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         timer
@@ -1257,7 +1413,7 @@ impl EventScan {
 }
 
 /// Resolves when the server starts shutting down.
-async fn stopping(shutdown: &mut watch::Receiver<bool>) {
+pub(crate) async fn stopping(shutdown: &mut watch::Receiver<bool>) {
     if shutdown.wait_for(|stopping| *stopping).await.is_err() {
         // The server handle is gone, which also means shutdown.
     }
@@ -1293,13 +1449,12 @@ async fn get_events(
     let mut recheck = scan.recheck_timer();
 
     let mut expired = wait.is_zero();
-    // True once the request has been held open, after which the credential
-    // it arrived with may have been revoked or have expired.
-    let mut held = false;
     loop {
         let (events, more) = scan.next_page().await?;
         if !events.is_empty() || (!more && expired) {
-            if held && !scan.credential_usable().await? {
+            // The credential the request arrived with may have been revoked
+            // or have expired while it was held open or scanning.
+            if !scan.may_deliver().await {
                 return Err(AppError::unauthenticated());
             }
             return Ok(Json(EventsResponse {
@@ -1311,27 +1466,38 @@ async fn get_events(
             // The page filled with events the caller may not see. Keep going.
             continue;
         }
-        held = true;
+        scan.waited = true;
         tokio::select! {
             changed = scan.wake.changed() => expired = changed.is_err(),
             () = tokio::time::sleep_until(deadline) => expired = true,
             () = stopping(&mut shutdown) => expired = true,
             _ = recheck.tick(), if has_credential => {
-                if !scan.credential_usable().await? {
+                if !scan.recheck().await {
                     return Err(AppError::unauthenticated());
                 }
+                // The wait goes on, so the next delivery checks again.
+                scan.waited = true;
             }
         }
     }
 }
 
-struct EventStream(mpsc::Receiver<SseEvent>);
+/// The body of an event stream. `cut` is set when the stream's credential
+/// stops being usable; frames that were ready but not yet written are then
+/// dropped instead of sent.
+struct EventStream {
+    frames: mpsc::Receiver<SseEvent>,
+    cut: Arc<AtomicBool>,
+}
 
 impl futures_core::Stream for EventStream {
     type Item = Result<SseEvent, Infallible>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.0.poll_recv(cx).map(|item| item.map(Ok))
+        if self.cut.load(Ordering::Acquire) {
+            return Poll::Ready(None);
+        }
+        self.frames.poll_recv(cx).map(|item| item.map(Ok))
     }
 }
 
@@ -1358,50 +1524,68 @@ async fn stream_events(
     let place = scan.state.waiter(&scan.caller)?;
     let has_credential = scan.caller.credential_id.is_some();
 
-    let (tx, rx) = mpsc::channel::<SseEvent>(16);
+    let (tx, frames) = mpsc::channel::<SseEvent>(STREAM_BUFFER);
+    let cut = Arc::new(AtomicBool::new(false));
+    let revoked = Arc::clone(&cut);
     tokio::spawn(async move {
         // Held until the stream ends.
         let _place = place;
         let mut recheck = scan.recheck_timer();
-        // False until the first batch: the request was authenticated a
-        // moment ago.
-        let mut held = false;
+        // Ends the stream of a credential that is no longer usable, and
+        // takes back what was not written yet.
+        let end = || revoked.store(true, Ordering::Release);
         loop {
             let Ok((events, more)) = scan.next_page().await else {
                 return;
             };
-            // A stream whose credential was revoked or has expired ends
-            // here, before it delivers anything more.
-            if held && !events.is_empty() && !scan.credential_usable().await.unwrap_or(false) {
-                return;
-            }
             for event in events {
                 let Ok(data) = serde_json::to_string(&event) else {
                     return;
                 };
                 let frame = SseEvent::default().id(event.cursor).data(data);
-                if tx.send(frame).await.is_err() {
+                // Room for the frame can take as long as the reader likes.
+                // The credential is read again on every tick meanwhile, so
+                // a reader that stalls is not owed events past a revocation.
+                let room = loop {
+                    tokio::select! {
+                        room = tx.reserve() => break room,
+                        () = stopping(&mut shutdown) => return,
+                        _ = recheck.tick(), if has_credential => {
+                            if !scan.recheck().await {
+                                return end();
+                            }
+                        }
+                    }
+                };
+                let Ok(room) = room else {
                     return;
+                };
+                // Nothing is sent without a check that is still good.
+                if !scan.may_deliver().await {
+                    return end();
                 }
+                room.send(frame);
             }
             if more {
                 continue;
             }
-            held = true;
+            scan.waited = true;
             tokio::select! {
                 changed = scan.wake.changed() => if changed.is_err() { return },
                 () = tx.closed() => return,
                 () = stopping(&mut shutdown) => return,
                 _ = recheck.tick(), if has_credential => {
-                    if !scan.credential_usable().await.unwrap_or(false) {
-                        return;
+                    if !scan.recheck().await {
+                        return end();
                     }
+                    // The wait goes on, so the next delivery checks again.
+                    scan.waited = true;
                 }
             }
         }
     });
 
-    Ok(Sse::new(EventStream(rx))
+    Ok(Sse::new(EventStream { frames, cut })
         .keep_alive(
             KeepAlive::new()
                 .interval(STREAM_KEEP_ALIVE)

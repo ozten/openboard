@@ -4,7 +4,7 @@
 use std::fmt;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::net::IpAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -18,8 +18,10 @@ use crate::chain::{event_hash, EventFields, GENESIS_HASH, HASH_VERSION};
 use crate::identity::{
     self, actor_kind_name, log_kinds, parse_actor_kind, AuthOutcome, Credential, LogEntry,
 };
+use crate::limits::LogRetention;
 use crate::names::{board_key, ChannelSel};
-use crate::time::{now_ms, now_rfc3339};
+use crate::time::{now_ms, now_rfc3339, rfc3339_from_ms};
+use crate::tls::{CERT_FILE_NAME, KEY_FILE_NAME};
 use crate::Mode;
 
 /// File name of the board database inside the data directory.
@@ -263,7 +265,32 @@ pub(crate) struct ThreadPage {
     pub more: bool,
 }
 
+/// What a start does to the directory's recorded mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModeChange {
+    /// The record already says it.
+    Keep,
+    /// A new directory: its first start decides.
+    First,
+    /// A local directory becomes a network one, for good.
+    Upgrade,
+    /// The directory is a network one by its contents, but its record was
+    /// missing or said local.
+    Repair,
+}
+
+/// The mode a start will run in, settled before anything is committed.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ModePlan {
+    pub mode: Mode,
+    change: ModeChange,
+    /// Whether a certificate fingerprint was ever recorded, after which
+    /// clients may have pinned it.
+    pub pinned: bool,
+}
+
 pub(crate) struct Store {
+    data_dir: PathBuf,
     conn: Mutex<Connection>,
     /// Holds the exclusive lock on the data directory. Closing the file
     /// releases it, so it is declared after the connection and outlives it.
@@ -286,6 +313,7 @@ impl Store {
         })?;
         // Taken before the database is touched.
         let lock = lock_data_dir(data_dir)?;
+        make_private(data_dir).map_err(StoreError::Other)?;
         let mut conn = Connection::open(data_dir.join(DB_FILE_NAME))?;
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -317,6 +345,7 @@ impl Store {
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
         Ok(Self {
+            data_dir: data_dir.to_path_buf(),
             conn: Mutex::new(conn),
             _lock: lock,
         })
@@ -330,48 +359,72 @@ impl Store {
             .unwrap_or_else(|poison| poison.into_inner())
     }
 
-    /// Settles the mode this data directory runs in and records it. A
-    /// network directory stays one whatever is asked. A local directory
-    /// becomes a network one, for good, when `network` is asked for. Returns
-    /// the mode and whether this call upgraded an existing local directory.
-    pub(crate) fn establish_mode(&self, network: bool) -> Result<(Mode, bool)> {
-        let mut conn = self.conn();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let recorded = match identity::meta_get(&tx, identity::META_MODE)? {
+    /// Settles the mode this start runs in, without writing anything.
+    ///
+    /// A network directory stays one whatever is asked, and it is recognised
+    /// by more than its record: a certificate or key file, or any principal,
+    /// credential or invite, makes it one even when the record is missing or
+    /// says local, so that removing a row cannot expose a network board
+    /// without TLS and authentication. A local directory becomes a network
+    /// one when `network` is asked for.
+    pub(crate) fn plan_mode(&self, network: bool) -> Result<ModePlan> {
+        let conn = self.conn();
+        let recorded = match identity::meta_get(&conn, identity::META_MODE)? {
             None => None,
             Some(text) => Some(Mode::parse(&text).ok_or_else(|| {
                 StoreError::Other("the database records an unknown mode".to_owned())
             })?),
         };
-        let (mode, upgraded) = match (recorded, network) {
-            (Some(Mode::Network), _) => (Mode::Network, false),
-            (Some(Mode::Local), true) => (Mode::Network, true),
-            (Some(Mode::Local), false) => (Mode::Local, false),
-            (None, true) => (Mode::Network, false),
-            (None, false) => (Mode::Local, false),
+        let evidence = tls_files_exist(&self.data_dir) || has_identities(&conn)?;
+        let (mode, change) = match (recorded, evidence, network) {
+            (Some(Mode::Network), _, _) => (Mode::Network, ModeChange::Keep),
+            (_, true, _) => (Mode::Network, ModeChange::Repair),
+            (Some(Mode::Local), false, true) => (Mode::Network, ModeChange::Upgrade),
+            (Some(Mode::Local), false, false) => (Mode::Local, ModeChange::Keep),
+            (None, false, true) => (Mode::Network, ModeChange::First),
+            (None, false, false) => (Mode::Local, ModeChange::First),
         };
-        if recorded != Some(mode) {
-            identity::meta_set(&tx, identity::META_MODE, mode.as_str())?;
+        let pinned = identity::meta_get(&conn, identity::META_FINGERPRINT)?.is_some();
+        Ok(ModePlan {
+            mode,
+            change,
+            pinned,
+        })
+    }
+
+    /// Commits what [`Store::plan_mode`] settled and records that a server
+    /// started, and where a network board can be reached, so the operator
+    /// functions can build invites. This is the one place a directory's mode
+    /// is written, and it runs only once the start can no longer fail for
+    /// another reason, such as a port that is taken.
+    pub(crate) fn record_start(
+        &self,
+        plan: &ModePlan,
+        endpoint: Option<(&str, &str)>,
+    ) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if plan.change != ModeChange::Keep {
+            identity::meta_set(&tx, identity::META_MODE, plan.mode.as_str())?;
         }
-        if upgraded {
+        let change = match plan.change {
+            ModeChange::Keep | ModeChange::First => None,
+            ModeChange::Upgrade => Some((log_kinds::MODE_UPGRADED, "local to network")),
+            ModeChange::Repair => Some((
+                log_kinds::MODE_REPAIRED,
+                "the mode record was missing or said local",
+            )),
+        };
+        if let Some((kind, detail)) = change {
             identity::log(
                 &tx,
                 &LogEntry {
-                    kind: log_kinds::MODE_UPGRADED,
-                    detail: Some("local to network"),
+                    kind,
+                    detail: Some(detail),
                     ..LogEntry::default()
                 },
             )?;
         }
-        tx.commit()?;
-        Ok((mode, upgraded))
-    }
-
-    /// Records that a server started, and where a network board can be
-    /// reached, so the operator functions can build invites.
-    pub(crate) fn record_start(&self, mode: Mode, endpoint: Option<(&str, &str)>) -> Result<()> {
-        let mut conn = self.conn();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some((url, fingerprint)) = endpoint {
             identity::meta_set(&tx, identity::META_URL, url)?;
             identity::meta_set(&tx, identity::META_FINGERPRINT, fingerprint)?;
@@ -380,7 +433,7 @@ impl Store {
             &tx,
             &LogEntry {
                 kind: log_kinds::SERVER_STARTED,
-                detail: Some(&format!("mode={}", mode.as_str())),
+                detail: Some(&format!("mode={}", plan.mode.as_str())),
                 ..LogEntry::default()
             },
         )?;
@@ -388,9 +441,31 @@ impl Store {
         Ok(())
     }
 
+    /// Removes security log entries beyond what `retention` keeps. Returns
+    /// how many were removed.
+    pub(crate) fn prune_log(&self, retention: &LogRetention) -> Result<u64> {
+        let max_age_ms = i64::try_from(retention.max_age.as_millis()).unwrap_or(i64::MAX);
+        let cutoff = rfc3339_from_ms(now_ms().saturating_sub(max_age_ms).max(0));
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let removed = identity::prune_log(&tx, &cutoff, retention.max_entries)?;
+        tx.commit()?;
+        Ok(removed)
+    }
+
     /// Resolves a token digest; see [`identity::authenticate`].
-    pub(crate) fn authenticate(&self, token_hash: &str) -> Result<AuthOutcome> {
-        Ok(identity::authenticate(&self.conn(), token_hash, now_ms())?)
+    pub(crate) fn authenticate(
+        &self,
+        token_hash: &str,
+        last_used_interval: Duration,
+    ) -> Result<AuthOutcome> {
+        let interval_ms = i64::try_from(last_used_interval.as_millis()).unwrap_or(i64::MAX);
+        Ok(identity::authenticate(
+            &self.conn(),
+            token_hash,
+            now_ms(),
+            interval_ms,
+        )?)
     }
 
     /// Whether the credential may still be used, read from the database.
@@ -833,9 +908,15 @@ impl Store {
 }
 
 /// The mode an existing data directory is in, read without locking,
-/// creating or changing anything. `None` when there is no readable board
-/// database there yet. A database from milestone M0 is a local one.
+/// creating or changing anything. `None` when nothing there says: no
+/// certificate and no readable board database. A database from milestone M0
+/// is a local one. Like [`Store::plan_mode`], it takes a directory with a
+/// certificate, a key or any agent for a network one whatever its record
+/// says.
 pub(crate) fn peek_mode(data_dir: &Path) -> Option<Mode> {
+    if tls_files_exist(data_dir) {
+        return Some(Mode::Network);
+    }
     let path = data_dir.join(DB_FILE_NAME);
     if !path.is_file() {
         return None;
@@ -851,11 +932,39 @@ pub(crate) fn peek_mode(data_dir: &Path) -> Option<Mode> {
         .ok()?;
     match version {
         1 => Some(Mode::Local),
-        SCHEMA_VERSION => identity::meta_get(&conn, identity::META_MODE)
-            .ok()?
-            .and_then(|text| Mode::parse(&text)),
+        SCHEMA_VERSION => mode_of(&conn, data_dir).ok()?,
         _ => None,
     }
+}
+
+/// The mode of a data directory whose database, at the current schema, is
+/// open on `conn`: the recorded one, except that a certificate, a key or
+/// any agent makes it a network one. `None` when nothing says.
+pub(crate) fn mode_of(conn: &Connection, data_dir: &Path) -> rusqlite::Result<Option<Mode>> {
+    let recorded =
+        identity::meta_get(conn, identity::META_MODE)?.and_then(|text| Mode::parse(&text));
+    if recorded != Some(Mode::Network) && (tls_files_exist(data_dir) || has_identities(conn)?) {
+        return Ok(Some(Mode::Network));
+    }
+    Ok(recorded)
+}
+
+/// Whether the directory holds a certificate or a key, in any state.
+fn tls_files_exist(data_dir: &Path) -> bool {
+    [CERT_FILE_NAME, KEY_FILE_NAME]
+        .iter()
+        .any(|name| std::fs::symlink_metadata(data_dir.join(name)).is_ok())
+}
+
+/// Whether the board has ever had a principal, a credential or an invite,
+/// none of which a local board can have.
+fn has_identities(conn: &Connection) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM principals) OR EXISTS (SELECT 1 FROM credentials)
+             OR EXISTS (SELECT 1 FROM invites)",
+        [],
+        |row| row.get(0),
+    )
 }
 
 /// The opaque cursor for position `seq` in the log of the board with `tag`.
@@ -977,7 +1086,8 @@ fn actor_from_row(row: &Row<'_>, at: usize) -> rusqlite::Result<Actor> {
 }
 
 /// Creates the data directory, readable only by its owner where the
-/// platform supports that.
+/// platform supports that. A directory that already exists is left as it
+/// is here; [`make_private`] deals with it.
 pub(crate) fn create_private_dir(path: &Path) -> std::io::Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
@@ -987,6 +1097,81 @@ pub(crate) fn create_private_dir(path: &Path) -> std::io::Result<()> {
         builder.mode(0o700);
     }
     builder.create(path)
+}
+
+/// Makes the data directory and the files that hold the board private to
+/// their owner, whoever created them and under whatever umask: the
+/// directory becomes 0700, and the database, its `-wal` and `-shm` side
+/// files and the lock file 0600. The database file is created here if it is
+/// missing, because SQLite would create it with the process umask, and
+/// SQLite gives the side files the mode of the database file.
+///
+/// A database path that is a symbolic link is refused: the board would
+/// otherwise write, and change the mode of, a file outside its directory.
+/// The data directory itself may be a symbolic link, which is a common way
+/// to keep it on another disk.
+///
+/// Does nothing where the platform has no such modes.
+fn make_private(data_dir: &Path) -> std::result::Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        // Removes group and other access. Returns whether there was any.
+        let restrict = |path: &Path, mode: u32| -> std::result::Result<bool, String> {
+            let failed =
+                |error: std::io::Error| format!("cannot restrict {}: {error}", path.display());
+            let current = std::fs::metadata(path)
+                .map_err(failed)?
+                .permissions()
+                .mode();
+            if current & 0o077 == 0 {
+                return Ok(false);
+            }
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+                .map_err(failed)?;
+            Ok(true)
+        };
+        let mut loose = restrict(data_dir, 0o700)?;
+
+        let database = data_dir.join(DB_FILE_NAME);
+        let is_link = |path: &Path| {
+            std::fs::symlink_metadata(path).is_ok_and(|found| found.file_type().is_symlink())
+        };
+        if is_link(&database) {
+            return Err(format!(
+                "{} is a symbolic link; the board database must be a file in the data directory",
+                database.display()
+            ));
+        }
+        OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&database)
+            .map_err(|error| format!("cannot create {}: {error}", database.display()))?;
+        for name in [
+            DB_FILE_NAME.to_owned(),
+            format!("{DB_FILE_NAME}-wal"),
+            format!("{DB_FILE_NAME}-shm"),
+            LOCK_FILE_NAME.to_owned(),
+        ] {
+            let path = data_dir.join(name);
+            if path.is_file() && !is_link(&path) {
+                loose |= restrict(&path, 0o600)?;
+            }
+        }
+        if loose {
+            eprintln!(
+                "openboard-server: {} or the database in it was accessible to other users; \
+                 restricting both to their owner",
+                data_dir.display()
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = data_dir;
+    Ok(())
 }
 
 /// Takes the exclusive lock that marks the data directory as served. The

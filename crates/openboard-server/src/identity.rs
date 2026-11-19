@@ -24,8 +24,6 @@ use crate::time::{now_rfc3339, rfc3339_from_ms};
 const SECRET_BYTES: usize = 32;
 /// The longest token the server will hash. Anything longer is malformed.
 const MAX_TOKEN_HEX: usize = 128;
-/// A credential's last-used time is rewritten at most this often.
-const LAST_USED_GRANULARITY_MS: i64 = 60_000;
 
 /// `meta` keys.
 pub(crate) const META_MODE: &str = "mode";
@@ -38,6 +36,10 @@ pub mod log_kinds {
     pub const SERVER_STARTED: &str = "server.started";
     /// A local data directory became a network one.
     pub const MODE_UPGRADED: &str = "mode.upgraded";
+    /// The data directory was plainly a network one, by its certificate or
+    /// its agents, while its recorded mode was missing or said local. The
+    /// record was put right and the board served as a network one.
+    pub const MODE_REPAIRED: &str = "mode.repaired";
     pub const INVITE_CREATED: &str = "invite.created";
     /// A pending invite was withdrawn when its principal was revoked.
     pub const INVITE_REVOKED: &str = "invite.revoked";
@@ -52,6 +54,9 @@ pub mod log_kinds {
     /// Failure entries were dropped for the rest of the minute because the
     /// log's budget for them was spent.
     pub const LOG_SUPPRESSED: &str = "log.suppressed";
+    /// Old entries were removed under the retention settings. The detail
+    /// holds how many.
+    pub const LOG_PRUNED: &str = "log.pruned";
 }
 
 /// `n` bytes from the operating system's random number generator, in hex.
@@ -175,6 +180,64 @@ pub(crate) fn log(conn: &Connection, entry: &LogEntry<'_>) -> rusqlite::Result<(
     Ok(())
 }
 
+const LOG_DELETE_TRIGGER: &str = "security_log_is_append_only_delete";
+
+/// Removes security log entries written before `cutoff`, an RFC 3339
+/// timestamp as the log stores them, and the oldest entries beyond the
+/// newest `max_entries`. When anything was removed, one
+/// [`log_kinds::LOG_PRUNED`] entry records how many. Returns that number.
+///
+/// The log is append-only: a trigger refuses every `DELETE`. This function
+/// is the one exception, and it is deliberate about it. It drops that
+/// trigger, deletes, and creates the trigger again exactly as the schema
+/// defines it. The caller runs it in one write transaction, so no other
+/// connection ever sees the log without its trigger, and a failure part-way
+/// rolls everything back.
+pub(crate) fn prune_log(
+    conn: &Connection,
+    cutoff: &str,
+    max_entries: u64,
+) -> rusqlite::Result<u64> {
+    let keep = i64::try_from(max_entries).unwrap_or(i64::MAX);
+    // The newest entry that is beyond the count, if the log is that long.
+    let overflow: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM security_log ORDER BY id DESC LIMIT 1 OFFSET ?1",
+            [keep],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let overflow = overflow.unwrap_or(0);
+    let doomed: i64 = conn.query_row(
+        "SELECT count(*) FROM security_log WHERE at < ?1 OR id <= ?2",
+        params![cutoff, overflow],
+        |row| row.get(0),
+    )?;
+    if doomed == 0 {
+        return Ok(0);
+    }
+    let definition: String = conn.query_row(
+        "SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = ?1",
+        [LOG_DELETE_TRIGGER],
+        |row| row.get(0),
+    )?;
+    conn.execute_batch(&format!("DROP TRIGGER {LOG_DELETE_TRIGGER}"))?;
+    let removed = conn.execute(
+        "DELETE FROM security_log WHERE at < ?1 OR id <= ?2",
+        params![cutoff, overflow],
+    )?;
+    conn.execute_batch(&definition)?;
+    log(
+        conn,
+        &LogEntry {
+            kind: log_kinds::LOG_PRUNED,
+            detail: Some(&format!("{removed} entries removed by retention")),
+            ..LogEntry::default()
+        },
+    )?;
+    Ok(removed as u64)
+}
+
 // ---------------------------------------------------------------------------
 // Credentials
 // ---------------------------------------------------------------------------
@@ -245,11 +308,13 @@ pub(crate) enum AuthOutcome {
 }
 
 /// Resolves a token digest to its credential and principal. A valid
-/// credential's last-used time is refreshed, at most once a minute.
+/// credential's last-used time is refreshed when it is at least
+/// `last_used_interval_ms` old, so that reads do not all become writes.
 pub(crate) fn authenticate(
     conn: &Connection,
     token_hash: &str,
     now_ms: i64,
+    last_used_interval_ms: i64,
 ) -> rusqlite::Result<AuthOutcome> {
     let found = conn
         .query_row(
@@ -269,7 +334,7 @@ pub(crate) fn authenticate(
     }
     let stale = credential
         .last_used_ms
-        .is_none_or(|last| now_ms.saturating_sub(last) >= LAST_USED_GRANULARITY_MS);
+        .is_none_or(|last| now_ms.saturating_sub(last) >= last_used_interval_ms);
     if stale {
         conn.execute(
             "UPDATE credentials SET last_used_ms = ?1 WHERE id = ?2",
@@ -484,6 +549,16 @@ pub(crate) fn list_pending_invites(
         })
     })?
     .collect()
+}
+
+/// Whether `code` has the shape of an enrolment code: [`SECRET_BYTES`] bytes
+/// in lowercase hex. Anything else cannot be one and is refused without
+/// touching the database.
+pub(crate) fn code_is_well_formed(code: &str) -> bool {
+    code.len() == SECRET_BYTES * 2
+        && code
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// Swaps an enrolment code for a new credential. The code is consumed by

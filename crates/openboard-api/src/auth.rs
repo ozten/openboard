@@ -153,9 +153,14 @@ impl Invite {
     }
 }
 
-/// Body of `POST /v1/join`. The endpoint takes no bearer token and is rate
-/// limited per client address. A wrong, expired or already used code gets
-/// [`crate::codes::INVITE_INVALID`] in every case.
+/// Body of `POST /v1/join`. The endpoint takes no bearer token. A wrong,
+/// expired or already used code gets [`crate::codes::INVITE_INVALID`] in
+/// every case.
+///
+/// Failed attempts are rate limited per client address: an address that has
+/// made too many gets [`crate::codes::RATE_LIMITED`] for further failures
+/// until the limit resets. A valid code is accepted regardless and does not
+/// count, so other clients behind the same address cannot be locked out.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JoinRequest {
     pub code: String,

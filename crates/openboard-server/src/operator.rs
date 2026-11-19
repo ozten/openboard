@@ -10,7 +10,7 @@
 //! seconds for a busy database, and never take the lock a server holds. A
 //! running server sees a revocation on its next request, and ends the
 //! long-polls and streams of the revoked credential within
-//! [`crate::Limits::credential_recheck`].
+//! [`crate::Limits::credential_recheck`], also when their reader has stalled.
 //!
 //! They block on disk I/O. Call them from a blocking context.
 //!
@@ -230,7 +230,7 @@ fn open(data_dir: &Path, write: bool) -> Result<(Connection, Schema)> {
     Ok((conn, schema))
 }
 
-fn info_of(conn: &Connection, schema: &Schema) -> Result<BoardInfo> {
+fn info_of(conn: &Connection, schema: &Schema, data_dir: &Path) -> Result<BoardInfo> {
     if matches!(schema, Schema::Old) {
         return Ok(BoardInfo {
             mode: Mode::Local,
@@ -238,9 +238,9 @@ fn info_of(conn: &Connection, schema: &Schema) -> Result<BoardInfo> {
             fingerprint: None,
         });
     }
-    let mode = identity::meta_get(conn, identity::META_MODE)?
-        .and_then(|text| Mode::parse(&text))
-        .unwrap_or(Mode::Local);
+    // As the server reads it: a directory with a certificate or any agent
+    // is a network one even if its mode record is missing.
+    let mode = crate::store::mode_of(conn, data_dir)?.unwrap_or(Mode::Local);
     let network = |key| -> Result<Option<String>> {
         Ok(match mode {
             Mode::Network => identity::meta_get(conn, key)?,
@@ -258,7 +258,7 @@ fn info_of(conn: &Connection, schema: &Schema) -> Result<BoardInfo> {
 /// Returns the connection with the board's recorded URL and fingerprint.
 fn open_network(data_dir: &Path) -> Result<(Connection, String, String)> {
     let (conn, schema) = open(data_dir, true)?;
-    match info_of(&conn, &schema)? {
+    match info_of(&conn, &schema, data_dir)? {
         BoardInfo {
             mode: Mode::Network,
             url: Some(url),
@@ -272,7 +272,7 @@ fn open_network(data_dir: &Path) -> Result<(Connection, String, String)> {
 /// fingerprint as recorded by the last server start.
 pub fn board_info(data_dir: &Path) -> Result<BoardInfo> {
     let (conn, schema) = open(data_dir, false)?;
-    info_of(&conn, &schema)
+    info_of(&conn, &schema, data_dir)
 }
 
 /// Creates a single-use invite for the agent `name`.
@@ -427,6 +427,10 @@ pub fn revoke_principal(data_dir: &Path, name: &str) -> Result<Revoked> {
 
 /// The security log, oldest entry first. With `limit`, only the newest
 /// `limit` entries. Empty for a directory no M1 server has opened yet.
+///
+/// A server trims the log to [`crate::Config::security_log`] when it starts
+/// and while it runs, and leaves a [`log_kinds::LOG_PRUNED`] entry when it
+/// removes anything. Nothing else can remove or change an entry.
 pub fn security_log(data_dir: &Path, limit: Option<u32>) -> Result<Vec<SecurityLogEntry>> {
     let (conn, schema) = open(data_dir, false)?;
     if matches!(schema, Schema::Old) {

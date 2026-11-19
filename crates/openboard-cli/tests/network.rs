@@ -46,6 +46,7 @@ impl NetBoard {
             auth_failures_per_minute: 100_000,
             max_waiters: 100,
             credential_recheck: Duration::from_millis(100),
+            ..Limits::default()
         };
         tweak(&mut config);
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();

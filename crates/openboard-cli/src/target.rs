@@ -46,6 +46,9 @@ pub struct Target {
     pub principal: Option<String>,
     pub credential_id: Option<String>,
     pub origin: Origin,
+    /// True when nothing chose this board: no URL was given and no login is
+    /// stored, so the local default is tried.
+    pub assumed: bool,
 }
 
 impl Target {
@@ -61,6 +64,7 @@ impl Target {
             principal: None,
             credential_id: None,
             origin: Origin::Local,
+            assumed: false,
         }
     }
 
@@ -73,6 +77,7 @@ impl Target {
             principal: None,
             credential_id: None,
             origin: Origin::Env,
+            assumed: false,
         }
     }
 
@@ -101,6 +106,7 @@ impl Target {
             principal: Some(login.principal.clone()),
             credential_id: Some(login.credential_id.clone()),
             origin: Origin::Stored(path),
+            assumed: false,
         })
     }
 }
@@ -209,6 +215,7 @@ pub fn resolve(
             principal: None,
             credential_id: None,
             origin: Origin::Env,
+            assumed: false,
         });
     }
 
@@ -220,7 +227,10 @@ pub fn resolve(
 
     let store = load()?;
     if wanted.url.is_none() && wanted.login.is_none() && store.logins.is_empty() {
-        return Ok(Target::local(DEFAULT_URL));
+        return Ok(Target {
+            assumed: true,
+            ..Target::local(DEFAULT_URL)
+        });
     }
     let matches: Vec<&Login> = store
         .logins
@@ -323,8 +333,14 @@ mod tests {
     #[test]
     fn nothing_given_and_nothing_stored_is_the_local_default() {
         let target = resolve(&wanted(None, None), store(Vec::new())).unwrap();
-        assert_eq!(target, Target::local(DEFAULT_URL));
+        assert_eq!(target.url, DEFAULT_URL);
+        assert_eq!(target.origin, Origin::Local);
         assert!(!target.is_network());
+        // Only this case is a guess. A URL that was given is not.
+        assert!(target.assumed);
+        let given = resolve(&wanted(Some(DEFAULT_URL), None), never).unwrap();
+        assert_eq!(given, Target::local(DEFAULT_URL));
+        assert!(!given.assumed);
     }
 
     #[test]

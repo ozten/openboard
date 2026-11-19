@@ -12,9 +12,12 @@
 //!
 //! The mode belongs to the data directory. A new directory takes the mode
 //! of its first start. A local directory started with [`Config::network`]
-//! becomes a network one for good, and a network directory is served in
-//! network mode whatever the configuration asks for, so it can never be
-//! reached without TLS and authentication.
+//! becomes a network one for good, once that start has its port, and a
+//! network directory is served in network mode whatever the configuration
+//! asks for, so it can never be reached without TLS and authentication. A
+//! directory counts as a network one when its record says so, and also when
+//! it holds a certificate or key file or any agent, credential or invite:
+//! losing the record does not turn it back into a local board.
 //!
 //! The server makes no outbound network calls and writes nothing but
 //! start-up and failure lines to stderr. Logs never contain message text,
@@ -54,15 +57,20 @@
 //!
 //! # Data directory
 //!
-//! The directory is created on first start, private to its owner on Unix.
-//! It holds:
+//! The directory is created on first start. On Unix it and the database
+//! files in it are private to their owner: a server that finds them
+//! accessible to anyone else, for example because the directory already
+//! existed, restricts them when it starts and says so on stderr. The
+//! database file must not be a symbolic link; the directory may be one. It
+//! holds:
 //!
 //! - [`DB_FILE_NAME`]: one SQLite database in WAL mode, plus SQLite's `-wal`
 //!   and `-shm` side files while it is open. It holds the boards, the
 //!   principals, credentials and invites (tokens and codes only as SHA-256
 //!   digests), the security log, the mode, and the URL and fingerprint the
 //!   last network start recorded. A database written by an older version is
-//!   migrated forward when a server opens it.
+//!   migrated forward when a server opens it. The security log is trimmed
+//!   to [`Config::security_log`].
 //! - [`LOCK_FILE_NAME`]: see below.
 //! - [`CERT_FILE_NAME`] and [`KEY_FILE_NAME`], on a network board: the
 //!   self-signed certificate and its private key in PEM. They are created
@@ -96,12 +104,13 @@ mod identity;
 mod limits;
 mod names;
 pub mod operator;
+mod serve;
 mod store;
 mod time;
 mod tls;
 
 pub use chain::{verify_log, BoardReport, BrokenEntry, VerifyError, VerifyReport};
-pub use limits::Limits;
+pub use limits::{Limits, LogRetention};
 pub use store::{DB_FILE_NAME, LOCK_FILE_NAME};
 pub use tls::{CERT_FILE_NAME, KEY_FILE_NAME};
 
@@ -182,8 +191,11 @@ pub struct Config {
     /// only possible when `bind` is a specific address: with `0.0.0.0` or
     /// `::` this must be given, or the server refuses to start.
     pub public_url: Option<String>,
-    /// Network mode: rate limits.
+    /// Rate limits, connection limits and timeouts. The connection limits
+    /// and timeouts apply in both modes, the rest in network mode.
     pub limits: Limits,
+    /// How long the security log is kept, in both modes.
+    pub security_log: LogRetention,
 }
 
 impl Config {
@@ -198,8 +210,8 @@ impl Config {
 
 impl Default for Config {
     /// [`DEFAULT_DATA_DIR`], `127.0.0.1`, [`openboard_api::DEFAULT_PORT`],
-    /// [`openboard_api::DEFAULT_MAX_MESSAGE_CHARS`], local mode and the
-    /// default [`Limits`].
+    /// [`openboard_api::DEFAULT_MAX_MESSAGE_CHARS`], local mode, the default
+    /// [`Limits`] and the default [`LogRetention`].
     fn default() -> Self {
         Self {
             data_dir: PathBuf::from(DEFAULT_DATA_DIR),
@@ -209,6 +221,7 @@ impl Default for Config {
             network: false,
             public_url: None,
             limits: Limits::default(),
+            security_log: LogRetention::default(),
         }
     }
 }
@@ -283,14 +296,13 @@ impl std::error::Error for ServeError {
     }
 }
 
-enum BoardListener {
-    Plain(TcpListener),
-    Tls(tls::TlsListener),
-}
-
 /// A bound server that has not started answering requests yet.
 pub struct Server {
-    listener: BoardListener,
+    listener: TcpListener,
+    /// Set on a network board, where every connection starts with TLS.
+    tls: Option<Arc<rustls::ServerConfig>>,
+    limits: Limits,
+    maintenance: http::Maintenance,
     local_addr: SocketAddr,
     mode: Mode,
     url: String,
@@ -339,7 +351,8 @@ impl Server {
     }
 
     /// Answers requests until `shutdown` completes, then stops gracefully:
-    /// open long-polls return and event streams end.
+    /// open long-polls return and event streams end. A client that has
+    /// stopped reading its response is cut off after a few seconds.
     ///
     /// When this returns, storage work that was still in flight has finished
     /// and the data directory is free for another server.
@@ -349,35 +362,30 @@ impl Server {
     ) -> Result<(), ServeError> {
         let stop = self.stop;
         let mut released = self.released;
-        let service = self
-            .router
-            .into_make_service_with_connect_info::<tls::ClientAddr>();
+        let stopping = stop.subscribe();
+        tokio::spawn(self.maintenance.run(stopping.clone()));
+        let serving = serve::serve(
+            self.listener,
+            self.tls.map(tokio_rustls::TlsAcceptor::from),
+            self.router,
+            self.limits,
+            stopping,
+        );
         let shutdown = async move {
             shutdown.await;
             stop.send_replace(true);
         };
-        let served = match self.listener {
-            BoardListener::Plain(listener) => {
-                axum::serve(listener, service)
-                    .with_graceful_shutdown(shutdown)
-                    .await
-            }
-            BoardListener::Tls(listener) => {
-                axum::serve(listener, service)
-                    .with_graceful_shutdown(shutdown)
-                    .await
-            }
-        }
-        .map_err(ServeError::Io);
+        tokio::join!(serving, shutdown);
         // A write whose client went away, or a stream noticing the shutdown,
         // can outlive its connection for a moment. Wait until the store is
         // closed, which is when every sender is gone.
         while released.recv().await.is_some() {}
-        served
+        Ok(())
     }
 }
 
 /// Opens the data directory and binds the listener without serving yet.
+/// Connections wait in the system's queue until [`Server::run`].
 ///
 /// The board runs in network mode when [`Config::network`] is set or the
 /// data directory is already a network one, and in local mode otherwise;
@@ -438,59 +446,64 @@ async fn bind_inner(
             other => ServeError::Storage(other.to_string()),
         })?;
         let storage = |error: store::StoreError| ServeError::Storage(error.to_string());
-        // The mode is settled under the data directory lock. It can only be
-        // more strict than what was read above.
-        let (mode, _upgraded) = store.establish_mode(network).map_err(storage)?;
-        if mode == Mode::Local && !bind_ip.is_loopback() {
+        // The mode is settled under the data directory lock, and only
+        // settled: nothing records it yet. It can only be more strict than
+        // what was read above.
+        let plan = store.plan_mode(network).map_err(storage)?;
+        if plan.mode == Mode::Local && !bind_ip.is_loopback() {
             return Err(ServeError::NonLoopbackBind(bind_ip));
         }
-        let identity = match mode {
-            Mode::Local => None,
-            Mode::Network => {
-                Some(tls::load_or_create(&data_dir, bind_ip).map_err(ServeError::Tls)?)
-            }
-        };
         // The default board always exists, so a fresh board can be read and
         // waited on before anything is posted.
         store
             .ensure_board(openboard_api::DEFAULT_BOARD)
             .map_err(storage)?;
-        Ok((store, mode, identity))
+        Ok((store, plan))
     })
     .await
     .map_err(|error| ServeError::Storage(error.to_string()))?;
-    let (store, mode, identity) = opened?;
+    let (store, plan) = opened?;
+    let mode = plan.mode;
 
+    // The port comes before anything that makes the directory a network
+    // one. A start that fails here leaves a local directory local.
     let addr = SocketAddr::new(config.bind, config.port);
     let listener = TcpListener::bind(addr)
         .await
         .map_err(|source| ServeError::Bind { addr, source })?;
     let local_addr = listener.local_addr().map_err(ServeError::Io)?;
 
-    let (listener, url, fingerprint) = match identity {
-        None => (
-            BoardListener::Plain(listener),
-            format!("http://{local_addr}"),
-            None,
-        ),
-        Some(identity) => (
-            BoardListener::Tls(
-                tls::TlsListener::new(listener, identity.config).map_err(ServeError::Io)?,
+    let (data_dir, bind_ip, retention) = (
+        config.data_dir.clone(),
+        config.bind,
+        config.security_log.clone(),
+    );
+    let started = tokio::task::spawn_blocking(move || {
+        let storage = |error: store::StoreError| ServeError::Storage(error.to_string());
+        let identity = match mode {
+            Mode::Local => None,
+            Mode::Network => Some(
+                tls::load_or_create(&data_dir, bind_ip, plan.pinned).map_err(ServeError::Tls)?,
             ),
-            public_url.unwrap_or_else(|| format!("https://{local_addr}")),
-            Some(identity.fingerprint),
-        ),
-    };
-    let (recorded_url, recorded_fingerprint) = (url.clone(), fingerprint.clone());
-    let store = tokio::task::spawn_blocking(move || {
-        let endpoint = recorded_fingerprint
-            .as_deref()
-            .map(|fingerprint| (recorded_url.as_str(), fingerprint));
-        store.record_start(mode, endpoint).map(|()| store)
+        };
+        let url = match &identity {
+            None => format!("http://{local_addr}"),
+            Some(_) => public_url.unwrap_or_else(|| format!("https://{local_addr}")),
+        };
+        let endpoint = identity
+            .as_ref()
+            .map(|identity| (url.as_str(), identity.fingerprint.as_str()));
+        store.record_start(&plan, endpoint).map_err(storage)?;
+        store.prune_log(&retention).map_err(storage)?;
+        Ok((store, identity, url))
     })
     .await
-    .map_err(|error| ServeError::Storage(error.to_string()))?
     .map_err(|error| ServeError::Storage(error.to_string()))?;
+    let (store, identity, url) = started?;
+    let (tls, fingerprint) = match identity {
+        None => (None, None),
+        Some(identity) => (Some(identity.config), Some(identity.fingerprint)),
+    };
 
     let policy = policy.unwrap_or_else(|| match mode {
         Mode::Local => Arc::new(authz::LocalPolicy),
@@ -498,17 +511,21 @@ async fn bind_inner(
     });
     let (stop, stopping) = watch::channel(false);
     let (in_use, released) = mpsc::channel(1);
-    let router = http::router(http::Parts {
+    let (router, maintenance) = http::router(http::Parts {
         store,
         authz: authz::Authorizer::new(policy),
         mode,
         max_message_chars: config.max_message_chars,
-        limits: config.limits,
+        limits: config.limits.clone(),
+        retention: config.security_log,
         shutdown: stopping,
         in_use,
     });
     Ok(Server {
         listener,
+        tls,
+        limits: config.limits,
+        maintenance,
         local_addr,
         mode,
         url,

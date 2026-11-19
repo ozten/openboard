@@ -1,5 +1,6 @@
-//! TLS for network mode: the board's self-signed certificate and a listener
-//! that speaks TLS 1.3 and nothing else.
+//! TLS for network mode: the board's self-signed certificate, and a server
+//! configuration that speaks TLS 1.3 and nothing else. The listener that
+//! uses it is in `serve`.
 //!
 //! Clients pin the certificate by fingerprint (see `openboard_api::auth`),
 //! so no certificate authority is involved and the names in the certificate
@@ -7,34 +8,20 @@
 
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
-use axum::extract::connect_info::Connected;
-use axum::serve::IncomingStream;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
 use sha2::{Digest, Sha256};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Semaphore};
-use tokio::task::JoinHandle;
-use tokio_rustls::server::TlsStream;
-use tokio_rustls::TlsAcceptor;
 
 /// File name of the board's certificate inside the data directory.
 pub const CERT_FILE_NAME: &str = "tls-cert.pem";
 /// File name of the certificate's private key inside the data directory.
 /// Readable only by its owner.
 pub const KEY_FILE_NAME: &str = "tls-key.pem";
-
-/// A client must finish its TLS handshake within this time.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-/// Handshakes in progress at once. Further connections wait in the system's
-/// accept queue, so slow clients cannot pile up unbounded work.
-const MAX_HANDSHAKES: usize = 256;
 
 pub(crate) struct TlsIdentity {
     pub config: Arc<ServerConfig>,
@@ -45,12 +32,24 @@ pub(crate) struct TlsIdentity {
 /// Loads the board's certificate and key from the data directory, creating
 /// them on the first network start. `bind` only adds a name to a new
 /// certificate. Blocks on disk I/O.
-pub(crate) fn load_or_create(data_dir: &Path, bind: IpAddr) -> Result<TlsIdentity, String> {
+///
+/// `pinned` says whether a fingerprint was ever recorded for this board,
+/// which a network start does once it has its certificate. Until then no
+/// client can have pinned anything, so a key without a certificate, which is
+/// what a crash in the middle of [`generate`] leaves, is replaced by a new
+/// pair. Afterwards half a pair is an error for the operator to resolve,
+/// because a new certificate would silently change the pin.
+pub(crate) fn load_or_create(
+    data_dir: &Path,
+    bind: IpAddr,
+    pinned: bool,
+) -> Result<TlsIdentity, String> {
     let cert_path = data_dir.join(CERT_FILE_NAME);
     let key_path = data_dir.join(KEY_FILE_NAME);
     match (cert_path.is_file(), key_path.is_file()) {
         (true, true) => {}
         (false, false) => generate(data_dir, bind)?,
+        (false, true) if !pinned => generate(data_dir, bind)?,
         (true, false) => {
             return Err(format!(
                 "{} exists but {} is missing; restore the key, or remove the certificate to \
@@ -111,8 +110,11 @@ fn generate(data_dir: &Path, bind: IpAddr) -> Result<(), String> {
     params.distinguished_name = subject;
     let cert = params.self_signed(&key).map_err(failed)?;
 
-    // The key is written first and the certificate last, each under a
-    // temporary name, so a crash leaves either nothing or a complete pair.
+    // Each file is written under a temporary name and renamed, so neither is
+    // ever seen half-written. The key comes first and the certificate last:
+    // a crash between the two leaves a key without a certificate, never a
+    // certificate that could be pinned without its key, and the next start
+    // replaces that key (see `load_or_create`).
     write_private(
         &data_dir.join(KEY_FILE_NAME),
         key.serialize_pem().as_bytes(),
@@ -170,106 +172,34 @@ fn restrict_to_owner(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// The address of the client behind a request.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct ClientAddr(pub SocketAddr);
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl Connected<IncomingStream<'_, TlsListener>> for ClientAddr {
-    fn connect_info(stream: IncomingStream<'_, TlsListener>) -> Self {
-        ClientAddr(*stream.remote_addr())
-    }
-}
+    #[test]
+    fn a_key_left_by_an_interrupted_first_start_is_replaced() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path().to_path_buf();
+        let bind = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let key_path = dir.join(KEY_FILE_NAME);
+        let cert_path = dir.join(CERT_FILE_NAME);
 
-impl Connected<IncomingStream<'_, TcpListener>> for ClientAddr {
-    fn connect_info(stream: IncomingStream<'_, TcpListener>) -> Self {
-        ClientAddr(*stream.remote_addr())
-    }
-}
+        // What a crash between the two writes leaves behind.
+        std::fs::write(&key_path, "half a pair").unwrap();
+        let first = load_or_create(&dir, bind, false)
+            .unwrap_or_else(|error| panic!("a new pair is made: {error}"));
+        assert!(cert_path.is_file());
+        assert_ne!(std::fs::read(&key_path).unwrap(), b"half a pair");
+        // The pair is then kept.
+        let again = load_or_create(&dir, bind, false).unwrap();
+        assert_eq!(again.fingerprint, first.fingerprint);
 
-/// Accepts TCP connections and hands over only those that complete a TLS
-/// handshake. Handshakes run beside the accept loop, so a slow or silent
-/// client delays nobody else. A connection that does not speak TLS 1.3,
-/// plain HTTP included, is dropped and never reaches a handler.
-pub(crate) struct TlsListener {
-    ready: mpsc::Receiver<(TlsStream<TcpStream>, SocketAddr)>,
-    local_addr: SocketAddr,
-    accepting: JoinHandle<()>,
-}
-
-impl TlsListener {
-    pub(crate) fn new(tcp: TcpListener, config: Arc<ServerConfig>) -> std::io::Result<Self> {
-        let local_addr = tcp.local_addr()?;
-        let (tx, ready) = mpsc::channel(64);
-        let accepting = tokio::spawn(accept_loop(tcp, TlsAcceptor::from(config), tx));
-        Ok(Self {
-            ready,
-            local_addr,
-            accepting,
-        })
-    }
-}
-
-impl Drop for TlsListener {
-    fn drop(&mut self) {
-        // Stops accepting and closes the socket.
-        self.accepting.abort();
-    }
-}
-
-async fn accept_loop(
-    tcp: TcpListener,
-    acceptor: TlsAcceptor,
-    ready: mpsc::Sender<(TlsStream<TcpStream>, SocketAddr)>,
-) {
-    let handshakes = Arc::new(Semaphore::new(MAX_HANDSHAKES));
-    loop {
-        let Ok(permit) = Arc::clone(&handshakes).acquire_owned().await else {
-            return;
-        };
-        let (stream, addr) = match tcp.accept().await {
-            Ok(accepted) => accepted,
-            Err(error) => {
-                use std::io::ErrorKind;
-                let transient = matches!(
-                    error.kind(),
-                    ErrorKind::ConnectionRefused
-                        | ErrorKind::ConnectionAborted
-                        | ErrorKind::ConnectionReset
-                );
-                if !transient {
-                    // Usually the process is out of file descriptors. Wait
-                    // for some to free up rather than spin.
-                    eprintln!("openboard-server: cannot accept a connection: {error}");
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
-                continue;
-            }
-        };
-        let _ = stream.set_nodelay(true);
-        let (acceptor, ready) = (acceptor.clone(), ready.clone());
-        tokio::spawn(async move {
-            let _permit = permit;
-            let handshake = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await;
-            if let Ok(Ok(tls)) = handshake {
-                let _ = ready.send((tls, addr)).await;
-            }
-        });
-    }
-}
-
-impl axum::serve::Listener for TlsListener {
-    type Io = TlsStream<TcpStream>;
-    type Addr = SocketAddr;
-
-    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-        match self.ready.recv().await {
-            Some(connection) => connection,
-            // The accept loop only ends when this listener is dropped.
-            None => std::future::pending().await,
-        }
-    }
-
-    fn local_addr(&self) -> std::io::Result<Self::Addr> {
-        Ok(self.local_addr)
+        // Once clients may have pinned the certificate, losing it is an
+        // error, not a reason to make another.
+        let key = std::fs::read(&key_path).unwrap();
+        std::fs::remove_file(&cert_path).unwrap();
+        assert!(load_or_create(&dir, bind, true).is_err());
+        assert_eq!(std::fs::read(&key_path).unwrap(), key);
+        assert!(!cert_path.exists());
     }
 }

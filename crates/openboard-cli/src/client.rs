@@ -48,6 +48,22 @@ pub struct Client {
     fingerprint: Option<String>,
     /// What the certificate verifier decided, for error reports.
     verdict: Arc<Verdict>,
+    /// See [`Target::assumed`].
+    assumed: bool,
+}
+
+/// What to do about a local board that cannot be reached. When the board
+/// was only assumed, because no URL was given and no login is stored, the
+/// caller may have meant a network board it has not joined, or has logged
+/// out of.
+fn local_unreachable_hint(assumed: bool) -> &'static str {
+    if assumed {
+        "start a board with `openboard serve`, or run `openboard join <invite>` to use a \
+         network board: no login is stored and no --url (or BOARD_URL) was given, so the \
+         local default was tried"
+    } else {
+        "start a board with `openboard serve`, or point --url (or BOARD_URL) at a running board"
+    }
 }
 
 impl Client {
@@ -106,6 +122,7 @@ impl Client {
             token,
             fingerprint: target.fingerprint.clone().filter(|_| network),
             verdict,
+            assumed: target.assumed,
         })
     }
 
@@ -297,10 +314,7 @@ impl Client {
                 codes::CONNECTION_FAILED,
                 format!("cannot reach a board at {base}: {cause}"),
             )
-            .next(
-                "start a board with `openboard serve`, or point --url (or BOARD_URL) at a \
-                 running board",
-            )
+            .next(local_unreachable_hint(self.assumed))
         } else if error.is_timeout() {
             Failure::new(
                 codes::REQUEST_TIMEOUT,
@@ -519,7 +533,40 @@ mod tests {
             principal: None,
             credential_id: None,
             origin: Origin::Local,
+            assumed: false,
         }
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_assumed_board_points_at_join_as_well_as_serve() {
+        tls::install_provider();
+        // A port nothing listens on: bound, then closed again.
+        let port = {
+            let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            taken.local_addr().unwrap().port()
+        };
+        let url = format!("http://127.0.0.1:{port}");
+        let hint_for = |assumed: bool| {
+            let target = Target {
+                assumed,
+                ..target(&url, None, None)
+            };
+            let client = Client::new(&target, "general", None).unwrap();
+            async move {
+                let failure = client.channels().await.unwrap_err();
+                assert_eq!(failure.code, codes::CONNECTION_FAILED);
+                failure.next.unwrap()
+            }
+        };
+        let given = hint_for(false).await;
+        assert!(given.starts_with("start a board with `openboard serve`"));
+        assert!(given.contains("--url"), "{given}");
+        assert!(!given.contains("openboard join"), "{given}");
+        // After the last login is gone, or before the first join.
+        let assumed = hint_for(true).await;
+        assert!(assumed.starts_with("start a board with `openboard serve`"));
+        assert!(assumed.contains("`openboard join <invite>`"), "{assumed}");
+        assert!(!assumed.contains(". "), "one sentence: {assumed}");
     }
 
     fn local(url: &str, board: &str) -> Result<Client, Failure> {
