@@ -34,6 +34,20 @@ pub mod codes {
     pub const SERVE_FAILED: &str = "serve_failed";
     /// Reading stdin or writing output failed.
     pub const IO: &str = "io";
+    /// The board did not prove it is the one this client pinned: it showed
+    /// another certificate, or could not sign with the pinned one's key.
+    pub const CERTIFICATE_MISMATCH: &str = "certificate_mismatch";
+    /// Several stored logins match and none was chosen. Exit code 2.
+    pub const AMBIGUOUS_LOGIN: &str = "ambiguous_login";
+    /// The login file can be read by other users.
+    pub const INSECURE_LOGIN_FILE: &str = "insecure_login_file";
+    /// The login file cannot be read, parsed or written.
+    pub const LOGIN_FILE: &str = "login_file";
+    /// An operator command was run on a data directory that is not a
+    /// network board yet.
+    pub const NOT_NETWORK: &str = "not_network";
+    /// An operator command could not use the data directory.
+    pub const OPERATOR_FAILED: &str = "operator_failed";
 }
 
 /// A failed command.
@@ -45,6 +59,8 @@ pub struct Failure {
     pub next: Option<String>,
     /// Where `wait` or `tail` can resume, when the command got that far.
     pub cursor: Option<String>,
+    /// Seconds the board asked the caller to wait, on `rate_limited`.
+    pub retry_after: Option<u64>,
     pub exit: u8,
     /// The command already wrote its stdout document (or must not write one),
     /// so no JSON error object follows.
@@ -60,6 +76,7 @@ impl Failure {
             message: message.into(),
             next: None,
             cursor: None,
+            retry_after: None,
             exit: EXIT_FAILURE,
             no_stdout: false,
             no_stderr: false,

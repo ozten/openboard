@@ -32,6 +32,9 @@ impl Board {
     }
 
     async fn start_with(tweak: impl FnOnce(&mut Config), policy: Option<Arc<dyn Policy>>) -> Self {
+        // The network tests in this crate enable reqwest's TLS support,
+        // which then wants a crypto provider even for plain HTTP clients.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let dir = TempDir::new().unwrap();
         let mut config = Config::new(dir.path().join("data"));
         config.port = 0;

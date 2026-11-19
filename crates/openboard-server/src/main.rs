@@ -6,16 +6,28 @@ use std::process::ExitCode;
 use openboard_server::{verify_log, Config};
 
 const USAGE: &str = "\
-obd: the Openboard server (local mode)
+obd: the Openboard server
 
 Usage:
-  obd [serve] [options]      Run a board on a loopback address
+  obd [serve] [options]      Run a board
   obd verify-log [options]   Check every board's event hash chain offline
+
+A board is local or networked. A local board speaks plain HTTP on a loopback
+address and has no authentication. A network board speaks TLS 1.3 only, with
+a self-signed certificate that clients pin by its fingerprint, and needs a
+token on every request; agents are enrolled with invites created on this
+host. --network turns a data directory into a network board for good: it is
+served with TLS and authentication from then on, with or without the flag.
 
 Options:
   --data-dir <dir>             Data directory (default: .openboard)
-  --bind <ip>                  Loopback address to listen on (default: 127.0.0.1)
+  --bind <ip>                  Address to listen on (default: 127.0.0.1).
+                               Anything but loopback needs a network board
   --port <port>                TCP port (default: 7878)
+  --network                    Run a network board
+  --public-url <url>           Network board: the https:// URL clients use,
+                               put into invites (default: https://<bind>:<port>;
+                               required with --bind 0.0.0.0 or ::)
   --max-message-chars <n>      Longest message, in characters (default: 10000)
   -h, --help                   Show this help
   -V, --version                Show the version
@@ -49,6 +61,9 @@ fn parse_args(args: Vec<String>) -> Result<Option<(Command, Config)>, String> {
             }
             _ => (arg, None),
         };
+        if inline.is_some() && flag == "--network" {
+            return Err("--network takes no value".to_owned());
+        }
         let mut value = || {
             inline
                 .clone()
@@ -75,6 +90,8 @@ fn parse_args(args: Vec<String>) -> Result<Option<(Command, Config)>, String> {
                     .parse()
                     .map_err(|_| "--port needs a number from 0 to 65535".to_owned())?;
             }
+            "--network" => config.network = true,
+            "--public-url" => config.public_url = Some(value()?),
             "--max-message-chars" => {
                 config.max_message_chars = value()?
                     .parse()
@@ -115,10 +132,16 @@ fn run_server(config: Config) -> ExitCode {
     let result = runtime.block_on(async {
         let server = openboard_server::bind(config.clone()).await?;
         eprintln!(
-            "obd: local board listening on http://{} (data in {})",
+            "obd: {} board listening on {} (data in {})",
+            server.mode(),
             server.local_addr(),
             config.data_dir.display()
         );
+        eprintln!("obd: url {}", server.url());
+        // The fingerprint is public: it is what clients pin.
+        if let Some(fingerprint) = server.fingerprint() {
+            eprintln!("obd: certificate fingerprint {fingerprint}");
+        }
         server.run(shutdown_signal()).await
     });
     match result {

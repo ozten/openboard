@@ -97,13 +97,22 @@ impl Drop for Board {
     }
 }
 
-/// The built binary with a clean environment and no stdin.
+/// The built binary with a clean environment and no stdin. Its configuration
+/// directory does not exist, so it has no stored logins and never reads the
+/// real user's.
 fn openboard() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_openboard"));
     command
         .env_remove("BOARD_URL")
         .env_remove("BOARD_NAME")
         .env_remove("BOARD_AS")
+        .env_remove("BOARD_LOGIN")
+        .env_remove("BOARD_TOKEN")
+        .env_remove("BOARD_FINGERPRINT")
+        .env(
+            "OPENBOARD_CONFIG_DIR",
+            std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("no-such-config"),
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

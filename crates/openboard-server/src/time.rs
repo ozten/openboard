@@ -10,6 +10,19 @@ pub(crate) fn now_rfc3339() -> String {
     format_rfc3339(since_epoch.as_secs() as i64, since_epoch.subsec_millis())
 }
 
+/// Milliseconds since the Unix epoch.
+pub(crate) fn now_ms() -> i64 {
+    let since_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    i64::try_from(since_epoch.as_millis()).unwrap_or(i64::MAX)
+}
+
+/// Formats milliseconds since the Unix epoch like [`now_rfc3339`].
+pub(crate) fn rfc3339_from_ms(ms: i64) -> String {
+    format_rfc3339(ms.div_euclid(1000), ms.rem_euclid(1000) as u32)
+}
+
 /// Formats seconds since the Unix epoch as `YYYY-MM-DDTHH:MM:SS.mmmZ`.
 pub(crate) fn format_rfc3339(secs: i64, millis: u32) -> String {
     let days = secs.div_euclid(86_400);

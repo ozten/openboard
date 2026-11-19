@@ -3,28 +3,36 @@
 
 use std::fmt;
 use std::fs::{File, OpenOptions, TryLockError};
+use std::net::IpAddr;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
-use openboard_api::{
-    event_types, Actor, ActorKind, ChannelInfo, Event, Message, Thread, ThreadSummary,
-};
+use openboard_api::{event_types, Actor, ChannelInfo, Event, Message, Thread, ThreadSummary};
 use rusqlite::types::Value;
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row, TransactionBehavior};
+use rusqlite::{
+    params, params_from_iter, Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior,
+};
 
-use crate::chain::{event_hash, EventFields, GENESIS_HASH};
+use crate::chain::{event_hash, EventFields, GENESIS_HASH, HASH_VERSION};
+use crate::identity::{
+    self, actor_kind_name, log_kinds, parse_actor_kind, AuthOutcome, Credential, LogEntry,
+};
 use crate::names::{board_key, ChannelSel};
-use crate::time::now_rfc3339;
+use crate::time::{now_ms, now_rfc3339};
+use crate::Mode;
 
 /// File name of the board database inside the data directory.
 pub const DB_FILE_NAME: &str = "openboard.db";
 /// File name of the lock a running server holds on the data directory.
 pub const LOCK_FILE_NAME: &str = "openboard.lock";
 
-const SCHEMA_VERSION: i64 = 1;
+pub(crate) const SCHEMA_VERSION: i64 = 2;
 
-const SCHEMA: &str = "
+/// The schema milestone M0 shipped, `user_version` 1. It is never edited:
+/// later versions are reached by running the migrations below on top of it,
+/// for a new database exactly as for an old one.
+const SCHEMA_V1: &str = "
 CREATE TABLE boards (
     id         INTEGER PRIMARY KEY,
     name       TEXT NOT NULL,
@@ -97,8 +105,64 @@ CREATE TABLE idempotency (
 ) WITHOUT ROWID;
 ";
 
-const MESSAGE_COLUMNS: &str =
-    "m.id, m.channel, m.thread_id, m.text, m.created_at, m.revision, a.id, a.kind, a.handle, a.profile";
+/// From `user_version` 1 to 2: modes, principals, credentials, invites, the
+/// security log, and the credential behind each message and event. Events
+/// written before this keep hash encoding 1.
+const MIGRATE_V1_TO_V2: &str = "
+CREATE TABLE meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+) WITHOUT ROWID;
+CREATE TABLE principals (
+    id         TEXT PRIMARY KEY,
+    kind       TEXT NOT NULL,
+    handle     TEXT NOT NULL,
+    handle_key TEXT NOT NULL UNIQUE,
+    created_ms INTEGER NOT NULL
+);
+CREATE TABLE credentials (
+    id           TEXT PRIMARY KEY,
+    principal_id TEXT NOT NULL REFERENCES principals(id),
+    token_hash   TEXT NOT NULL UNIQUE,
+    created_ms   INTEGER NOT NULL,
+    expires_ms   INTEGER NOT NULL,
+    revoked_ms   INTEGER,
+    last_used_ms INTEGER
+);
+CREATE INDEX credentials_by_principal ON credentials(principal_id);
+CREATE TABLE invites (
+    id           TEXT PRIMARY KEY,
+    principal_id TEXT NOT NULL REFERENCES principals(id),
+    code_hash    TEXT NOT NULL UNIQUE,
+    token_ttl_ms INTEGER NOT NULL,
+    created_ms   INTEGER NOT NULL,
+    expires_ms   INTEGER NOT NULL,
+    used_ms      INTEGER,
+    revoked_ms   INTEGER
+);
+CREATE INDEX invites_by_principal ON invites(principal_id);
+CREATE TABLE security_log (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    at            TEXT NOT NULL,
+    kind          TEXT NOT NULL,
+    principal     TEXT,
+    credential_id TEXT,
+    client        TEXT,
+    detail        TEXT
+);
+CREATE TRIGGER security_log_is_append_only_update BEFORE UPDATE ON security_log
+BEGIN SELECT RAISE(ABORT, 'the security log is append-only'); END;
+CREATE TRIGGER security_log_is_append_only_delete BEFORE DELETE ON security_log
+BEGIN SELECT RAISE(ABORT, 'the security log is append-only'); END;
+ALTER TABLE messages ADD COLUMN credential_id TEXT;
+ALTER TABLE events ADD COLUMN credential_id TEXT;
+ALTER TABLE events ADD COLUMN hash_version INTEGER NOT NULL DEFAULT 1;
+";
+
+const MESSAGE_COLUMNS: &str = "m.id, m.channel, m.thread_id, m.text, m.created_at, m.revision, \
+                               a.id, a.kind, a.handle, a.profile, m.credential_id";
+/// Number of columns in [`MESSAGE_COLUMNS`].
+const MESSAGE_COLUMN_COUNT: usize = 11;
 
 #[derive(Debug)]
 pub(crate) enum StoreError {
@@ -159,6 +223,8 @@ pub(crate) struct NewPost {
     pub actor: Actor,
     /// The principal behind `actor`.
     pub principal_id: String,
+    /// The credential the caller authenticated with. `None` on a local board.
+    pub credential_id: Option<String>,
     pub text: String,
     /// Key and request fingerprint.
     pub idempotency: Option<(String, String)>,
@@ -178,6 +244,8 @@ pub(crate) struct EventFilter {
     pub channel: Option<ChannelSel>,
     pub thread: Option<String>,
     pub not_from: Option<String>,
+    /// Skip events written by the actor with this ID.
+    pub not_from_actor: Option<String>,
 }
 
 pub(crate) struct EventPage {
@@ -224,12 +292,20 @@ impl Store {
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
 
+        // Migrations are forward-only and run here, in one transaction, so
+        // a database is either at the old version or fully at the new one.
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let version: i64 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         match version {
             0 => {
-                tx.execute_batch(SCHEMA)?;
-                tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                // A new database. Its mode is decided by the first start.
+                tx.execute_batch(SCHEMA_V1)?;
+                tx.execute_batch(MIGRATE_V1_TO_V2)?;
+            }
+            1 => {
+                // Milestone M0 knew only local mode.
+                tx.execute_batch(MIGRATE_V1_TO_V2)?;
+                identity::meta_set(&tx, identity::META_MODE, Mode::Local.as_str())?;
             }
             SCHEMA_VERSION => {}
             other => {
@@ -238,6 +314,7 @@ impl Store {
                 )));
             }
         }
+        tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -251,6 +328,129 @@ impl Store {
         self.conn
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// Settles the mode this data directory runs in and records it. A
+    /// network directory stays one whatever is asked. A local directory
+    /// becomes a network one, for good, when `network` is asked for. Returns
+    /// the mode and whether this call upgraded an existing local directory.
+    pub(crate) fn establish_mode(&self, network: bool) -> Result<(Mode, bool)> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let recorded = match identity::meta_get(&tx, identity::META_MODE)? {
+            None => None,
+            Some(text) => Some(Mode::parse(&text).ok_or_else(|| {
+                StoreError::Other("the database records an unknown mode".to_owned())
+            })?),
+        };
+        let (mode, upgraded) = match (recorded, network) {
+            (Some(Mode::Network), _) => (Mode::Network, false),
+            (Some(Mode::Local), true) => (Mode::Network, true),
+            (Some(Mode::Local), false) => (Mode::Local, false),
+            (None, true) => (Mode::Network, false),
+            (None, false) => (Mode::Local, false),
+        };
+        if recorded != Some(mode) {
+            identity::meta_set(&tx, identity::META_MODE, mode.as_str())?;
+        }
+        if upgraded {
+            identity::log(
+                &tx,
+                &LogEntry {
+                    kind: log_kinds::MODE_UPGRADED,
+                    detail: Some("local to network"),
+                    ..LogEntry::default()
+                },
+            )?;
+        }
+        tx.commit()?;
+        Ok((mode, upgraded))
+    }
+
+    /// Records that a server started, and where a network board can be
+    /// reached, so the operator functions can build invites.
+    pub(crate) fn record_start(&self, mode: Mode, endpoint: Option<(&str, &str)>) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some((url, fingerprint)) = endpoint {
+            identity::meta_set(&tx, identity::META_URL, url)?;
+            identity::meta_set(&tx, identity::META_FINGERPRINT, fingerprint)?;
+        }
+        identity::log(
+            &tx,
+            &LogEntry {
+                kind: log_kinds::SERVER_STARTED,
+                detail: Some(&format!("mode={}", mode.as_str())),
+                ..LogEntry::default()
+            },
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Resolves a token digest; see [`identity::authenticate`].
+    pub(crate) fn authenticate(&self, token_hash: &str) -> Result<AuthOutcome> {
+        Ok(identity::authenticate(&self.conn(), token_hash, now_ms())?)
+    }
+
+    /// Whether the credential may still be used, read from the database.
+    pub(crate) fn credential_usable(&self, credential_id: &str) -> Result<bool> {
+        Ok(identity::credential_usable(
+            &self.conn(),
+            credential_id,
+            now_ms(),
+        )?)
+    }
+
+    /// Swaps an enrolment code for a token. A success is written to the
+    /// security log in the same transaction. A failure returns `None` and
+    /// is left to the caller to log, within the log's budget for failures.
+    pub(crate) fn join(
+        &self,
+        code: &str,
+        client: Option<IpAddr>,
+    ) -> Result<Option<(String, Credential)>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let joined = identity::join(&tx, code, now_ms()).map_err(StoreError::Other)?;
+        if let Some((_, credential)) = &joined {
+            identity::log(
+                &tx,
+                &LogEntry {
+                    kind: log_kinds::ENROL_SUCCEEDED,
+                    principal: Some(&credential.handle),
+                    credential_id: Some(&credential.id),
+                    client,
+                    detail: None,
+                },
+            )?;
+        }
+        tx.commit()?;
+        Ok(joined)
+    }
+
+    /// Revokes the caller's own credential.
+    pub(crate) fn logout(&self, credential: &Credential, client: Option<IpAddr>) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        identity::revoke_credential(&tx, &credential.id, now_ms())?;
+        identity::log(
+            &tx,
+            &LogEntry {
+                kind: log_kinds::LOGOUT,
+                principal: Some(&credential.handle),
+                credential_id: Some(&credential.id),
+                client,
+                detail: None,
+            },
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Appends one security log entry.
+    pub(crate) fn log(&self, entry: &LogEntry<'_>) -> Result<()> {
+        Ok(identity::log(&self.conn(), entry)?)
     }
 
     pub(crate) fn find_board(&self, name: &str) -> Result<Option<BoardRef>> {
@@ -325,7 +525,12 @@ impl Store {
                          JOIN actors a ON a.id = m.actor_id WHERE m.id = ?1"
                     ),
                     [&message_id],
-                    |row| Ok((message_from_row(row, 0, &board.name)?, row.get(10)?)),
+                    |row| {
+                        Ok((
+                            message_from_row(row, 0, &board.name)?,
+                            row.get(MESSAGE_COLUMN_COUNT)?,
+                        ))
+                    },
                 )?;
                 return Ok(Posted {
                     board: board.clone(),
@@ -361,9 +566,19 @@ impl Store {
             ],
         )?;
         tx.execute(
-            "INSERT INTO messages (id, board_id, channel, thread_id, actor_id, text, created_at, seq)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![id, board.id, post.channel, thread_id, actor.id, post.text, now, seq],
+            "INSERT INTO messages (id, board_id, channel, thread_id, actor_id, text, created_at, seq, credential_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                id,
+                board.id,
+                post.channel,
+                thread_id,
+                actor.id,
+                post.text,
+                now,
+                seq,
+                post.credential_id
+            ],
         )?;
         tx.execute(
             "INSERT INTO channels (board_id, path, created_at, thread_count, last_activity_at)
@@ -390,23 +605,28 @@ impl Store {
             }
         }
 
-        let hash = event_hash(&EventFields {
-            prev_hash: &head_hash,
-            board: &board.name,
-            seq,
-            kind: event_types::MESSAGE_POSTED,
-            channel: &post.channel,
-            thread_id: &thread_id,
-            message_id: &id,
-            actor_id: &actor.id,
-            actor_kind: kind,
-            actor_handle: &actor.handle,
-            actor_profile: actor.profile.as_deref(),
-            at: &now,
-        });
+        let hash = event_hash(
+            HASH_VERSION,
+            &EventFields {
+                prev_hash: &head_hash,
+                board: &board.name,
+                seq,
+                kind: event_types::MESSAGE_POSTED,
+                channel: &post.channel,
+                thread_id: &thread_id,
+                message_id: &id,
+                actor_id: &actor.id,
+                actor_kind: kind,
+                actor_handle: &actor.handle,
+                actor_profile: actor.profile.as_deref(),
+                at: &now,
+                credential_id: post.credential_id.as_deref(),
+            },
+        )
+        .ok_or_else(|| StoreError::Other("the current hash encoding is unknown".to_owned()))?;
         tx.execute(
-            "INSERT INTO events (board_id, seq, kind, channel, thread_id, message_id, actor_id, at, prev_hash, hash)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO events (board_id, seq, kind, channel, thread_id, message_id, actor_id, at, prev_hash, hash, credential_id, hash_version)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 board.id,
                 seq,
@@ -417,7 +637,9 @@ impl Store {
                 actor.id,
                 now,
                 head_hash,
-                hash
+                hash,
+                post.credential_id,
+                HASH_VERSION
             ],
         )?;
         tx.execute(
@@ -444,6 +666,7 @@ impl Store {
                 text: post.text,
                 created_at: now,
                 revision: 1,
+                credential_id: post.credential_id,
             },
             seq,
             duplicate: false,
@@ -546,7 +769,7 @@ impl Store {
         let mut values = vec![Value::Integer(board.id), Value::Integer(after)];
         let mut sql = String::from(
             "SELECT e.seq, e.kind, e.channel, e.thread_id, e.message_id, e.at, e.prev_hash, e.hash,
-                    a.id, a.kind, a.handle, a.profile
+                    a.id, a.kind, a.handle, a.profile, e.credential_id
              FROM events e JOIN actors a ON a.id = e.actor_id
              WHERE e.board_id = ? AND e.seq > ?",
         );
@@ -561,6 +784,10 @@ impl Store {
         if let Some(handle) = &filter.not_from {
             sql.push_str(" AND a.handle <> ?");
             values.push(Value::Text(handle.clone()));
+        }
+        if let Some(actor_id) = &filter.not_from_actor {
+            sql.push_str(" AND e.actor_id <> ?");
+            values.push(Value::Text(actor_id.clone()));
         }
         sql.push_str(" ORDER BY e.seq LIMIT ?");
         values.push(Value::Integer(i64::from(limit)));
@@ -587,6 +814,7 @@ impl Store {
                     prev_hash: row.get(6)?,
                     hash: row.get(7)?,
                     by: actor_from_row(row, 8)?,
+                    credential_id: row.get(12)?,
                 },
             ))
         })?;
@@ -601,6 +829,32 @@ impl Store {
             scanned_to,
             more,
         })
+    }
+}
+
+/// The mode an existing data directory is in, read without locking,
+/// creating or changing anything. `None` when there is no readable board
+/// database there yet. A database from milestone M0 is a local one.
+pub(crate) fn peek_mode(data_dir: &Path) -> Option<Mode> {
+    let path = data_dir.join(DB_FILE_NAME);
+    if !path.is_file() {
+        return None;
+    }
+    let conn = Connection::open_with_flags(
+        &path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    conn.busy_timeout(Duration::from_secs(5)).ok()?;
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .ok()?;
+    match version {
+        1 => Some(Mode::Local),
+        SCHEMA_VERSION => identity::meta_get(&conn, identity::META_MODE)
+            .ok()?
+            .and_then(|text| Mode::parse(&text)),
+        _ => None,
     }
 }
 
@@ -701,6 +955,7 @@ fn message_from_row(row: &Row<'_>, at: usize, board: &str) -> rusqlite::Result<M
         created_at: row.get(at + 4)?,
         revision: row.get(at + 5)?,
         by: actor_from_row(row, at + 6)?,
+        credential_id: row.get(at + 10)?,
     })
 }
 
@@ -721,30 +976,9 @@ fn actor_from_row(row: &Row<'_>, at: usize) -> rusqlite::Result<Actor> {
     })
 }
 
-fn actor_kind_name(kind: ActorKind) -> &'static str {
-    match kind {
-        ActorKind::Local => "local",
-        ActorKind::Person => "person",
-        ActorKind::Service => "service",
-        ActorKind::Agent => "agent",
-        ActorKind::Bridge => "bridge",
-    }
-}
-
-fn parse_actor_kind(name: &str) -> Option<ActorKind> {
-    Some(match name {
-        "local" => ActorKind::Local,
-        "person" => ActorKind::Person,
-        "service" => ActorKind::Service,
-        "agent" => ActorKind::Agent,
-        "bridge" => ActorKind::Bridge,
-        _ => return None,
-    })
-}
-
 /// Creates the data directory, readable only by its owner where the
 /// platform supports that.
-fn create_private_dir(path: &Path) -> std::io::Result<()> {
+pub(crate) fn create_private_dir(path: &Path) -> std::io::Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]

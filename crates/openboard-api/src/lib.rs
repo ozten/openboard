@@ -6,6 +6,9 @@
 //! | Method | Path | Request | Response |
 //! | --- | --- | --- | --- |
 //! | GET | `/v1/health` | | [`Health`] |
+//! | POST | `/v1/join` | [`auth::JoinRequest`] | [`auth::JoinResponse`] |
+//! | GET | `/v1/whoami` | | [`auth::WhoAmI`] |
+//! | POST | `/v1/logout` | | `204`, and the calling credential is revoked |
 //! | POST | `/v1/boards/{board}/messages` | [`PostMessageRequest`] | [`PostMessageResponse`] |
 //! | GET | `/v1/boards/{board}/channels` | | [`ChannelList`] |
 //! | GET | `/v1/boards/{board}/threads` | [`ThreadsQuery`] | [`ThreadList`] |
@@ -30,6 +33,8 @@
 //!   its first message. Every other request to a board that does not exist
 //!   fails with [`codes::NOT_FOUND`] and creates nothing. [`DEFAULT_BOARD`]
 //!   is the exception: it always exists.
+
+pub mod auth;
 
 use serde::{Deserialize, Serialize};
 
@@ -88,6 +93,14 @@ pub mod codes {
     pub const IDEMPOTENCY_CONFLICT: &str = "idempotency_conflict";
     /// The authorization module denied the request.
     pub const FORBIDDEN: &str = "forbidden";
+    /// Network mode: the bearer token is missing, malformed, unknown,
+    /// expired or revoked. Always `401`, and never says which.
+    pub const UNAUTHENTICATED: &str = "unauthenticated";
+    /// The enrolment code is wrong, expired or already used.
+    pub const INVITE_INVALID: &str = "invite_invalid";
+    /// Too many requests or open connections for this credential or client
+    /// address. `429` with a `Retry-After` header in seconds.
+    pub const RATE_LIMITED: &str = "rate_limited";
     /// The server failed. The message never contains message bodies.
     pub const INTERNAL: &str = "internal";
 }
@@ -132,6 +145,10 @@ pub struct Message {
     pub created_at: String,
     /// Starts at 1. Reserved for edits, which arrive in a later milestone.
     pub revision: u32,
+    /// Network mode: ID of the credential that wrote the message. Set by the
+    /// server. Absent in local mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<String>,
 }
 
 /// Body of `POST /v1/boards/{board}/messages`.
@@ -244,6 +261,10 @@ pub struct Event {
     pub by: Actor,
     /// RFC 3339 timestamp in UTC.
     pub at: String,
+    /// Network mode: ID of the credential behind the event. Covered by the
+    /// hash chain. Absent in local mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<String>,
     /// Hex SHA-256 of the previous event, or 64 zeros for the first.
     pub prev_hash: String,
     /// Hex SHA-256 over `prev_hash` and this event's canonical fields.
@@ -276,6 +297,10 @@ pub struct EventsQuery {
     /// posts do not wake it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_from: Option<String>,
+    /// Skip events written by the caller's own principal and profile. Works
+    /// in every mode, so a client need not know its own handle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_from_self: Option<bool>,
     /// Long-poll: hold the request up to this many seconds until a matching
     /// event exists. Capped at [`MAX_WAIT_SECS`]. Ignored by the stream.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -297,7 +322,7 @@ pub struct EventsResponse {
 pub struct Health {
     pub status: String,
     pub version: String,
-    /// `local` for a no-auth loopback server.
+    /// [`auth::MODE_LOCAL`] or [`auth::MODE_NETWORK`].
     pub mode: String,
 }
 

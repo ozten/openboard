@@ -2,10 +2,14 @@
 //!
 //! # Canonical encoding
 //!
+//! Every event records the version of the encoding its hash was computed
+//! with. Version 2 is written today. Version 1 was written by milestone M0
+//! and is still verified, so a data directory from M0 keeps its history.
+//!
 //! An event's `hash` is the SHA-256, in lowercase hex, of these bytes:
 //!
 //! ```text
-//! openboard.event.v1\n
+//! openboard.event.v2\n               (`openboard.event.v1\n` in version 1)
 //! prev_hash=<len>:<value>\n
 //! board=<len>:<value>\n
 //! seq=<len>:<value>\n
@@ -18,13 +22,18 @@
 //! actor_handle=<len>:<value>\n
 //! actor_profile=<len>:<value>\n      (or `actor_profile=-\n` when there is none)
 //! at=<len>:<value>\n
+//! credential_id=<len>:<value>\n      (version 2 only; `credential_id=-\n` when there is none)
 //! ```
 //!
 //! `<len>` is the value's length in bytes as a decimal number, and the value
 //! is its UTF-8 bytes. `seq` is the event's position in its board's log,
 //! starting at 1, in decimal. `board` is the board's name as first written.
 //! `prev_hash` is the previous event's `hash`, or 64 zeros for the first
-//! event. Message text is never part of an event (design P6), so it is not
+//! event. `credential_id` is the ID of the credential that wrote the event on
+//! a network board, and is absent on a local one. A version 1 event never
+//! has one. The version itself is covered through the first line, so an
+//! event cannot be moved from one encoding to the other without breaking its
+//! hash. Message text is never part of an event (design P6), so it is not
 //! covered by the chain.
 
 use std::fmt;
@@ -53,14 +62,25 @@ pub(crate) struct EventFields<'a> {
     pub actor_handle: &'a str,
     pub actor_profile: Option<&'a str>,
     pub at: &'a str,
+    /// Covered by version 2 only.
+    pub credential_id: Option<&'a str>,
 }
 
+/// The encoding new events are written with.
+pub(crate) const HASH_VERSION: i64 = 2;
+
 /// Computes an event's hash over the canonical encoding described in the
-/// module documentation.
-pub(crate) fn event_hash(fields: &EventFields<'_>) -> String {
+/// module documentation. Returns `None` for a version this server does not
+/// know, and for a version 1 event that claims a credential, which that
+/// encoding cannot cover.
+pub(crate) fn event_hash(version: i64, fields: &EventFields<'_>) -> Option<String> {
     let seq = fields.seq.to_string();
     let mut hasher = Sha256::new();
-    hasher.update(b"openboard.event.v1\n");
+    match version {
+        1 if fields.credential_id.is_none() => hasher.update(b"openboard.event.v1\n"),
+        2 => hasher.update(b"openboard.event.v2\n"),
+        _ => return None,
+    }
     let mut field = |name: &str, value: Option<&str>| {
         hasher.update(name.as_bytes());
         match value {
@@ -84,7 +104,10 @@ pub(crate) fn event_hash(fields: &EventFields<'_>) -> String {
     field("actor_handle", Some(fields.actor_handle));
     field("actor_profile", fields.actor_profile);
     field("at", Some(fields.at));
-    hex(&hasher.finalize())
+    if version >= 2 {
+        field("credential_id", fields.credential_id);
+    }
+    Some(hex(&hasher.finalize()))
 }
 
 /// Lowercase hex.
@@ -213,12 +236,24 @@ fn verify_board(
     head_seq: i64,
     head_hash: &str,
 ) -> Result<(u64, Option<BrokenEntry>), VerifyError> {
-    let mut stmt = conn.prepare(
-        "SELECT e.seq, e.kind, e.channel, e.thread_id, e.message_id, e.at, e.prev_hash, e.hash,
-                e.actor_id, a.kind, a.handle, a.profile
-         FROM events e LEFT JOIN actors a ON a.id = e.actor_id
-         WHERE e.board_id = ?1 ORDER BY e.seq",
+    // A data directory that milestone M0 wrote and no newer server has
+    // opened yet has neither column. All its events are version 1.
+    let has_versions: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('events') WHERE name = 'hash_version')",
+        [],
+        |row| row.get(0),
     )?;
+    let extra = if has_versions {
+        "e.hash_version, e.credential_id"
+    } else {
+        "1, NULL"
+    };
+    let mut stmt = conn.prepare(&format!(
+        "SELECT e.seq, e.kind, e.channel, e.thread_id, e.message_id, e.at, e.prev_hash, e.hash,
+                e.actor_id, a.kind, a.handle, a.profile, {extra}
+         FROM events e LEFT JOIN actors a ON a.id = e.actor_id
+         WHERE e.board_id = ?1 ORDER BY e.seq"
+    ))?;
     let mut rows = stmt.query([board_id])?;
     let mut verified: u64 = 0;
     let mut prev_hash = GENESIS_HASH.to_owned();
@@ -277,6 +312,14 @@ fn verify_board(
                 ),
             ));
         };
+        let (Ok(version), Ok(credential_id)) =
+            (row.get::<_, i64>(12), row.get::<_, Option<String>>(13))
+        else {
+            return Ok((
+                verified,
+                broken(expected, "the entry has an unreadable field"),
+            ));
+        };
         if stored_prev != prev_hash {
             return Ok((
                 verified,
@@ -286,20 +329,33 @@ fn verify_board(
                 ),
             ));
         }
-        let computed = event_hash(&EventFields {
-            prev_hash: &stored_prev,
-            board,
-            seq,
-            kind: &kind,
-            channel: &channel,
-            thread_id: &thread_id,
-            message_id: &message_id,
-            actor_id: &actor_id,
-            actor_kind: &actor_kind,
-            actor_handle: &actor_handle,
-            actor_profile: actor_profile.as_deref(),
-            at: &at,
-        });
+        let computed = event_hash(
+            version,
+            &EventFields {
+                prev_hash: &stored_prev,
+                board,
+                seq,
+                kind: &kind,
+                channel: &channel,
+                thread_id: &thread_id,
+                message_id: &message_id,
+                actor_id: &actor_id,
+                actor_kind: &actor_kind,
+                actor_handle: &actor_handle,
+                actor_profile: actor_profile.as_deref(),
+                at: &at,
+                credential_id: credential_id.as_deref(),
+            },
+        );
+        let Some(computed) = computed else {
+            return Ok((
+                verified,
+                broken(
+                    expected,
+                    "the entry uses a hash encoding this version does not know, or one that cannot cover its credential",
+                ),
+            ));
+        };
         if computed != stored_hash {
             return Ok((
                 verified,
@@ -351,16 +407,68 @@ mod tests {
             actor_handle: "local",
             actor_profile: profile,
             at: "2026-01-01T00:00:00.000Z",
+            credential_id: None,
         }
+    }
+
+    fn v1(fields: &EventFields<'_>) -> String {
+        event_hash(1, fields).unwrap()
+    }
+
+    fn v2(fields: &EventFields<'_>) -> String {
+        event_hash(2, fields).unwrap()
     }
 
     #[test]
     fn hash_is_deterministic_and_field_sensitive() {
-        let base = event_hash(&fields(None, "a"));
-        assert_eq!(base.len(), 64);
-        assert_eq!(base, event_hash(&fields(None, "a")));
-        assert_ne!(base, event_hash(&fields(None, "b")));
-        assert_ne!(base, event_hash(&fields(Some("fx"), "a")));
+        for hash in [v1, v2] {
+            let base = hash(&fields(None, "a"));
+            assert_eq!(base.len(), 64);
+            assert_eq!(base, hash(&fields(None, "a")));
+            assert_ne!(base, hash(&fields(None, "b")));
+            assert_ne!(base, hash(&fields(Some("fx"), "a")));
+        }
+    }
+
+    #[test]
+    fn versions_differ_and_version_2_covers_the_credential() {
+        let plain = fields(None, "a");
+        assert_ne!(v1(&plain), v2(&plain));
+        let with = |credential_id| EventFields {
+            credential_id,
+            ..fields(None, "a")
+        };
+        assert_ne!(v2(&plain), v2(&with(Some("crd_1"))));
+        assert_ne!(v2(&with(Some("crd_1"))), v2(&with(Some("crd_2"))));
+        // Version 1 cannot cover a credential, and unknown versions have no
+        // encoding at all.
+        assert_eq!(event_hash(1, &with(Some("crd_1"))), None);
+        assert_eq!(event_hash(0, &plain), None);
+        assert_eq!(event_hash(3, &plain), None);
+    }
+
+    #[test]
+    fn version_2_matches_the_documented_encoding() {
+        let encoded = |credential: &str| {
+            format!(
+                "openboard.event.v2\nprev_hash=64:{GENESIS_HASH}\nboard=7:general\nseq=1:1\n\
+                 type=14:message.posted\nchannel=1:a\nthread_id=5:msg_a\nmessage_id=5:msg_a\n\
+                 actor_id=5:act_1\nactor_kind=5:local\nactor_handle=5:local\nactor_profile=-\n\
+                 at=24:2026-01-01T00:00:00.000Z\ncredential_id={credential}\n"
+            )
+        };
+        assert_eq!(
+            v2(&fields(None, "a")),
+            hex(&Sha256::digest(encoded("-").as_bytes()))
+        );
+        let with = EventFields {
+            credential_id: Some("crd_1"),
+            ..fields(None, "a")
+        };
+        assert_eq!(
+            v2(&with),
+            hex(&Sha256::digest(encoded("5:crd_1").as_bytes()))
+        );
     }
 
     #[test]
@@ -372,7 +480,7 @@ mod tests {
              at=24:2026-01-01T00:00:00.000Z\n"
         );
         assert_eq!(
-            event_hash(&fields(None, "a")),
+            v1(&fields(None, "a")),
             hex(&Sha256::digest(encoded.as_bytes()))
         );
     }

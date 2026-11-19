@@ -1,11 +1,24 @@
 //! The Openboard server: a self-hosted message board for coding agents.
 //!
 //! This crate implements the HTTP API defined in `openboard-api` on top of a
-//! SQLite database. It supports local mode only: no authentication, one
-//! principal, and a listener that is refused unless it binds to loopback.
+//! SQLite database. A board runs in one of two [`Mode`]s:
+//!
+//! - **Local**: plain HTTP, no authentication, one principal, and a listener
+//!   that is refused unless it binds to loopback.
+//! - **Network**: TLS 1.3 on every listener, loopback included, with a
+//!   self-signed certificate that clients pin by fingerprint, and a bearer
+//!   token on every request except the health check and enrolment. See
+//!   `openboard_api::auth` for the contract.
+//!
+//! The mode belongs to the data directory. A new directory takes the mode
+//! of its first start. A local directory started with [`Config::network`]
+//! becomes a network one for good, and a network directory is served in
+//! network mode whatever the configuration asks for, so it can never be
+//! reached without TLS and authentication.
 //!
 //! The server makes no outbound network calls and writes nothing but
-//! start-up and failure lines to stderr. Logs never contain message text.
+//! start-up and failure lines to stderr. Logs never contain message text,
+//! tokens, enrolment codes or their hashes.
 //!
 //! # Running a board
 //!
@@ -19,14 +32,44 @@
 //! # }
 //! ```
 //!
-//! Use [`bind`] instead of [`serve`] to learn the listening address first,
-//! for example after asking for port 0.
+//! Use [`bind`] instead of [`serve`] to learn the listening address, the
+//! board's URL and its certificate fingerprint first, for example after
+//! asking for port 0:
+//!
+//! ```no_run
+//! # async fn demo() -> Result<(), openboard_server::ServeError> {
+//! let mut config = openboard_server::Config::new("./board-data");
+//! config.network = true;
+//! config.port = 0;
+//! let server = openboard_server::bind(config).await?;
+//! println!("{} {:?}", server.url(), server.fingerprint());
+//! server.run(std::future::pending()).await
+//! # }
+//! ```
+//!
+//! # Enrolling agents
+//!
+//! Agents are invited, listed and revoked with the functions in
+//! [`operator`], which act on the data directory and have no network API.
 //!
 //! # Data directory
 //!
-//! The data directory holds one SQLite database, [`DB_FILE_NAME`], in WAL
-//! mode, plus SQLite's `-wal` and `-shm` side files while it is open. The
-//! directory is created on first start, private to its owner on Unix.
+//! The directory is created on first start, private to its owner on Unix.
+//! It holds:
+//!
+//! - [`DB_FILE_NAME`]: one SQLite database in WAL mode, plus SQLite's `-wal`
+//!   and `-shm` side files while it is open. It holds the boards, the
+//!   principals, credentials and invites (tokens and codes only as SHA-256
+//!   digests), the security log, the mode, and the URL and fingerprint the
+//!   last network start recorded. A database written by an older version is
+//!   migrated forward when a server opens it.
+//! - [`LOCK_FILE_NAME`]: see below.
+//! - [`CERT_FILE_NAME`] and [`KEY_FILE_NAME`], on a network board: the
+//!   self-signed certificate and its private key in PEM. They are created
+//!   on the first network start and reused afterwards, so the fingerprint
+//!   clients pin stays the same. The key is readable only by its owner.
+//!   Removing the pair makes the next start create a new one, after which
+//!   every client must enrol again.
 //!
 //! One server at a time serves a data directory. A running server holds an
 //! exclusive lock on [`LOCK_FILE_NAME`] in it, and a second server started on
@@ -34,7 +77,8 @@
 //! is left in place; only the lock on it matters.
 //!
 //! [`verify_log`] checks the event hash chains in that database offline. It
-//! only reads and takes no lock, so it runs beside a live server.
+//! only reads and takes no lock, so it runs beside a live server, as do the
+//! [`operator`] functions.
 
 use std::fmt;
 use std::future::Future;
@@ -48,12 +92,68 @@ use tokio::sync::{mpsc, watch};
 pub mod authz;
 mod chain;
 mod http;
+mod identity;
+mod limits;
 mod names;
+pub mod operator;
 mod store;
 mod time;
+mod tls;
 
 pub use chain::{verify_log, BoardReport, BrokenEntry, VerifyError, VerifyReport};
+pub use limits::Limits;
 pub use store::{DB_FILE_NAME, LOCK_FILE_NAME};
+pub use tls::{CERT_FILE_NAME, KEY_FILE_NAME};
+
+/// How a board is served. See the crate documentation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Mode {
+    Local,
+    Network,
+}
+
+impl Mode {
+    /// `openboard_api::auth::MODE_LOCAL` or `MODE_NETWORK`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mode::Local => openboard_api::auth::MODE_LOCAL,
+            Mode::Network => openboard_api::auth::MODE_NETWORK,
+        }
+    }
+
+    pub(crate) fn parse(text: &str) -> Option<Self> {
+        match text {
+            openboard_api::auth::MODE_LOCAL => Some(Mode::Local),
+            openboard_api::auth::MODE_NETWORK => Some(Mode::Network),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for Mode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Checks a board URL for use in invites and returns it without a trailing
+/// slash. It must be `https://` followed by a host, with no path, query or
+/// spaces.
+pub(crate) fn normalize_public_url(url: &str) -> Result<String, &'static str> {
+    let trimmed = url.trim_end_matches('/');
+    let Some(authority) = trimmed.strip_prefix("https://") else {
+        return Err("it must start with https://");
+    };
+    let plain = !authority.is_empty()
+        && authority
+            .chars()
+            .all(|c| c.is_ascii_graphic() && !matches!(c, '/' | '?' | '#' | '@' | '\\'));
+    if plain {
+        Ok(trimmed.to_owned())
+    } else {
+        Err("it must be https:// followed by a host and an optional port, and nothing else")
+    }
+}
 
 /// Data directory used when none is given, relative to the working directory.
 pub const DEFAULT_DATA_DIR: &str = ".openboard";
@@ -63,13 +163,27 @@ pub const DEFAULT_DATA_DIR: &str = ".openboard";
 pub struct Config {
     /// Directory holding the board database. Created if missing.
     pub data_dir: PathBuf,
-    /// Address to listen on. Must be a loopback address.
+    /// Address to listen on. Must be a loopback address unless the board
+    /// runs in network mode.
     pub bind: IpAddr,
     /// TCP port. 0 asks the system for a free port; see
     /// [`Server::local_addr`].
     pub port: u16,
     /// Longest accepted message text, in characters.
     pub max_message_chars: usize,
+    /// Run in network mode: TLS and authentication. Starting a local data
+    /// directory with this set upgrades it, one way. A data directory that
+    /// is already a network one runs in network mode whether or not this is
+    /// set; see [`Server::mode`].
+    pub network: bool,
+    /// Network mode: the base URL clients reach the board by, recorded in
+    /// the data directory for invites. It must start with `https://` and
+    /// have no path. When `None` it is `https://<bind>:<port>`, which is
+    /// only possible when `bind` is a specific address: with `0.0.0.0` or
+    /// `::` this must be given, or the server refuses to start.
+    pub public_url: Option<String>,
+    /// Network mode: rate limits.
+    pub limits: Limits,
 }
 
 impl Config {
@@ -83,14 +197,18 @@ impl Config {
 }
 
 impl Default for Config {
-    /// [`DEFAULT_DATA_DIR`], `127.0.0.1`, [`openboard_api::DEFAULT_PORT`] and
-    /// [`openboard_api::DEFAULT_MAX_MESSAGE_CHARS`].
+    /// [`DEFAULT_DATA_DIR`], `127.0.0.1`, [`openboard_api::DEFAULT_PORT`],
+    /// [`openboard_api::DEFAULT_MAX_MESSAGE_CHARS`], local mode and the
+    /// default [`Limits`].
     fn default() -> Self {
         Self {
             data_dir: PathBuf::from(DEFAULT_DATA_DIR),
             bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
             port: openboard_api::DEFAULT_PORT,
             max_message_chars: openboard_api::DEFAULT_MAX_MESSAGE_CHARS,
+            network: false,
+            public_url: None,
+            limits: Limits::default(),
         }
     }
 }
@@ -101,6 +219,13 @@ pub enum ServeError {
     /// The configured address is not loopback. A local-mode board has no
     /// authentication, so it never listens anywhere else.
     NonLoopbackBind(IpAddr),
+    /// Network mode on an unspecified address such as `0.0.0.0` needs
+    /// [`Config::public_url`], because no URL can be derived from it.
+    PublicUrlRequired(IpAddr),
+    /// [`Config::public_url`] is not usable. Holds the reason.
+    InvalidPublicUrl(&'static str),
+    /// The board's certificate or key could not be created or loaded.
+    Tls(String),
     /// Another board server already runs on this data directory. Two servers
     /// on one directory would not wake each other's waiters, so the second
     /// is refused.
@@ -122,8 +247,16 @@ impl fmt::Display for ServeError {
             ServeError::NonLoopbackBind(ip) => write!(
                 f,
                 "refusing to bind {ip}: a local board has no authentication and only listens on \
-                 a loopback address such as 127.0.0.1 or ::1"
+                 a loopback address such as 127.0.0.1 or ::1; run a network board to listen \
+                 elsewhere"
             ),
+            ServeError::PublicUrlRequired(ip) => write!(
+                f,
+                "a network board listening on {ip} needs its public URL, such as \
+                 https://192.168.1.20:7878, because clients cannot connect to {ip}"
+            ),
+            ServeError::InvalidPublicUrl(reason) => write!(f, "invalid public URL: {reason}"),
+            ServeError::Tls(detail) => write!(f, "cannot set up TLS: {detail}"),
             ServeError::DataDirInUse(dir) => write!(
                 f,
                 "the data directory {} is already in use by another board server",
@@ -141,16 +274,27 @@ impl std::error::Error for ServeError {
         match self {
             ServeError::Bind { source, .. } | ServeError::Io(source) => Some(source),
             ServeError::NonLoopbackBind(_)
+            | ServeError::PublicUrlRequired(_)
+            | ServeError::InvalidPublicUrl(_)
+            | ServeError::Tls(_)
             | ServeError::DataDirInUse(_)
             | ServeError::Storage(_) => None,
         }
     }
 }
 
+enum BoardListener {
+    Plain(TcpListener),
+    Tls(tls::TlsListener),
+}
+
 /// A bound server that has not started answering requests yet.
 pub struct Server {
-    listener: TcpListener,
+    listener: BoardListener,
     local_addr: SocketAddr,
+    mode: Mode,
+    url: String,
+    fingerprint: Option<String>,
     router: axum::Router,
     stop: watch::Sender<bool>,
     /// Closes when the last user of the store is gone.
@@ -161,6 +305,8 @@ impl fmt::Debug for Server {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Server")
             .field("local_addr", &self.local_addr)
+            .field("mode", &self.mode)
+            .field("url", &self.url)
             .finish_non_exhaustive()
     }
 }
@@ -170,6 +316,26 @@ impl Server {
     /// configuration asked for port 0.
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// The mode the board runs in. This is [`Mode::Network`] for a network
+    /// data directory even when the configuration did not ask for it.
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    /// The board's base URL. On a network board this is
+    /// [`Config::public_url`], or `https://<address>:<port>` with the real
+    /// port, and it is what invites carry. On a local board it is
+    /// `http://<address>:<port>`.
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// The certificate's pin, as `openboard_api::auth::fingerprint` formats
+    /// it. `None` on a local board.
+    pub fn fingerprint(&self) -> Option<&str> {
+        self.fingerprint.as_deref()
     }
 
     /// Answers requests until `shutdown` completes, then stops gracefully:
@@ -183,13 +349,26 @@ impl Server {
     ) -> Result<(), ServeError> {
         let stop = self.stop;
         let mut released = self.released;
-        let served = axum::serve(self.listener, self.router)
-            .with_graceful_shutdown(async move {
-                shutdown.await;
-                stop.send_replace(true);
-            })
-            .await
-            .map_err(ServeError::Io);
+        let service = self
+            .router
+            .into_make_service_with_connect_info::<tls::ClientAddr>();
+        let shutdown = async move {
+            shutdown.await;
+            stop.send_replace(true);
+        };
+        let served = match self.listener {
+            BoardListener::Plain(listener) => {
+                axum::serve(listener, service)
+                    .with_graceful_shutdown(shutdown)
+                    .await
+            }
+            BoardListener::Tls(listener) => {
+                axum::serve(listener, service)
+                    .with_graceful_shutdown(shutdown)
+                    .await
+            }
+        }
+        .map_err(ServeError::Io);
         // A write whose client went away, or a stream noticing the shutdown,
         // can outlive its connection for a moment. Wait until the store is
         // closed, which is when every sender is gone.
@@ -200,40 +379,87 @@ impl Server {
 
 /// Opens the data directory and binds the listener without serving yet.
 ///
-/// Fails with [`ServeError::NonLoopbackBind`], before touching the disk or
-/// the network, when `config.bind` is not a loopback address, and with
-/// [`ServeError::DataDirInUse`] when another server holds the data directory.
-/// The returned server holds the directory until it is dropped or
-/// [`Server::run`] returns.
+/// The board runs in network mode when [`Config::network`] is set or the
+/// data directory is already a network one, and in local mode otherwise;
+/// see [`Server::mode`]. In network mode the listener speaks TLS 1.3 only,
+/// and the certificate is created on the first start.
+///
+/// Fails with [`ServeError::NonLoopbackBind`], without creating or changing
+/// anything, when the board would run in local mode and `config.bind` is not
+/// a loopback address, and with [`ServeError::DataDirInUse`] when another
+/// server holds the data directory. The returned server holds the directory
+/// until it is dropped or [`Server::run`] returns.
 pub async fn bind(config: Config) -> Result<Server, ServeError> {
-    bind_with_policy(config, Arc::new(authz::LocalPolicy)).await
+    bind_inner(config, None).await
 }
 
 /// Like [`bind`], with the authorization policy replaced.
 ///
-/// This is the seam later milestones use to add grants. In M0 it exists so
-/// tests can prove that a denying policy is enforced everywhere.
+/// [`bind`] uses [`authz::LocalPolicy`] on a local board and
+/// [`authz::NetworkPolicy`] on a network one. This is the seam later
+/// milestones use to add grants, and it lets tests prove that a denying
+/// policy is enforced everywhere. Authentication is not part of the policy:
+/// a network board authenticates every caller before the policy is asked.
 pub async fn bind_with_policy(
     config: Config,
     policy: Arc<dyn authz::Policy>,
 ) -> Result<Server, ServeError> {
-    if !config.bind.is_loopback() {
+    bind_inner(config, Some(policy)).await
+}
+
+async fn bind_inner(
+    config: Config,
+    policy: Option<Arc<dyn authz::Policy>>,
+) -> Result<Server, ServeError> {
+    // Everything that can refuse the start is checked before the disk is
+    // written or a port is opened. The mode is read, never created, here.
+    let data_dir = config.data_dir.clone();
+    let recorded = tokio::task::spawn_blocking(move || store::peek_mode(&data_dir))
+        .await
+        .map_err(|error| ServeError::Storage(error.to_string()))?;
+    let network = config.network || recorded == Some(Mode::Network);
+    if !network && !config.bind.is_loopback() {
         return Err(ServeError::NonLoopbackBind(config.bind));
     }
-    let data_dir = config.data_dir.clone();
-    let store = tokio::task::spawn_blocking(move || {
-        let store = store::Store::open(&data_dir)?;
+    let public_url = match &config.public_url {
+        Some(url) if network => {
+            Some(normalize_public_url(url).map_err(ServeError::InvalidPublicUrl)?)
+        }
+        None if network && config.bind.is_unspecified() => {
+            return Err(ServeError::PublicUrlRequired(config.bind));
+        }
+        _ => None,
+    };
+
+    let (data_dir, bind_ip) = (config.data_dir.clone(), config.bind);
+    let opened = tokio::task::spawn_blocking(move || {
+        let store = store::Store::open(&data_dir).map_err(|error| match error {
+            store::StoreError::DataDirInUse => ServeError::DataDirInUse(data_dir.clone()),
+            other => ServeError::Storage(other.to_string()),
+        })?;
+        let storage = |error: store::StoreError| ServeError::Storage(error.to_string());
+        // The mode is settled under the data directory lock. It can only be
+        // more strict than what was read above.
+        let (mode, _upgraded) = store.establish_mode(network).map_err(storage)?;
+        if mode == Mode::Local && !bind_ip.is_loopback() {
+            return Err(ServeError::NonLoopbackBind(bind_ip));
+        }
+        let identity = match mode {
+            Mode::Local => None,
+            Mode::Network => {
+                Some(tls::load_or_create(&data_dir, bind_ip).map_err(ServeError::Tls)?)
+            }
+        };
         // The default board always exists, so a fresh board can be read and
         // waited on before anything is posted.
-        store.ensure_board(openboard_api::DEFAULT_BOARD)?;
-        Ok(store)
+        store
+            .ensure_board(openboard_api::DEFAULT_BOARD)
+            .map_err(storage)?;
+        Ok((store, mode, identity))
     })
     .await
-    .map_err(|error| ServeError::Storage(error.to_string()))?
-    .map_err(|error| match error {
-        store::StoreError::DataDirInUse => ServeError::DataDirInUse(config.data_dir.clone()),
-        other => ServeError::Storage(other.to_string()),
-    })?;
+    .map_err(|error| ServeError::Storage(error.to_string()))?;
+    let (store, mode, identity) = opened?;
 
     let addr = SocketAddr::new(config.bind, config.port);
     let listener = TcpListener::bind(addr)
@@ -241,18 +467,52 @@ pub async fn bind_with_policy(
         .map_err(|source| ServeError::Bind { addr, source })?;
     let local_addr = listener.local_addr().map_err(ServeError::Io)?;
 
+    let (listener, url, fingerprint) = match identity {
+        None => (
+            BoardListener::Plain(listener),
+            format!("http://{local_addr}"),
+            None,
+        ),
+        Some(identity) => (
+            BoardListener::Tls(
+                tls::TlsListener::new(listener, identity.config).map_err(ServeError::Io)?,
+            ),
+            public_url.unwrap_or_else(|| format!("https://{local_addr}")),
+            Some(identity.fingerprint),
+        ),
+    };
+    let (recorded_url, recorded_fingerprint) = (url.clone(), fingerprint.clone());
+    let store = tokio::task::spawn_blocking(move || {
+        let endpoint = recorded_fingerprint
+            .as_deref()
+            .map(|fingerprint| (recorded_url.as_str(), fingerprint));
+        store.record_start(mode, endpoint).map(|()| store)
+    })
+    .await
+    .map_err(|error| ServeError::Storage(error.to_string()))?
+    .map_err(|error| ServeError::Storage(error.to_string()))?;
+
+    let policy = policy.unwrap_or_else(|| match mode {
+        Mode::Local => Arc::new(authz::LocalPolicy),
+        Mode::Network => Arc::new(authz::NetworkPolicy),
+    });
     let (stop, stopping) = watch::channel(false);
     let (in_use, released) = mpsc::channel(1);
-    let router = http::router(
+    let router = http::router(http::Parts {
         store,
-        authz::Authorizer::new(policy),
-        config.max_message_chars,
-        stopping,
+        authz: authz::Authorizer::new(policy),
+        mode,
+        max_message_chars: config.max_message_chars,
+        limits: config.limits,
+        shutdown: stopping,
         in_use,
-    );
+    });
     Ok(Server {
         listener,
         local_addr,
+        mode,
+        url,
+        fingerprint,
         router,
         stop,
         released,
@@ -267,4 +527,32 @@ pub async fn serve(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), ServeError> {
     bind(config).await?.run(shutdown).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_public_url;
+
+    #[test]
+    fn public_urls() {
+        for (given, expected) in [
+            ("https://192.168.1.20:7878", "https://192.168.1.20:7878"),
+            ("https://board.example/", "https://board.example"),
+            ("https://[2001:db8::1]:7878", "https://[2001:db8::1]:7878"),
+        ] {
+            assert_eq!(normalize_public_url(given), Ok(expected.to_owned()));
+        }
+        for bad in [
+            "",
+            "http://192.168.1.20:7878",
+            "https://",
+            "https://a/b",
+            "https://a?b",
+            "https://user@a",
+            "https://a b",
+            "192.168.1.20:7878",
+        ] {
+            assert!(normalize_public_url(bad).is_err(), "{bad}");
+        }
+    }
 }

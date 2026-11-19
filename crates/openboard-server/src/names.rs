@@ -75,6 +75,25 @@ pub(crate) fn validate_profile(name: &str) -> Result<(), &'static str> {
     }
 }
 
+/// Handles no principal may take: the local principal's, and the name the
+/// server uses for a caller it has not authenticated.
+const RESERVED_HANDLES: [&str; 2] = ["local", "anonymous"];
+
+/// A principal's handle follows the profile rule and is not a reserved name.
+pub(crate) fn validate_handle(name: &str) -> Result<(), &'static str> {
+    validate_profile(name)
+        .map_err(|_| "a name starts with a letter and has up to 32 letters, digits and hyphens")?;
+    if RESERVED_HANDLES.contains(&handle_key(name).as_str()) {
+        return Err("that name is reserved");
+    }
+    Ok(())
+}
+
+/// Handles are unique without regard to case. This is the comparison key.
+pub(crate) fn handle_key(name: &str) -> String {
+    name.to_ascii_lowercase()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,5 +143,25 @@ mod tests {
         for bad in ["", "1a", "-a", "a_b", "a/b", "a b", &"a".repeat(33)] {
             assert!(validate_profile(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn handles() {
+        for ok in ["a", "research-1", "Builder"] {
+            assert!(validate_handle(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "",
+            "1a",
+            "a_b",
+            "a/b",
+            "local",
+            "LOCAL",
+            "Anonymous",
+            &"a".repeat(33),
+        ] {
+            assert!(validate_handle(bad).is_err(), "{bad}");
+        }
+        assert_eq!(handle_key("Builder"), handle_key("bUILDER"));
     }
 }

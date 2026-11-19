@@ -187,6 +187,43 @@ pub fn event_line(event: &Event) -> String {
     )
 }
 
+/// Rows under a header, in columns padded to their widest cell. Every cell
+/// is cleaned of control characters.
+pub fn table(headers: &[&str], rows: &[Vec<String>]) -> String {
+    let rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| row.iter().map(|cell| line(cell)).collect())
+        .collect();
+    let mut widths: Vec<usize> = headers
+        .iter()
+        .map(|header| header.chars().count())
+        .collect();
+    for row in &rows {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.chars().count());
+        }
+    }
+    let mut out = String::new();
+    let mut put = |cells: Vec<&str>| {
+        let mut text = String::new();
+        for (cell, width) in cells.iter().zip(&widths) {
+            let _ = write!(text, "{cell:width$}  ");
+        }
+        let _ = writeln!(out, "{}", text.trim_end());
+    };
+    put(headers.to_vec());
+    for row in &rows {
+        put(row.iter().map(String::as_str).collect());
+    }
+    out.truncate(out.trim_end().len());
+    out
+}
+
+/// A single-line value from elsewhere, safe to print.
+pub fn safe(text: &str) -> String {
+    line(text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,6 +244,7 @@ mod tests {
             text: text.into(),
             created_at: "2026-01-01T00:00:00Z".into(),
             revision: 1,
+            credential_id: None,
         }
     }
 

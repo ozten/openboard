@@ -1,8 +1,9 @@
-//! `openboard`: the command-line client for an Openboard board, and the way
-//! to run a local one.
+//! `openboard`: the command-line client for an Openboard board, the way to
+//! run one, and the operator's tool for enrolling agents in a network board.
 //!
 //! The CLI makes no network connection except to the configured board URL:
-//! no telemetry, no update checks, no proxy lookups.
+//! no telemetry, no update checks, no proxy lookups. A network board is
+//! reached over TLS 1.3 with its certificate pinned; see [`tls`].
 
 use std::io::{IsTerminal, Read, Write};
 use std::sync::Mutex;
@@ -16,15 +17,22 @@ use openboard_server::ServeError;
 use serde::Serialize;
 use tokio::sync::watch;
 
+mod admin;
 mod cli;
 mod client;
 mod error;
+mod logins;
 mod render;
+mod session;
 mod sse;
+mod target;
+mod tls;
 
 use cli::{AdminCommand, Cli, Command, Global, ReadArgs, ServeArgs, TailArgs, WaitArgs};
 use client::Client;
 use error::{codes, Failure, Resume, EXIT_FAILURE, EXIT_USAGE};
+use logins::{Secret, Store};
+use target::{Origin, Target, Wanted};
 
 /// The event stream sends a keep-alive every 15 seconds. This much silence
 /// means the connection is dead.
@@ -33,6 +41,8 @@ const STREAM_SILENCE: Duration = Duration::from_secs(45);
 const MAX_RECONNECTS: u32 = 8;
 
 fn main() {
+    // Before anything builds an HTTP client or a TLS configuration.
+    tls::install_provider();
     let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
     let cli = match Cli::try_parse_from(&args) {
         Ok(cli) => cli,
@@ -86,6 +96,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
     let text = match &cli.command {
         Command::Post(args) => Some(message_text(args.text.as_deref())?),
         Command::Reply(args) => Some(message_text(args.text.as_deref())?),
+        Command::Join(args) => Some(session::invite_text(args.invite.as_deref())?),
         _ => None,
     };
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -241,6 +252,8 @@ async fn signalled(signals: &mut watch::Receiver<Option<Sig>>) -> Sig {
 /// What a client command needs.
 struct Ctx<'a> {
     global: &'a Global,
+    /// The board and identity this command uses.
+    target: Target,
     client: Client,
     /// Where `wait` or `tail` can continue from, kept current so a signal
     /// or failure can report it.
@@ -272,19 +285,43 @@ impl Ctx<'_> {
         resume
     }
 
+    /// `openboard` with the flags that select this board and login.
+    ///
+    /// They are spelled out, so the command means the same thing later, when
+    /// more logins may be stored. A token from the environment stays there
+    /// and is never put on a command line.
+    fn selecting(&self) -> Vec<String> {
+        let mut parts = vec!["openboard".to_owned()];
+        let url = shell_quote(&self.target.url);
+        match &self.target.origin {
+            Origin::Local if self.target.url == cli::DEFAULT_URL => {}
+            Origin::Local | Origin::Env => parts.extend(["--url".to_owned(), url]),
+            Origin::Stored(_) => {
+                parts.extend(["--url".to_owned(), url]);
+                if let Some(principal) = &self.target.principal {
+                    parts.extend(["--login".to_owned(), shell_quote(principal)]);
+                }
+            }
+        }
+        parts
+    }
+
+    /// A full command line for this board and login.
+    fn command(&self, rest: &str) -> String {
+        format!("{} {rest}", self.selecting().join(" "))
+    }
+
     /// The command line that runs `verb` again from `cursor`, with every
     /// non-default global flag spelled out so it works from any shell.
     fn command_line(&self, verb: &str, cursor: &str, flags: &[(&str, Option<&str>)]) -> String {
-        let mut parts = vec!["openboard".to_owned()];
+        let mut parts = self.selecting();
         let mut flag = |name: &str, value: &str| {
             parts.push(name.to_owned());
             if !value.is_empty() {
                 parts.push(shell_quote(value));
             }
         };
-        if self.global.url() != cli::DEFAULT_URL {
-            flag("--url", self.global.url());
-        }
+
         if self.global.board() != openboard_api::DEFAULT_BOARD {
             flag("--board", self.global.board());
         }
@@ -319,6 +356,23 @@ fn to_json<T: Serialize>(value: &T) -> Result<String, Failure> {
         .map_err(|error| Failure::new(codes::IO, format!("cannot encode the output: {error}")))
 }
 
+/// What the command line and the environment say about which board to use
+/// and as whom. This is the only place the token variable is read.
+fn wanted(global: &Global) -> Wanted {
+    let env = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+    };
+    Wanted {
+        url: global.url(),
+        login: global.login().map(str::to_owned),
+        token: env("BOARD_TOKEN").map(Secret::new),
+        fingerprint: env("BOARD_FINGERPRINT"),
+    }
+}
+
 /// Quotes a value for a POSIX shell when it needs it.
 fn shell_quote(value: &str) -> String {
     let plain = !value.is_empty()
@@ -344,12 +398,35 @@ async fn dispatch(cli: Cli, text: Option<String>) -> Result<(), Failure> {
                 result = verify_log(global.json, args.data_dir.clone()) => result,
             };
         }
+        // These need no board connection chosen from the stored logins.
+        Command::Invite(_)
+        | Command::Admin(_)
+        | Command::Join(_)
+        | Command::Logins
+        | Command::Logout(cli::LogoutArgs { local_only: true }) => {
+            let command = async {
+                match &cli.command {
+                    Command::Invite(args) => admin::invite(global, args).await,
+                    Command::Admin(command) => admin::run(global.json, command).await,
+                    Command::Join(_) => session::join(global, &text.unwrap_or_default()).await,
+                    Command::Logins => session::logins(global.json),
+                    _ => session::forget(global),
+                }
+            };
+            return tokio::select! {
+                biased;
+                sig = signalled(&mut signals) => Err(interrupted(sig)),
+                result = command => result,
+            };
+        }
         _ => {}
     }
 
+    let target = target::resolve(&wanted(global), Store::load)?;
     let ctx = Ctx {
         global,
-        client: Client::new(global.url(), global.board(), global.profile())?,
+        client: Client::new(&target, global.board(), global.profile())?,
+        target,
         resume: Mutex::new(None),
     };
     let command = async {
@@ -379,7 +456,13 @@ async fn dispatch(cli: Cli, text: Option<String>) -> Result<(), Failure> {
             }
             Command::Wait(args) => wait(&ctx, args).await,
             Command::Tail(args) => tail(&ctx, args).await,
-            Command::Serve(_) | Command::Admin(_) => Ok(()),
+            Command::Whoami => session::whoami(&ctx).await,
+            Command::Logout(_) => session::logout(&ctx).await,
+            Command::Serve(_)
+            | Command::Admin(_)
+            | Command::Invite(_)
+            | Command::Join(_)
+            | Command::Logins => Ok(()),
         }
     };
     tokio::select! {
@@ -412,12 +495,35 @@ async fn serve(
     config.bind = args.bind;
     config.port = args.port;
     config.max_message_chars = args.max_message_chars;
+    config.network = args.network;
+    config.public_url.clone_from(&args.public_url);
+
+    // Whether --network is about to turn an existing local board into a
+    // network one, which cannot be undone and is worth saying.
+    let data_dir = args.data_dir.clone();
+    let was_local = args.network
+        && tokio::task::spawn_blocking(move || {
+            openboard_server::operator::board_info(&data_dir)
+                .is_ok_and(|info| info.mode == openboard_server::Mode::Local)
+        })
+        .await
+        .unwrap_or(false);
 
     let server = openboard_server::bind(config).await.map_err(|error| {
         let message = error.to_string();
         match error {
-            ServeError::NonLoopbackBind(_) => Failure::new(codes::NON_LOOPBACK_BIND, message)
-                .next("use --bind 127.0.0.1 or --bind ::1"),
+            ServeError::NonLoopbackBind(_) => Failure::new(codes::NON_LOOPBACK_BIND, message).next(
+                "use --bind 127.0.0.1 or --bind ::1 for a local board, or add --network to \
+                     run a network board with TLS and authentication",
+            ),
+            ServeError::PublicUrlRequired(_) => Failure::usage(message).next(
+                "add --public-url with the address agents will use, such as --public-url \
+                 https://192.168.1.20:7878, or --bind that one address",
+            ),
+            ServeError::InvalidPublicUrl(_) => Failure::usage(message)
+                .next("pass --public-url as https://<host>:<port> with nothing after the port"),
+            ServeError::Tls(_) => Failure::new(codes::SERVE_FAILED, message)
+                .next("check the certificate and key files in --data-dir"),
             ServeError::Bind { .. } => Failure::new(codes::SERVE_FAILED, message).next(
                 "another board may already be running there; choose a port with --port, or \
                  --port 0 for any free one",
@@ -432,22 +538,50 @@ async fn serve(
         }
     })?;
 
-    let url = format!("http://{}", server.local_addr());
+    let url = server.url().to_owned();
+    let mode = server.mode();
+    let data_dir = args.data_dir.display().to_string();
     if json {
         #[derive(Serialize)]
         struct Listening<'a> {
             url: &'a str,
-            data_dir: String,
+            data_dir: &'a str,
+            mode: &'a str,
+            /// The address the listener is bound to.
+            listen: String,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            fingerprint: Option<&'a str>,
         }
         write_stdout(&to_json(&Listening {
             url: &url,
-            data_dir: args.data_dir.display().to_string(),
+            data_dir: &data_dir,
+            mode: mode.as_str(),
+            listen: server.local_addr().to_string(),
+            fingerprint: server.fingerprint(),
         })?)?;
-    } else {
+    } else if let Some(fingerprint) = server.fingerprint() {
         write_stdout(&format!(
-            "listening on {url} (data in {})",
-            args.data_dir.display()
+            "network board listening on {url} (data in {data_dir})\n\
+             mode: network (TLS 1.3, a token on every request)\n\
+             certificate fingerprint: {fingerprint}\n\
+             invite an agent from this host with: openboard invite <name> --data-dir {}",
+            shell_quote(&data_dir)
         ))?;
+    } else {
+        write_stdout(&format!("listening on {url} (data in {data_dir})"))?;
+    }
+    if mode == openboard_server::Mode::Network {
+        if was_local {
+            eprintln!(
+                "openboard: this data directory was a local board and is now a network board \
+                 for good"
+            );
+        } else if !args.network {
+            eprintln!(
+                "openboard: this data directory is a network board, so it is served with TLS \
+                 and authentication although --network was not given"
+            );
+        }
     }
 
     let mut stop = signals.clone();
@@ -613,12 +747,13 @@ struct Waited<'a> {
 
 async fn wait(ctx: &Ctx<'_>, args: &WaitArgs) -> Result<(), Failure> {
     let thread = thread_root(ctx, args.thread.as_deref()).await?;
-    // In local mode every caller is the principal `local`, so a profile's
-    // handle is `local/<profile>`.
-    let not_from = match ctx.global.profile() {
-        Some(profile) if !args.include_self => Some(format!("local/{profile}")),
-        _ => None,
-    };
+    // The board knows who is asking, so it does the skipping. On a local
+    // board every caller is the principal `local`: without a profile there
+    // is no "self" to tell apart, and nothing is skipped.
+    let skip_self =
+        !args.include_self && (ctx.target.is_network() || ctx.global.profile().is_some());
+    let not_from_self = skip_self.then_some(true);
+    let deadline = Instant::now() + args.timeout;
     let timeout_flag =
         (args.timeout != Duration::from_secs(30 * 60)).then(|| cli::format_duration(args.timeout));
     let flags = [
@@ -628,23 +763,25 @@ async fn wait(ctx: &Ctx<'_>, args: &WaitArgs) -> Result<(), Failure> {
         ("--include-self", args.include_self.then_some("")),
     ];
 
-    let deadline = Instant::now() + args.timeout;
     let mut after = args.after.clone();
     if after.is_none() {
         // "From now" is decided by the server when a request arrives. Ask
         // once without holding, so the starting cursor is known before the
         // first long-poll and an interrupted wait can still say where to
         // resume.
-        let now = ctx
-            .client
-            .events(&EventsQuery {
-                channel: args.channel.clone(),
-                thread: thread.clone(),
-                not_from: not_from.clone(),
-                limit: Some(1),
-                ..EventsQuery::default()
-            })
-            .await?;
+        let query = EventsQuery {
+            channel: args.channel.clone(),
+            thread: thread.clone(),
+            not_from_self,
+            limit: Some(1),
+            ..EventsQuery::default()
+        };
+        let now = loop {
+            match ctx.client.events(&query).await {
+                Err(failure) => slow_down(failure, Some(deadline)).await?,
+                Ok(now) => break now,
+            }
+        };
         ctx.set_resume("wait", &now.cursor, &flags);
         after = Some(now.cursor);
     }
@@ -664,12 +801,23 @@ async fn wait(ctx: &Ctx<'_>, args: &WaitArgs) -> Result<(), Failure> {
                 after: after.clone(),
                 channel: args.channel.clone(),
                 thread: thread.clone(),
-                not_from: not_from.clone(),
+                not_from: None,
+                not_from_self,
                 wait: Some(hold),
                 limit: Some(1),
             })
-            .await
-            .map_err(|failure| failure.resume(ctx.resume().as_ref()))?;
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            // Any other failure ends the wait. In particular a login the
+            // board stopped accepting (`unauthenticated`) is never retried.
+            Err(failure) => {
+                slow_down(failure, Some(deadline))
+                    .await
+                    .map_err(|failure| failure.resume(ctx.resume().as_ref()))?;
+                continue;
+            }
+        };
 
         if let Some(event) = response.events.first() {
             // Resume just past this event, not past everything scanned.
@@ -718,6 +866,25 @@ async fn wait(ctx: &Ctx<'_>, args: &WaitArgs) -> Result<(), Failure> {
     }
 }
 
+/// Waits out a `rate_limited` answer for as long as the board asked, so the
+/// caller can try again. Every other failure is handed back, and so is a
+/// pause that would run past `deadline`.
+async fn slow_down(failure: Failure, deadline: Option<Instant>) -> Result<(), Failure> {
+    if failure.code != openboard_api::codes::RATE_LIMITED {
+        return Err(failure);
+    }
+    let pause = Duration::from_secs(failure.retry_after.unwrap_or(5).clamp(1, 300));
+    if deadline.is_some_and(|deadline| Instant::now() + pause >= deadline) {
+        return Err(failure);
+    }
+    eprintln!(
+        "openboard: the board asked this client to slow down; continuing in {}s",
+        pause.as_secs()
+    );
+    tokio::time::sleep(pause).await;
+    Ok(())
+}
+
 async fn tail(ctx: &Ctx<'_>, args: &TailArgs) -> Result<(), Failure> {
     let thread = thread_root(ctx, args.thread.as_deref()).await?;
     let filter = EventsQuery {
@@ -736,13 +903,16 @@ async fn tail(ctx: &Ctx<'_>, args: &TailArgs) -> Result<(), Failure> {
         (Some(after), _) => after.clone(),
         (None, true) => CURSOR_START.to_owned(),
         (None, false) => {
-            ctx.client
-                .events(&EventsQuery {
-                    limit: Some(1),
-                    ..filter.clone()
-                })
-                .await?
-                .cursor
+            let query = EventsQuery {
+                limit: Some(1),
+                ..filter.clone()
+            };
+            loop {
+                match ctx.client.events(&query).await {
+                    Err(failure) => slow_down(failure, None).await?,
+                    Ok(now) => break now.cursor,
+                }
+            }
         }
     };
     let mut connected = false;
@@ -785,6 +955,13 @@ async fn tail(ctx: &Ctx<'_>, args: &TailArgs) -> Result<(), Failure> {
                 eprintln!("openboard: the event stream ended; reconnecting after {cursor}");
             }
             Err(failure) => {
+                // Told to slow down: wait as long as asked, then go on.
+                let failure = match slow_down(failure, None).await {
+                    Ok(()) => continue,
+                    Err(failure) => failure,
+                };
+                // A login the board stopped accepting is not transient: the
+                // tail ends here with `unauthenticated`.
                 let transient = [
                     codes::CONNECTION_FAILED,
                     codes::REQUEST_TIMEOUT,
