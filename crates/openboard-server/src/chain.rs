@@ -35,6 +35,15 @@
 //! event cannot be moved from one encoding to the other without breaking its
 //! hash. Message text is never part of an event (design P6), so it is not
 //! covered by the chain.
+//!
+//! `type` is one of the names in `openboard_api::event_types`. Every type
+//! has the same fields and is encoded the same way, so the types added
+//! after `message.posted` (edits, deletions, label and reaction changes)
+//! needed no new encoding version: an event's type is covered by its hash
+//! like any other field, and one chain per board runs through all of them.
+//! For a label or reaction change the actor and credential are those of
+//! whoever made the change. Label values and reaction names are never part
+//! of an event either.
 
 use std::fmt;
 use std::path::{Path, PathBuf};

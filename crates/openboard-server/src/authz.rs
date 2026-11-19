@@ -42,8 +42,8 @@ impl Principal {
     }
 
     /// A caller the server has not authenticated. A network board uses it
-    /// for the two routes that take no token, the health check and
-    /// enrolment, and for nothing else. It never writes anything, and no
+    /// for the routes that take no token, the health check, enrolment and
+    /// the web UI's static files, and for nothing else. It never writes anything, and no
     /// agent can be given its handle.
     pub fn anonymous() -> Self {
         Self {
@@ -104,6 +104,20 @@ pub enum Action {
     /// Read or end the caller's own session: `whoami` and `logout`. Carries
     /// no board.
     Session,
+    /// Replace the text of a message. The policy decides whether the caller
+    /// may edit in the channel at all; that only the message's own author
+    /// may do it is a fixed rule the server applies on top.
+    Edit,
+    /// Delete a message, leaving a tombstone. Author-only, like [`Action::Edit`].
+    Delete,
+    /// Set or clear labels on a message.
+    Label,
+    /// Add or remove a reaction on a message.
+    React,
+    /// Fetch the web UI's page, script or style sheet. Carries no board.
+    /// These files hold no board content, and the caller is not
+    /// authenticated.
+    Page,
 }
 
 /// The outcome of an authorization check.
@@ -155,8 +169,8 @@ impl Policy for LocalPolicy {
 }
 
 /// The network policy until milestone M4: every authenticated principal may
-/// do everything, and an unauthenticated caller may only check health and
-/// enrol.
+/// do everything, and an unauthenticated caller may only check health,
+/// enrol and fetch the web UI's static files.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NetworkPolicy;
 
@@ -169,7 +183,7 @@ impl Policy for NetworkPolicy {
         _channel: Option<&str>,
     ) -> Decision {
         let allowed = if principal.is_anonymous() {
-            matches!(action, Action::Health | Action::Enrol)
+            matches!(action, Action::Health | Action::Enrol | Action::Page)
         } else {
             // The local principal does not exist on a network board.
             principal.kind != ActorKind::Local
@@ -210,7 +224,7 @@ impl Authorizer {
 mod tests {
     use super::*;
 
-    const ACTIONS: [Action; 7] = [
+    const ACTIONS: [Action; 12] = [
         Action::Health,
         Action::Read,
         Action::Post,
@@ -218,6 +232,11 @@ mod tests {
         Action::CreateBoard,
         Action::Enrol,
         Action::Session,
+        Action::Edit,
+        Action::Delete,
+        Action::Label,
+        Action::React,
+        Action::Page,
     ];
 
     #[test]
@@ -234,7 +253,7 @@ mod tests {
             let decision = authz.authorize(&Principal::local(), action, Some("general"), None);
             assert_eq!(decision, Decision::Deny, "{action:?}");
             let anonymous = authz.authorize(&Principal::anonymous(), action, None, None);
-            let open = matches!(action, Action::Health | Action::Enrol);
+            let open = matches!(action, Action::Health | Action::Enrol | Action::Page);
             assert_eq!(anonymous.is_allowed(), open, "{action:?}");
         }
     }

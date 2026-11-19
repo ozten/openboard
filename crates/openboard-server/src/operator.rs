@@ -30,7 +30,7 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 
 use crate::identity::{self, LogEntry};
 use crate::names;
-use crate::store::{DB_FILE_NAME, SCHEMA_VERSION};
+use crate::store::{DB_FILE_NAME, OLDEST_IDENTITY_SCHEMA, SCHEMA_VERSION};
 use crate::time::{now_ms, rfc3339_from_ms};
 use crate::Mode;
 
@@ -220,7 +220,8 @@ fn open(data_dir: &Path, write: bool) -> Result<(Connection, Schema)> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     let schema = match version {
         1 => Schema::Old,
-        SCHEMA_VERSION => Schema::Current,
+        // Milestone M1's schema has every table used here.
+        OLDEST_IDENTITY_SCHEMA..=SCHEMA_VERSION => Schema::Current,
         other => {
             return Err(OperatorError::Storage(format!(
             "the database has schema version {other}, but this version supports {SCHEMA_VERSION}"

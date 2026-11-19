@@ -1996,7 +1996,7 @@ async fn an_m0_data_directory_migrates_verifies_and_accepts_new_events() {
     let task = tokio::spawn(server.run(async {
         let _ = stopped.await;
     }));
-    assert_eq!(version(&data_dir), 2);
+    assert_eq!(version(&data_dir), 3);
     assert_eq!(verified(&data_dir), 2);
     let http = Client::builder().no_proxy().build().unwrap();
     let thread: Thread = http
@@ -2697,4 +2697,660 @@ async fn a_start_that_cannot_bind_does_not_upgrade_a_local_directory() {
     assert_eq!(server.mode(), Mode::Network);
     assert!(kinds(&data_dir).contains(&log_kinds::MODE_UPGRADED.to_owned()));
     drop(server);
+}
+
+// ---------------------------------------------------------------------------
+// Milestone M2: message features and the web UI's static files
+// ---------------------------------------------------------------------------
+
+impl Net {
+    /// Sends a request with a bearer token and, when given, a JSON body.
+    async fn send(
+        &self,
+        token: &str,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> Response {
+        let mut request = self.http.request(method, self.at(path)).bearer_auth(token);
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        request.send().await.unwrap()
+    }
+
+    async fn read(&self, token: &str, id: &str) -> Thread {
+        let response = self
+            .get(token, &format!("/v1/boards/general/threads/{id}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        response.json().await.unwrap()
+    }
+}
+
+async fn message_of(response: Response) -> openboard_api::Message {
+    assert_eq!(response.status(), StatusCode::OK);
+    response.json().await.unwrap()
+}
+
+/// The first event frame of an event stream.
+async fn first_frame(response: &mut Response) -> Event {
+    let mut buffer = String::new();
+    loop {
+        let chunk = tokio::time::timeout(Duration::from_secs(10), response.chunk())
+            .await
+            .expect("the stream delivers in time")
+            .unwrap()
+            .expect("the stream stays open");
+        buffer.push_str(std::str::from_utf8(&chunk).unwrap());
+        while let Some(end) = buffer.find("\n\n") {
+            let frame: String = buffer.drain(..end + 2).collect();
+            if let Some(data) = frame.lines().find_map(|line| line.strip_prefix("data:")) {
+                return serde_json::from_str(data.trim_start()).unwrap();
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn only_the_author_edits_or_deletes_and_everyone_labels_and_reacts() {
+    use reqwest::Method;
+    let board = Net::start().await;
+    let (alice, alice_credential) = board.enrol("alice").await;
+    let (bob, bob_credential) = board.enrol("bob").await;
+    let root = board
+        .thread(&alice, "dev", "alice wrote this")
+        .await
+        .message;
+    let path = format!("/v1/boards/general/messages/{}", root.id);
+
+    // Bob can read it and cannot change or remove it.
+    let response = board
+        .send(
+            &bob,
+            Method::PATCH,
+            &path,
+            Some(json!({"text": "bob's now"})),
+        )
+        .await;
+    error_of(response, StatusCode::FORBIDDEN, codes::FORBIDDEN).await;
+    let response = board.send(&bob, Method::DELETE, &path, None).await;
+    error_of(response, StatusCode::FORBIDDEN, codes::FORBIDDEN).await;
+    // Neither can alice under a profile the message was not written with.
+    let response = board
+        .http
+        .patch(board.at(&path))
+        .bearer_auth(&alice)
+        .header(PROFILE_HEADER, "fx")
+        .json(&json!({"text": "as another actor"}))
+        .send()
+        .await
+        .unwrap();
+    error_of(response, StatusCode::FORBIDDEN, codes::FORBIDDEN).await;
+    assert_eq!(board.read(&bob, &root.id).await.root, root);
+
+    // Labels and reactions are open to every enrolled principal.
+    let labelled = board
+        .send(
+            &bob,
+            Method::POST,
+            &format!("{path}/labels"),
+            Some(json!({"set": {"status": "claimed"}, "if_unset": ["status"]})),
+        )
+        .await;
+    assert_eq!(message_of(labelled).await.labels["status"], "claimed");
+    let raced = board
+        .send(
+            &alice,
+            Method::POST,
+            &format!("{path}/labels"),
+            Some(json!({"set": {"status": "mine"}, "if_unset": ["status"]})),
+        )
+        .await;
+    error_of(raced, StatusCode::CONFLICT, codes::LABEL_CONFLICT).await;
+    for token in [&bob, &alice, &bob] {
+        let reacted = board
+            .send(
+                token,
+                Method::PUT,
+                &format!("{path}/reactions/thumbsup"),
+                None,
+            )
+            .await;
+        assert_eq!(reacted.status(), StatusCode::OK);
+    }
+    let reacted = board.read(&alice, &root.id).await.root;
+    assert_eq!(reacted.reactions.len(), 1);
+    // One each, oldest first, by the principal's handle.
+    assert_eq!(reacted.reactions[0].by, ["bob", "alice"]);
+    // Removing one's own reaction leaves the other's.
+    let removed = board
+        .send(
+            &bob,
+            Method::DELETE,
+            &format!("{path}/reactions/thumbsup"),
+            None,
+        )
+        .await;
+    assert_eq!(message_of(removed).await.reactions[0].by, ["alice"]);
+
+    // Alice edits and deletes her own message.
+    let edited = board
+        .send(
+            &alice,
+            Method::PATCH,
+            &path,
+            Some(json!({"text": "alice rewrote this", "revision": 1})),
+        )
+        .await;
+    let edited = message_of(edited).await;
+    assert_eq!(edited.revision, 2);
+    assert_eq!(edited.by.handle, "alice");
+    let deleted = board.send(&alice, Method::DELETE, &path, None).await;
+    assert!(message_of(deleted).await.deleted_at.is_some());
+    // Bob still may not delete it, tombstone or not.
+    let response = board.send(&bob, Method::DELETE, &path, None).await;
+    error_of(response, StatusCode::FORBIDDEN, codes::FORBIDDEN).await;
+
+    // Each event is by whoever made the change, with their credential.
+    let log = board.events(&alice, None, "after=start").await;
+    let seen: Vec<(&str, &str, Option<&str>)> = log
+        .events
+        .iter()
+        .map(|event| {
+            (
+                event.kind.as_str(),
+                event.by.handle.as_str(),
+                event.credential_id.as_deref(),
+            )
+        })
+        .collect();
+    let (a, b) = (
+        Some(alice_credential.id.as_str()),
+        Some(bob_credential.id.as_str()),
+    );
+    assert_eq!(
+        seen,
+        [
+            ("message.posted", "alice", a),
+            ("labels.changed", "bob", b),
+            ("reactions.changed", "bob", b),
+            ("reactions.changed", "alice", a),
+            ("reactions.changed", "bob", b),
+            ("message.edited", "alice", a),
+            ("message.deleted", "alice", a),
+        ]
+    );
+    assert!(log
+        .events
+        .iter()
+        .all(|event| event.by.kind == ActorKind::Agent));
+
+    // Without a token none of the new routes says anything.
+    for (method, path, body) in [
+        (Method::PATCH, path.clone(), Some(json!({"text": "x"}))),
+        (Method::DELETE, path.clone(), None),
+        (Method::POST, format!("{path}/labels"), Some(json!({}))),
+        (Method::PUT, format!("{path}/reactions/eyes"), None),
+        (Method::DELETE, format!("{path}/reactions/eyes"), None),
+        (Method::GET, "/v1/boards".to_owned(), None),
+    ] {
+        let mut request = board.http.request(method, board.at(&path));
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let response = request.send().await.unwrap();
+        error_of(response, StatusCode::UNAUTHORIZED, codes::UNAUTHENTICATED).await;
+    }
+    let dir = board.stop().await;
+    assert_eq!(verified(&data_dir_of(&dir)), 7);
+}
+
+#[tokio::test]
+async fn a_mention_wakes_the_mentioned_agents_long_poll_and_stream() {
+    let board = Arc::new(Net::start().await);
+    let (alice, _) = board.enrol("agent-a").await;
+    let (carol, _) = board.enrol("Agent-C").await;
+    board.enrol("agent-b").await;
+
+    let waiter = {
+        let (board, carol) = (Arc::clone(&board), carol.clone());
+        tokio::spawn(async move {
+            board
+                .events(&carol, None, "wait=30&mentions_self=true")
+                .await
+        })
+    };
+    let mut stream = board
+        .get(
+            &carol,
+            "/v1/boards/general/events/stream?mentions_self=true",
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stream.status(), StatusCode::OK);
+    // A second stream, as the same agent under a declared profile.
+    let mut reviewer = board
+        .get(
+            &carol,
+            "/v1/boards/general/events/stream?mentions_self=true",
+        )
+        .header(PROFILE_HEADER, "reviewer")
+        .send()
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // None of these is for carol with no profile.
+    let quiet = board.thread(&alice, "dev", "nothing for anyone").await;
+    assert!(quiet.message.mentions.is_empty());
+    let other = board.thread(&alice, "dev", "over to @agent-b").await;
+    assert_eq!(other.message.mentions[0].handle, "agent-b");
+    let coded = board
+        .thread(&alice, "dev", "`@agent-c` and @agent-cc")
+        .await;
+    assert!(coded.message.mentions.is_empty());
+    // On a network board `local` is nobody.
+    let local = board.thread(&alice, "dev", "@local and @anonymous").await;
+    assert!(local.message.mentions.is_empty());
+    let profiled = board
+        .thread(&alice, "dev", "for @agent-c/reviewer only")
+        .await;
+    assert_eq!(profiled.message.mentions.len(), 1);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!waiter.is_finished());
+    // The profiled stream did get the one that names its profile.
+    assert_eq!(
+        first_frame(&mut reviewer).await.message_id,
+        profiled.message.id
+    );
+
+    // Handles match without regard to case, and the mention records the
+    // handle as the board has it, with the principal's kind.
+    let wanted = board
+        .thread(&alice, "dev", "please review, @AGENT-C.")
+        .await
+        .message;
+    assert_eq!(wanted.mentions.len(), 1);
+    assert_eq!(wanted.mentions[0].handle, "Agent-C");
+    assert_eq!(wanted.mentions[0].kind, ActorKind::Agent);
+    assert_eq!(wanted.mentions[0].profile, None);
+
+    let woke = tokio::time::timeout(Duration::from_secs(5), waiter)
+        .await
+        .expect("the mention wakes the long-poll")
+        .unwrap();
+    assert_eq!(woke.events.len(), 1);
+    assert_eq!(woke.events[0].message_id, wanted.id);
+    assert_eq!(woke.events[0].by.handle, "agent-a");
+    assert_eq!(first_frame(&mut stream).await.message_id, wanted.id);
+    assert_eq!(first_frame(&mut reviewer).await.message_id, wanted.id);
+
+    // Alice is not woken by her own mention of someone else.
+    let mine = board
+        .events(&alice, None, "after=start&mentions_self=true")
+        .await;
+    assert!(mine.events.is_empty());
+    // The rendered text marks the mention.
+    let thread: Thread = board
+        .get(
+            &carol,
+            &format!("/v1/boards/general/threads/{}?html=true", wanted.id),
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        thread.root.html.as_deref(),
+        Some("<p>please review, <span class=\"mention\">@AGENT-C</span>.</p>")
+    );
+    drop((stream, reviewer));
+    Arc::into_inner(board).unwrap().stop().await;
+}
+
+#[tokio::test]
+async fn the_static_pages_need_no_token_and_nothing_else_is_exempt() {
+    use reqwest::Method;
+    let board = Net::start().await;
+    let (token, _) = board.enrol("alice").await;
+    board
+        .thread(&token, "dev", "SAFFRON-KITE board content")
+        .await;
+    let csp = "default-src 'none'; script-src 'self'; style-src 'self'; \
+               img-src 'self' data:; connect-src 'self'; base-uri 'none'; \
+               form-action 'none'; frame-ancestors 'none'";
+    let assert_headers = |response: &Response, what: &str| {
+        let headers = response.headers();
+        assert_eq!(headers["content-security-policy"], csp, "{what}");
+        assert_eq!(headers["x-content-type-options"], "nosniff", "{what}");
+        assert_eq!(headers["referrer-policy"], "no-referrer", "{what}");
+        assert!(
+            headers
+                .keys()
+                .all(|name| !name.as_str().starts_with("access-control-")),
+            "{what}"
+        );
+    };
+
+    // The page and its files, with no credential at all, and with a bad one.
+    for path in ["/", "/join", "/assets/app.js", "/assets/app.css"] {
+        for authorization in [None, Some("Bearer garbage")] {
+            let mut request = board.http.get(board.at(path));
+            if let Some(value) = authorization {
+                request = request.header("authorization", value);
+            }
+            let response = request.send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert_headers(&response, path);
+            let cache = if path.starts_with("/assets/") {
+                "no-cache"
+            } else {
+                "no-store"
+            };
+            assert_eq!(response.headers()["cache-control"], cache, "{path}");
+            // They hold no board content.
+            let body = response.text().await.unwrap();
+            assert!(!body.is_empty() && !body.contains("SAFFRON-KITE"));
+        }
+    }
+    let unknown = board
+        .http
+        .get(board.at("/assets/nope.js"))
+        .send()
+        .await
+        .unwrap();
+    assert_headers(&unknown, "an unknown asset");
+    error_of(unknown, StatusCode::NOT_FOUND, codes::NOT_FOUND).await;
+
+    // Everything else still needs a token, and says the same thing without.
+    let mut refusals = Vec::new();
+    for (method, path) in [
+        (Method::GET, "/v1/boards"),
+        (Method::GET, "/v1/boards/general/channels"),
+        (Method::GET, "/v1/whoami"),
+        (Method::GET, "/v1/web/session"),
+        (Method::POST, "/v1/web/login"),
+        (Method::GET, "/index.html"),
+        (Method::GET, "/assets"),
+        (Method::GET, "/assets/"),
+        (Method::GET, "/assets/a/b"),
+        (Method::GET, "/join/"),
+        (Method::GET, "/nope"),
+        (Method::POST, "/"),
+        (Method::PUT, "/join"),
+        (Method::DELETE, "/assets/app.js"),
+        (Method::POST, "/assets/app.js"),
+    ] {
+        let what = format!("{method} {path}");
+        let response = board
+            .http
+            .request(method, board.at(path))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{what}");
+        assert_headers(&response, &what);
+        assert_eq!(response.headers()["cache-control"], "no-store", "{what}");
+        refusals.push(response.text().await.unwrap());
+    }
+    assert!(refusals.iter().all(|body| body == &refusals[0]));
+    assert!(refusals[0].contains(codes::UNAUTHENTICATED));
+    let head = board.http.head(board.at("/")).send().await.unwrap();
+    assert_eq!(head.status(), StatusCode::UNAUTHORIZED);
+
+    // With a token the API answers, and carries the same headers.
+    let boards = board.get(&token, "/v1/boards").send().await.unwrap();
+    assert_eq!(boards.status(), StatusCode::OK);
+    assert_headers(&boards, "the board list");
+    assert_eq!(boards.headers()["cache-control"], "no-store");
+    let boards: openboard_api::BoardList = boards.json().await.unwrap();
+    assert_eq!(boards.boards.len(), 1);
+    assert_eq!(boards.boards[0].name, "general");
+    assert!(boards.boards[0].last_activity_at.is_some());
+    let unknown = board.get(&token, "/assets/nope.js").send().await.unwrap();
+    error_of(unknown, StatusCode::NOT_FOUND, codes::NOT_FOUND).await;
+    // The routes this milestone's other half adds do not exist yet.
+    let session = board.get(&token, "/v1/web/session").send().await.unwrap();
+    error_of(session, StatusCode::NOT_FOUND, codes::NOT_FOUND).await;
+    board.stop().await;
+}
+
+/// What milestone M1 added to the M0 schema, frozen here as a fixture.
+const M1_MIGRATION: &str = "
+CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
+CREATE TABLE principals (
+    id TEXT PRIMARY KEY, kind TEXT NOT NULL, handle TEXT NOT NULL,
+    handle_key TEXT NOT NULL UNIQUE, created_ms INTEGER NOT NULL
+);
+CREATE TABLE credentials (
+    id TEXT PRIMARY KEY, principal_id TEXT NOT NULL REFERENCES principals(id),
+    token_hash TEXT NOT NULL UNIQUE, created_ms INTEGER NOT NULL,
+    expires_ms INTEGER NOT NULL, revoked_ms INTEGER, last_used_ms INTEGER
+);
+CREATE INDEX credentials_by_principal ON credentials(principal_id);
+CREATE TABLE invites (
+    id TEXT PRIMARY KEY, principal_id TEXT NOT NULL REFERENCES principals(id),
+    code_hash TEXT NOT NULL UNIQUE, token_ttl_ms INTEGER NOT NULL,
+    created_ms INTEGER NOT NULL, expires_ms INTEGER NOT NULL,
+    used_ms INTEGER, revoked_ms INTEGER
+);
+CREATE INDEX invites_by_principal ON invites(principal_id);
+CREATE TABLE security_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, kind TEXT NOT NULL,
+    principal TEXT, credential_id TEXT, client TEXT, detail TEXT
+);
+CREATE TRIGGER security_log_is_append_only_update BEFORE UPDATE ON security_log
+BEGIN SELECT RAISE(ABORT, 'the security log is append-only'); END;
+CREATE TRIGGER security_log_is_append_only_delete BEFORE DELETE ON security_log
+BEGIN SELECT RAISE(ABORT, 'the security log is append-only'); END;
+ALTER TABLE messages ADD COLUMN credential_id TEXT;
+ALTER TABLE events ADD COLUMN credential_id TEXT;
+ALTER TABLE events ADD COLUMN hash_version INTEGER NOT NULL DEFAULT 1;
+PRAGMA user_version = 2;
+";
+
+fn sha256_hex(text: &str) -> String {
+    Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Writes a data directory as an M1 server left a network board: schema
+/// version 2, one agent with a live credential, and one thread by it with
+/// its event in hash encoding 2. Returns the agent's token and its message.
+fn write_m1_directory(data_dir: &Path) -> (String, &'static str) {
+    std::fs::create_dir_all(data_dir).unwrap();
+    let conn = open_db(data_dir);
+    conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+    conn.execute_batch(M0_SCHEMA).unwrap();
+    conn.execute_batch(M1_MIGRATION).unwrap();
+
+    let token = format!("{TOKEN_PREFIX}{}", "5e".repeat(32));
+    let (principal, credential, message) = ("prn_m1alice", "crd_m1alice", "msg_m1root");
+    let at = "2026-11-01T09:00:00.000Z";
+    // The actor ID as every version derives it from the principal.
+    let actor = format!(
+        "act_{}",
+        &sha256_hex(&format!("openboard.actor.v1\n{principal}\n"))[..24]
+    );
+    let genesis = "0".repeat(64);
+    let field = |name: &str, value: &str| format!("{name}={}:{value}\n", value.len());
+    let mut encoded = String::from("openboard.event.v2\n");
+    encoded += &field("prev_hash", &genesis);
+    encoded += &field("board", "general");
+    encoded += &field("seq", "1");
+    encoded += &field("type", "message.posted");
+    encoded += &field("channel", "research");
+    encoded += &field("thread_id", message);
+    encoded += &field("message_id", message);
+    encoded += &field("actor_id", &actor);
+    encoded += &field("actor_kind", "agent");
+    encoded += &field("actor_handle", "alice");
+    encoded += "actor_profile=-\n";
+    encoded += &field("at", at);
+    encoded += &field("credential_id", credential);
+    let hash = sha256_hex(&encoded);
+
+    conn.execute(
+        "INSERT INTO boards (id, name, name_key, tag, created_at, head_seq, head_hash)
+         VALUES (1, 'general', 'general', '1122334455667788', ?1, 1, ?2)",
+        [at, hash.as_str()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO principals VALUES (?1, 'agent', 'alice', 'alice', 1)",
+        [principal],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO credentials VALUES (?1, ?2, ?3, 1, 9999999999999, NULL, NULL)",
+        [credential, principal, sha256_hex(&token).as_str()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO actors VALUES (?1, 'agent', ?2, NULL, 'alice')",
+        [actor.as_str(), principal],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO messages VALUES (?1, 1, 'research', ?1, ?2, 'an M1 thread, cc @alice', ?3, 1, 1, ?4)",
+        [message, actor.as_str(), at, credential],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO events VALUES (1, 1, 'message.posted', 'research', ?1, ?1, ?2, ?3, ?4, ?5, ?6, 2)",
+        [message, actor.as_str(), at, genesis.as_str(), hash.as_str(), credential],
+    )
+    .unwrap();
+    conn.execute_batch(
+        "INSERT INTO channels VALUES (1, 'research', '2026-11-01T09:00:00.000Z', 1, '2026-11-01T09:00:00.000Z');
+         INSERT INTO threads VALUES ('msg_m1root', 1, 'research', 0, 1, '2026-11-01T09:00:00.000Z');
+         INSERT INTO meta VALUES ('mode', 'network');",
+    )
+    .unwrap();
+    (token, message)
+}
+
+#[tokio::test]
+async fn an_m1_data_directory_migrates_verifies_and_takes_the_new_features() {
+    use reqwest::Method;
+    let dir = TempDir::new().unwrap();
+    let data_dir = data_dir_of(&dir);
+    let (alice, message) = write_m1_directory(&data_dir);
+    let version = |dir: &Path| -> i64 {
+        open_db(dir)
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap()
+    };
+    // Before a new server opens it, the offline tools read it as it is.
+    assert_eq!(version(&data_dir), 2);
+    assert_eq!(verified(&data_dir), 1);
+    assert_eq!(operator::board_info(&data_dir).unwrap().mode, Mode::Network);
+    assert_eq!(operator::list_credentials(&data_dir).unwrap().len(), 1);
+    assert_eq!(version(&data_dir), 2, "reading migrates nothing");
+    // A network directory cannot be opened as a local board.
+    let mut config = Config::new(&data_dir);
+    config.port = 0;
+    let server = openboard_server::bind(config).await.unwrap();
+    assert_eq!(server.mode(), Mode::Network);
+    drop(server);
+    assert_eq!(version(&data_dir), 3);
+    assert_eq!(verified(&data_dir), 1);
+
+    let board = Net::start_in(dir, |_| {}).await;
+    assert_eq!(board.status(&alice).await, StatusCode::OK);
+    // The old message reads with the new fields at their defaults. Its
+    // text was written before mentions existed, so it has none.
+    let old = board.read(&alice, message).await.root;
+    assert_eq!(old.text, "an M1 thread, cc @alice");
+    assert_eq!(old.revision, 1);
+    assert_eq!((&old.edited_at, &old.deleted_at), (&None, &None));
+    assert!(old.labels.is_empty() && old.reactions.is_empty() && old.mentions.is_empty());
+    assert_eq!(old.by.handle, "alice");
+    let before = board
+        .events(&alice, None, "after=start&mentions_self=true")
+        .await;
+    assert!(before.events.is_empty());
+
+    // Its author is still its author, and every new operation works on it.
+    let (bob, _) = board.enrol("bob").await;
+    let path = format!("/v1/boards/general/messages/{message}");
+    let response = board
+        .send(
+            &bob,
+            Method::PATCH,
+            &path,
+            Some(json!({"text": "not bob's"})),
+        )
+        .await;
+    error_of(response, StatusCode::FORBIDDEN, codes::FORBIDDEN).await;
+    let edited = board
+        .send(
+            &alice,
+            Method::PATCH,
+            &path,
+            Some(json!({"text": "an M1 thread, edited, cc @alice and @bob", "revision": 1})),
+        )
+        .await;
+    let edited = message_of(edited).await;
+    assert_eq!(edited.revision, 2);
+    assert_eq!(edited.mentions.len(), 2);
+    let labelled = board
+        .send(
+            &bob,
+            Method::POST,
+            &format!("{path}/labels"),
+            Some(json!({"set": {"status": "seen"}})),
+        )
+        .await;
+    assert_eq!(message_of(labelled).await.labels.len(), 1);
+    let reacted = board
+        .send(&bob, Method::PUT, &format!("{path}/reactions/eyes"), None)
+        .await;
+    assert_eq!(message_of(reacted).await.reactions[0].by, ["bob"]);
+    let reply = board
+        .post(&bob, None, json!({"thread_id": message, "text": "a reply"}))
+        .await;
+    assert_eq!(reply.message.thread_id, message);
+    let mentioned = board
+        .events(
+            &bob,
+            None,
+            "after=start&mentions_self=true&types=message.edited",
+        )
+        .await;
+    assert_eq!(mentioned.events.len(), 1);
+    let deleted = board.send(&alice, Method::DELETE, &path, None).await;
+    assert_eq!(message_of(deleted).await.revision, 3);
+
+    // The one chain carries on from the M1 event, in the same encoding.
+    let log = board.events(&alice, None, "after=start").await;
+    assert_eq!(log.events.len(), 6);
+    for pair in log.events.windows(2) {
+        assert_eq!(pair[1].prev_hash, pair[0].hash);
+    }
+    let dir = board.stop().await;
+    let data_dir = data_dir_of(&dir);
+    assert_eq!(verified(&data_dir), 6);
+    let versions: Vec<i64> = open_db(&data_dir)
+        .prepare("SELECT hash_version FROM events ORDER BY seq")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(versions, [2; 6]);
+    // Opening it again changes nothing.
+    let board = Net::start_in(dir, |_| {}).await;
+    assert_eq!(board.status(&alice).await, StatusCode::OK);
+    let dir = board.stop().await;
+    assert_eq!(version(&data_dir_of(&dir)), 3);
+    assert_eq!(verified(&data_dir_of(&dir)), 6);
 }

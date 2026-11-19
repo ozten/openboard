@@ -722,6 +722,7 @@ async fn read(ctx: &Ctx<'_>, args: &ReadArgs) -> Result<(), Failure> {
             channel: channel.clone(),
             limit: args.limit,
             cursor: args.cursor.clone(),
+            ..ThreadsQuery::default()
         })
         .await?;
     ctx.print(&list, || render::thread_list(&list, &channel))
@@ -805,6 +806,7 @@ async fn wait(ctx: &Ctx<'_>, args: &WaitArgs) -> Result<(), Failure> {
                 not_from_self,
                 wait: Some(hold),
                 limit: Some(1),
+                ..EventsQuery::default()
             })
             .await;
         let response = match response {

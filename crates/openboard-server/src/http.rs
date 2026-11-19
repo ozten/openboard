@@ -6,7 +6,12 @@
 //! Every request passes [`gate`] before anything else looks at it. On a
 //! local board the gate checks the `Host` header. On a network board it
 //! authenticates the bearer token, so a caller without a valid one learns
-//! nothing about boards, routes or the shape of valid requests.
+//! nothing about boards, routes or the shape of valid requests. The only
+//! routes it lets through without one are the health check, enrolment and
+//! the web UI's static files, which hold no board content.
+//!
+//! Every response, from a handler, the gate or a fallback, leaves through
+//! [`security_headers`].
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -20,18 +25,19 @@ use std::time::Duration;
 use axum::body::{Body, Bytes};
 use axum::extract::rejection::{BytesRejection, PathRejection, QueryRejection};
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Extension, Path, Query, Request, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post, put};
 use axum::{Json, Router};
 use openboard_api::auth::{JoinRequest, JoinResponse, WhoAmI};
 use openboard_api::{
-    codes, ApiError, ChannelList, ErrorBody, Event, EventsQuery, EventsResponse, Health,
-    PostMessageRequest, PostMessageResponse, Thread, ThreadList, ThreadsQuery, CURSOR_START,
-    DEFAULT_EVENTS_PER_PAGE, DEFAULT_THREADS_PER_PAGE, IDEMPOTENCY_HEADER, MAX_EVENTS_PER_PAGE,
-    MAX_THREADS_PER_PAGE, MAX_WAIT_SECS, PROFILE_HEADER,
+    codes, event_types, ApiError, BoardList, ChannelList, DeleteMessageQuery, EditMessageRequest,
+    ErrorBody, Event, EventsQuery, EventsResponse, Health, LabelsRequest, Message,
+    PostMessageRequest, PostMessageResponse, ReadOptions, Thread, ThreadList, ThreadsQuery,
+    CURSOR_START, DEFAULT_EVENTS_PER_PAGE, DEFAULT_THREADS_PER_PAGE, IDEMPOTENCY_HEADER,
+    MAX_EVENTS_PER_PAGE, MAX_THREADS_PER_PAGE, MAX_WAIT_SECS, PROFILE_HEADER,
 };
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, watch};
@@ -41,11 +47,14 @@ use crate::authz::{Action, Authorizer, Principal};
 use crate::chain::hex;
 use crate::identity::{self, log_kinds, token_lookup_hash, AuthOutcome, Credential, LogEntry};
 use crate::limits::{address_key, Hit, Limits, LogRetention, RateTable, WaiterGuard, Waiters};
+use crate::markdown;
 use crate::names::{self, ChannelSel};
+use crate::pages;
 use crate::serve::ClientAddr;
 use crate::store::{
-    event_cursor, parse_cursor, thread_cursor, BoardRef, EventFilter, NewPost, PostTarget, Store,
-    StoreError,
+    event_cursor, parse_cursor, thread_cursor, BoardRef, Changed, EventFilter, LabelFilter,
+    MentionInput, MentionedSelf, MessageMeta, NewPost, PostTarget, Store, StoreError, Writer,
+    MAX_LABELS_PER_MESSAGE,
 };
 use crate::Mode;
 
@@ -190,7 +199,23 @@ pub(crate) fn router(parts: Parts) -> (Router, Maintenance) {
         .route(JOIN_PATH, post(join))
         .route("/v1/whoami", get(whoami))
         .route("/v1/logout", post(logout))
+        .route(pages::INDEX_PATH, get(page))
+        .route(pages::JOIN_PATH, get(page))
+        .route("/assets/{file}", get(asset))
+        .route("/v1/boards", get(list_boards))
         .route("/v1/boards/{board}/messages", post(post_message))
+        .route(
+            "/v1/boards/{board}/messages/{message_id}",
+            patch(edit_message).delete(delete_message),
+        )
+        .route(
+            "/v1/boards/{board}/messages/{message_id}/labels",
+            post(label_message),
+        )
+        .route(
+            "/v1/boards/{board}/messages/{message_id}/reactions/{emoji}",
+            put(add_reaction).delete(remove_reaction),
+        )
         .route("/v1/boards/{board}/channels", get(list_channels))
         .route("/v1/boards/{board}/threads", get(list_threads))
         .route("/v1/boards/{board}/threads/{thread_id}", get(get_thread))
@@ -199,16 +224,67 @@ pub(crate) fn router(parts: Parts) -> (Router, Maintenance) {
         .fallback(unknown_route)
         .method_not_allowed_fallback(wrong_method)
         .layer(DefaultBodyLimit::max(body_limit))
-        // The outermost layer: it runs before routing, extraction and
-        // every handler.
+        // It runs before routing, extraction and every handler.
         .layer(middleware::from_fn_with_state(Arc::clone(&state), gate))
+        // The outermost layer, so what the gate refuses carries the
+        // headers too.
+        .layer(middleware::from_fn(security_headers))
         .with_state(Arc::clone(&state));
     (router, Maintenance(state))
 }
 
-/// The two routes a network board answers without a token.
+/// The two API routes a network board answers without a token.
 const HEALTH_PATH: &str = "/v1/health";
 const JOIN_PATH: &str = "/v1/join";
+
+/// Whether a network board answers this request without a token: the health
+/// check, enrolment, and a `GET` of the web UI's page or of one file
+/// directly under `/assets/`. Nothing else is exempt, whatever its method.
+fn needs_no_token(method: &Method, path: &str) -> bool {
+    if path == HEALTH_PATH || path == JOIN_PATH {
+        return true;
+    }
+    if method != Method::GET {
+        return false;
+    }
+    path == pages::INDEX_PATH
+        || path == pages::JOIN_PATH
+        || path
+            .strip_prefix(pages::ASSETS_PREFIX)
+            .is_some_and(|file| !file.is_empty() && !file.contains('/'))
+}
+
+/// The content security policy of every response; see `openboard_api::web`.
+const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \
+     img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'; \
+     frame-ancestors 'none'";
+
+/// Adds the headers every response carries, pages and API alike. Nothing
+/// may be cached except an asset that was found, which says for itself how.
+/// No `Access-Control-*` header is ever set, so no other origin can read a
+/// response.
+async fn security_headers(request: Request, next: Next) -> Response {
+    let is_asset = request.uri().path().starts_with(pages::ASSETS_PREFIX);
+    let mut response = next.run(request).await;
+    let cacheable = is_asset && response.status() == StatusCode::OK;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(CONTENT_SECURITY_POLICY),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    if !cacheable {
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
+    response
+}
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -231,7 +307,10 @@ impl AppError {
             codes::FORBIDDEN | codes::INVITE_INVALID => StatusCode::FORBIDDEN,
             codes::UNAUTHENTICATED => StatusCode::UNAUTHORIZED,
             codes::RATE_LIMITED => StatusCode::TOO_MANY_REQUESTS,
-            codes::IDEMPOTENCY_CONFLICT => StatusCode::CONFLICT,
+            codes::IDEMPOTENCY_CONFLICT
+            | codes::REVISION_CONFLICT
+            | codes::LABEL_CONFLICT
+            | codes::MESSAGE_DELETED => StatusCode::CONFLICT,
             codes::MESSAGE_TOO_LARGE => StatusCode::PAYLOAD_TOO_LARGE,
             codes::INTERNAL => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::BAD_REQUEST,
@@ -343,6 +422,27 @@ impl From<StoreError> for AppError {
             )
             .next("use a new idempotency key for a new message"),
             StoreError::ThreadMissing => thread_not_found(),
+            StoreError::MessageMissing => message_not_found(),
+            StoreError::MessageDeleted => AppError::new(
+                codes::MESSAGE_DELETED,
+                "the message was deleted and cannot be changed",
+            )
+            .next("reply to its thread instead; replying still works"),
+            StoreError::RevisionConflict => AppError::new(
+                codes::REVISION_CONFLICT,
+                "the message is not at the revision the request named",
+            )
+            .next("read the message again and retry with its current revision"),
+            // The key was validated before it got to the store. A value
+            // never appears here.
+            StoreError::LabelConflict(key) => AppError::new(
+                codes::LABEL_CONFLICT,
+                format!("the condition on label `{key}` does not hold"),
+            )
+            .next("read the message again to see its current labels"),
+            StoreError::TooManyLabels => invalid_label(format!(
+                "a message holds at most {MAX_LABELS_PER_MESSAGE} labels"
+            )),
             other => AppError::internal(&other),
         }
     }
@@ -356,6 +456,15 @@ fn board_not_found() -> AppError {
 fn thread_not_found() -> AppError {
     AppError::new(codes::NOT_FOUND, "no such thread on this board")
         .next("list threads in a channel to find a thread ID")
+}
+
+fn message_not_found() -> AppError {
+    AppError::new(codes::NOT_FOUND, "no such message on this board")
+        .next("read the thread to find the message ID")
+}
+
+fn invalid_label(reason: impl Into<String>) -> AppError {
+    AppError::new(codes::INVALID_LABEL, reason)
 }
 
 type ApiResult<T> = Result<T, AppError>;
@@ -386,9 +495,10 @@ struct Identity {
 /// whose `Host` is not a loopback name are refused.
 ///
 /// Network mode authenticates instead: clients address the board by its LAN
-/// address, and only the health check and enrolment are answered without a
-/// valid token. An unauthenticated request is refused here, before routing,
-/// so unknown routes, bad paths and bad bodies all look the same to it.
+/// address, and only the health check, enrolment and the web UI's static
+/// files are answered without a valid token; see [`needs_no_token`]. Any
+/// other unauthenticated request is refused here, before routing, so
+/// unknown routes, bad paths and bad bodies all look the same to it.
 async fn gate(State(state): State<Shared>, mut request: Request, next: Next) -> Response {
     let client = request
         .extensions()
@@ -414,8 +524,7 @@ async fn gate(State(state): State<Shared>, mut request: Request, next: Next) -> 
             }
         }
         Mode::Network => {
-            let path = request.uri().path();
-            if path == HEALTH_PATH || path == JOIN_PATH {
+            if needs_no_token(request.method(), request.uri().path()) {
                 Identity {
                     principal: Principal::anonymous(),
                     credential: None,
@@ -653,6 +762,16 @@ impl Caller {
     fn actor(&self) -> openboard_api::Actor {
         self.principal.actor(self.profile.as_deref())
     }
+
+    /// The caller as the store records the author of a change. The actor
+    /// and the credential come from the gate, never from the request.
+    fn writer(&self) -> Writer {
+        Writer {
+            actor: self.actor(),
+            principal_id: self.principal.id.clone(),
+            credential_id: self.credential_id.clone(),
+        }
+    }
 }
 
 impl AppState {
@@ -728,6 +847,127 @@ impl AppState {
             Err(denied) => denied,
         }
     }
+}
+
+impl AppState {
+    /// The board and message a change is addressed to, once the caller is
+    /// known to be allowed `action` in the message's channel. A message in
+    /// a channel the caller may not read is reported as missing.
+    async fn message_target(
+        self: &Arc<Self>,
+        caller: &Caller,
+        board: &str,
+        message_id: &str,
+        action: Action,
+    ) -> ApiResult<(BoardRef, MessageMeta)> {
+        let board = self.board_named(caller, board).await?;
+        let (board_id, id) = (board.id, message_id.to_owned());
+        let meta = self
+            .db(move |state| state.store.message_meta(board_id, &id))
+            .await?
+            .filter(|meta| self.allows(caller, Action::Read, &board.name, Some(&meta.channel)))
+            .ok_or_else(message_not_found)?;
+        self.require(caller, action, &board.name, Some(&meta.channel))?;
+        Ok((board, meta))
+    }
+
+    /// Checks a message text against the rules a post and an edit share.
+    fn check_text(&self, text: &str) -> ApiResult<()> {
+        if text.trim().is_empty() {
+            return Err(AppError::invalid("the message text is empty"));
+        }
+        let (chars, limit) = (text.chars().count(), self.max_message_chars);
+        if chars > limit {
+            return Err(message_too_large(format!(
+                "the message has {chars} characters and the limit is {limit}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// What `text` addresses, for the store to resolve. This parses the
+    /// text, so it is called from storage work, off the async runtime.
+    fn mentions_in(&self, text: &str) -> MentionInput {
+        MentionInput {
+            candidates: markdown::mention_candidates(text),
+            local: self.mode == Mode::Local,
+        }
+    }
+
+    /// Wakes the board's waiters when a change appended an event. Called
+    /// from the blocking task that made the change, straight after its
+    /// commit, so it happens even if the request was dropped meanwhile.
+    fn announce(&self, board: &BoardRef, changed: &Changed) {
+        if let Some(seq) = changed.seq {
+            self.hub.publish(board.id, seq);
+        }
+    }
+}
+
+/// The one place the author-only rule of edit and delete is enforced: the
+/// caller must be the actor that wrote the message, which is the same
+/// principal under the same declared profile. It applies on top of what
+/// the policy allows.
+fn require_author(caller: &Caller, message: &MessageMeta) -> ApiResult<()> {
+    if caller.actor().id == message.actor_id {
+        Ok(())
+    } else {
+        Err(AppError::new(
+            codes::FORBIDDEN,
+            "only the actor that wrote a message may edit or delete it",
+        )
+        .next(format!(
+            "use the principal and the {PROFILE_HEADER} profile the message was written with"
+        )))
+    }
+}
+
+fn message_too_large(detail: String) -> AppError {
+    AppError::new(codes::MESSAGE_TOO_LARGE, detail)
+        .next("shorten the message or split it across replies")
+}
+
+/// Reads a JSON request body. Requiring JSON keeps a web page from writing
+/// here with a plain form. The error reports where the JSON is wrong and
+/// never quotes it.
+fn read_json<T: serde::de::DeserializeOwned>(
+    headers: &HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+    what: &str,
+    too_large: impl FnOnce() -> AppError,
+) -> ApiResult<T> {
+    if !is_json(headers) {
+        return Err(
+            AppError::invalid("the request body must be sent as application/json")
+                .status(StatusCode::UNSUPPORTED_MEDIA_TYPE),
+        );
+    }
+    let body = body.map_err(|rejection| {
+        if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            too_large()
+        } else {
+            AppError::invalid("the request body could not be read")
+        }
+    })?;
+    serde_json::from_slice(&body).map_err(|error| {
+        // Only the position is reported. A serde message can quote the input.
+        AppError::invalid(format!(
+            "the request body is not a valid {what} (JSON {:?} error at line {}, column {})",
+            error.classify(),
+            error.line(),
+            error.column()
+        ))
+    })
+}
+
+/// Renders the message's text into [`Message::html`]. A tombstone has no
+/// text, so its HTML is empty.
+fn add_html(message: &mut Message) {
+    message.html = Some(if message.deleted_at.is_some() {
+        String::new()
+    } else {
+        markdown::render_html(&message.text, &message.mentions)
+    });
 }
 
 fn bad_path() -> AppError {
@@ -950,47 +1190,18 @@ async fn post_message(
     names::validate_board(&board_name)
         .map_err(|reason| AppError::new(codes::INVALID_BOARD, reason))?;
     let limit = state.max_message_chars;
-    let too_large = |detail: String| {
-        AppError::new(codes::MESSAGE_TOO_LARGE, detail)
-            .next("shorten the message or split it across replies")
-    };
-
-    // Requiring JSON keeps a web page from posting here with a plain form.
-    if !is_json(&headers) {
-        return Err(
-            AppError::invalid("the request body must be sent as application/json")
-                .status(StatusCode::UNSUPPORTED_MEDIA_TYPE),
-        );
-    }
-    let body = body.map_err(|rejection| {
-        if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
-            too_large(format!(
-                "the request body is too large for a message of at most {limit} characters"
-            ))
-        } else {
-            AppError::invalid("the request body could not be read")
-        }
-    })?;
-    let request: PostMessageRequest = serde_json::from_slice(&body).map_err(|error| {
-        // Only the position is reported. A serde message can quote the input.
-        AppError::invalid(format!(
-            "the request body is not a valid post request (JSON {:?} error at line {}, column {})",
-            error.classify(),
-            error.line(),
-            error.column()
+    let request: PostMessageRequest = read_json(&headers, body, "post request", || {
+        message_too_large(format!(
+            "the request body is too large for a message of at most {limit} characters"
         ))
-        .next("send JSON with `text` and exactly one of `channel` or `thread_id`")
+    })
+    .map_err(|error| match error.status {
+        StatusCode::BAD_REQUEST => {
+            error.next("send JSON with `text` and exactly one of `channel` or `thread_id`")
+        }
+        _ => error,
     })?;
-
-    if request.text.trim().is_empty() {
-        return Err(AppError::invalid("the message text is empty"));
-    }
-    let chars = request.text.chars().count();
-    if chars > limit {
-        return Err(too_large(format!(
-            "the message has {chars} characters and the limit is {limit}"
-        )));
-    }
+    state.check_text(&request.text)?;
     let key = match request.idempotency_key.clone() {
         Some(key) => Some(key),
         None => match headers.get(IDEMPOTENCY_HEADER) {
@@ -1066,7 +1277,7 @@ async fn post_message(
     // The author and the credential come from the gate, never the body.
     let actor = caller.actor();
     let idempotency = key.map(|key| (key, request_fingerprint(&request)));
-    let post = NewPost {
+    let mut post = NewPost {
         channel,
         thread_id,
         actor,
@@ -1074,6 +1285,7 @@ async fn post_message(
         credential_id: caller.credential_id.clone(),
         text: request.text,
         idempotency,
+        mentions: MentionInput::default(),
     };
     // Waiters are told from the blocking task, straight after the commit.
     // The task finishes even if this request is dropped because its client
@@ -1082,6 +1294,7 @@ async fn post_message(
     // has already seen it.
     let posted = state
         .db(move |state| {
+            post.mentions = state.mentions_in(&post.text);
             let posted = state.store.post(target, post)?;
             state.hub.publish(posted.board.id, posted.seq);
             Ok(posted)
@@ -1122,6 +1335,246 @@ fn request_fingerprint(request: &PostMessageRequest) -> String {
         hasher.update(b"\n");
     }
     hex(&hasher.finalize())
+}
+
+/// `PATCH /v1/boards/{board}/messages/{message_id}`: replaces the text.
+async fn edit_message(
+    State(state): State<Shared>,
+    Extension(identity): Extension<Identity>,
+    headers: HeaderMap,
+    path: Result<Path<(String, String)>, PathRejection>,
+    body: Result<Bytes, BytesRejection>,
+) -> ApiResult<Json<Message>> {
+    let caller = Caller::new(&identity, &headers)?;
+    let Path((board_name, message_id)) = path.map_err(|_| bad_path())?;
+    let limit = state.max_message_chars;
+    let request: EditMessageRequest = read_json(&headers, body, "edit request", || {
+        message_too_large(format!(
+            "the request body is too large for a message of at most {limit} characters"
+        ))
+    })?;
+    state.check_text(&request.text)?;
+
+    let (board, meta) = state
+        .message_target(&caller, &board_name, &message_id, Action::Edit)
+        .await?;
+    require_author(&caller, &meta)?;
+    let by = caller.writer();
+    let changed = state
+        .db(move |state| {
+            let mentions = state.mentions_in(&request.text);
+            let changed = state.store.edit(
+                &board,
+                &message_id,
+                &by,
+                &request.text,
+                request.revision,
+                &mentions,
+            )?;
+            state.announce(&board, &changed);
+            Ok(changed)
+        })
+        .await?;
+    Ok(Json(changed.message))
+}
+
+/// `DELETE /v1/boards/{board}/messages/{message_id}`: leaves a tombstone.
+async fn delete_message(
+    State(state): State<Shared>,
+    Extension(identity): Extension<Identity>,
+    headers: HeaderMap,
+    path: Result<Path<(String, String)>, PathRejection>,
+    query: Result<Query<DeleteMessageQuery>, QueryRejection>,
+) -> ApiResult<Json<Message>> {
+    let caller = Caller::new(&identity, &headers)?;
+    let Path((board_name, message_id)) = path.map_err(|_| bad_path())?;
+    let Query(query) = query.map_err(bad_query)?;
+    let (board, meta) = state
+        .message_target(&caller, &board_name, &message_id, Action::Delete)
+        .await?;
+    require_author(&caller, &meta)?;
+    let by = caller.writer();
+    let changed = state
+        .db(move |state| {
+            let changed = state
+                .store
+                .delete(&board, &message_id, &by, query.revision)?;
+            state.announce(&board, &changed);
+            Ok(changed)
+        })
+        .await?;
+    Ok(Json(changed.message))
+}
+
+/// `POST /v1/boards/{board}/messages/{message_id}/labels`.
+async fn label_message(
+    State(state): State<Shared>,
+    Extension(identity): Extension<Identity>,
+    headers: HeaderMap,
+    path: Result<Path<(String, String)>, PathRejection>,
+    body: Result<Bytes, BytesRejection>,
+) -> ApiResult<Json<Message>> {
+    let caller = Caller::new(&identity, &headers)?;
+    let Path((board_name, message_id)) = path.map_err(|_| bad_path())?;
+    let request: LabelsRequest = read_json(&headers, body, "labels request", || {
+        AppError::invalid("the request body is too large for a labels request")
+            .status(StatusCode::PAYLOAD_TOO_LARGE)
+    })?;
+    check_labels_request(&request)?;
+
+    let (board, _meta) = state
+        .message_target(&caller, &board_name, &message_id, Action::Label)
+        .await?;
+    let by = caller.writer();
+    let changed = state
+        .db(move |state| {
+            let changed = state.store.label(&board, &message_id, &by, &request)?;
+            state.announce(&board, &changed);
+            Ok(changed)
+        })
+        .await?;
+    Ok(Json(changed.message))
+}
+
+/// Validates every key and value of a labels request. No error names a
+/// value, and a key that breaks the rules is not echoed either.
+fn check_labels_request(request: &LabelsRequest) -> ApiResult<()> {
+    let keys = request
+        .set
+        .keys()
+        .chain(&request.clear)
+        .chain(request.if_equals.keys())
+        .chain(&request.if_unset);
+    for key in keys {
+        names::validate_label_key(key).map_err(invalid_label)?;
+    }
+    // A condition can only hold for a value a label could have.
+    for value in request.set.values().chain(request.if_equals.values()) {
+        names::validate_label_value(value).map_err(invalid_label)?;
+    }
+    if let Some(key) = request
+        .clear
+        .iter()
+        .find(|key| request.set.contains_key(*key))
+    {
+        return Err(AppError::invalid(format!(
+            "label `{key}` is in both `set` and `clear`"
+        )));
+    }
+    Ok(())
+}
+
+/// Parses [`ThreadsQuery::label`]: `key`, `key=value` or `key=a|b`.
+fn parse_label_filter(raw: &str) -> ApiResult<LabelFilter> {
+    let (key, values) = match raw.split_once('=') {
+        None => (raw, Vec::new()),
+        Some((key, values)) => (key, values.split('|').map(str::to_owned).collect()),
+    };
+    names::validate_label_key(key).map_err(invalid_label)?;
+    for value in &values {
+        names::validate_label_value(value).map_err(invalid_label)?;
+    }
+    Ok(LabelFilter {
+        key: key.to_owned(),
+        values,
+    })
+}
+
+/// `PUT .../reactions/{emoji}`.
+async fn add_reaction(
+    state: State<Shared>,
+    identity: Extension<Identity>,
+    headers: HeaderMap,
+    path: Result<Path<(String, String, String)>, PathRejection>,
+) -> ApiResult<Json<Message>> {
+    react(state, identity, headers, path, true).await
+}
+
+/// `DELETE .../reactions/{emoji}`.
+async fn remove_reaction(
+    state: State<Shared>,
+    identity: Extension<Identity>,
+    headers: HeaderMap,
+    path: Result<Path<(String, String, String)>, PathRejection>,
+) -> ApiResult<Json<Message>> {
+    react(state, identity, headers, path, false).await
+}
+
+async fn react(
+    State(state): State<Shared>,
+    Extension(identity): Extension<Identity>,
+    headers: HeaderMap,
+    path: Result<Path<(String, String, String)>, PathRejection>,
+    add: bool,
+) -> ApiResult<Json<Message>> {
+    let caller = Caller::new(&identity, &headers)?;
+    let Path((board_name, message_id, name)) = path.map_err(|_| bad_path())?;
+    names::validate_reaction(&name)
+        .map_err(|reason| AppError::new(codes::INVALID_REACTION, reason))?;
+    let (board, _meta) = state
+        .message_target(&caller, &board_name, &message_id, Action::React)
+        .await?;
+    let by = caller.writer();
+    // A reaction belongs to the principal, whatever profile it declared.
+    let handle = caller.principal.handle.clone();
+    let changed = state
+        .db(move |state| {
+            let changed = state
+                .store
+                .react(&board, &message_id, &by, &handle, &name, add)?;
+            state.announce(&board, &changed);
+            Ok(changed)
+        })
+        .await?;
+    Ok(Json(changed.message))
+}
+
+/// `GET /v1/boards`: the boards the caller may read, ordered by name.
+async fn list_boards(
+    State(state): State<Shared>,
+    Extension(identity): Extension<Identity>,
+    headers: HeaderMap,
+) -> ApiResult<Json<BoardList>> {
+    let caller = Caller::new(&identity, &headers)?;
+    let mut boards = state.db(|state| state.store.boards()).await?;
+    boards.retain(|board| state.allows(&caller, Action::Read, &board.name, None));
+    Ok(Json(BoardList { boards }))
+}
+
+/// `GET /` and `GET /join`: the web UI's page. It holds no board content;
+/// the script on it learns who is signed in from the API.
+async fn page(
+    State(state): State<Shared>,
+    Extension(identity): Extension<Identity>,
+) -> ApiResult<Response> {
+    state.require_global(&identity.principal, Action::Page)?;
+    Ok((
+        [(header::CONTENT_TYPE, pages::INDEX_CONTENT_TYPE)],
+        pages::INDEX_HTML,
+    )
+        .into_response())
+}
+
+/// `GET /assets/{file}`: one of the files in [`pages::ASSETS`].
+async fn asset(
+    State(state): State<Shared>,
+    Extension(identity): Extension<Identity>,
+    file: Result<Path<String>, PathRejection>,
+) -> ApiResult<Response> {
+    state.require_global(&identity.principal, Action::Page)?;
+    let Path(file) = file.map_err(|_| bad_path())?;
+    let asset =
+        pages::find_asset(&file).ok_or_else(|| AppError::new(codes::NOT_FOUND, "no such asset"))?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, asset.content_type),
+            // The files change with the binary and carry no version in
+            // their names, so a browser asks again every time.
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        asset.bytes,
+    )
+        .into_response())
 }
 
 async fn list_channels(
@@ -1165,10 +1618,26 @@ async fn list_threads(
             Some(parse_cursor("th", &board.tag, cursor).ok_or_else(AppError::invalid_cursor)?)
         }
     };
+    let label = match &query.label {
+        None => None,
+        Some(raw) => Some(parse_label_filter(raw)?),
+    };
+    let html = query.html == Some(true);
 
     let listed_on = board.clone();
     let page = state
-        .db(move |state| state.store.threads(&listed_on, &channel, before, limit))
+        .db(move |state| {
+            let mut page =
+                state
+                    .store
+                    .threads(&listed_on, &channel, label.as_ref(), before, limit)?;
+            if html {
+                for (_, summary) in &mut page.threads {
+                    add_html(&mut summary.root);
+                }
+            }
+            Ok(page)
+        })
         .await?;
     let next_cursor = match page.threads.last() {
         Some((last_seq, _)) if page.more => Some(thread_cursor(&board.tag, *last_seq)),
@@ -1198,9 +1667,12 @@ async fn get_thread(
     Extension(identity): Extension<Identity>,
     headers: HeaderMap,
     path: Result<Path<(String, String)>, PathRejection>,
+    options: Result<Query<ReadOptions>, QueryRejection>,
 ) -> ApiResult<Json<Thread>> {
     let caller = Caller::new(&identity, &headers)?;
     let Path((board, thread_id)) = path.map_err(|_| bad_path())?;
+    let Query(options) = options.map_err(bad_query)?;
+    let html = options.html == Some(true);
     let board = state.board_named(&caller, &board).await?;
     state.require(&caller, Action::Read, &board.name, None)?;
     let board_id = board.id;
@@ -1212,7 +1684,14 @@ async fn get_thread(
         .ok_or_else(thread_not_found)?;
     let read_on = board.clone();
     let thread = state
-        .db(move |state| state.store.thread(&read_on, &root))
+        .db(move |state| {
+            let mut thread = state.store.thread(&read_on, &root)?;
+            if let (true, Some(thread)) = (html, &mut thread) {
+                add_html(&mut thread.root);
+                thread.replies.iter_mut().for_each(add_html);
+            }
+            Ok(thread)
+        })
         .await?
         .ok_or_else(thread_not_found)?;
     Ok(Json(thread))
@@ -1273,6 +1752,15 @@ impl EventScan {
         };
         state.require(&caller, Action::Read, &board.name, exact)?;
         let limit = page_size(query.limit, DEFAULT_EVENTS_PER_PAGE, MAX_EVENTS_PER_PAGE)?;
+        let kinds = match &query.types {
+            None => None,
+            Some(raw) => Some(parse_event_types(raw)?),
+        };
+        // The caller's principal, and its declared profile if it has one.
+        let mentions = (query.mentions_self == Some(true)).then(|| MentionedSelf {
+            principal_id: caller.principal.id.clone(),
+            profile: caller.profile.clone(),
+        });
         // Like `GET /threads/{id}`, the filter takes the ID of any message
         // in the thread and resolves it to the thread's root.
         let thread = match &query.thread {
@@ -1312,6 +1800,8 @@ impl EventScan {
                 thread,
                 not_from: query.not_from.clone(),
                 not_from_actor,
+                kinds,
+                mentions,
             },
             limit,
             after,
@@ -1410,6 +1900,31 @@ impl EventScan {
         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         timer
     }
+}
+
+/// Every event type this server writes.
+const EVENT_TYPES: [&str; 5] = [
+    event_types::MESSAGE_POSTED,
+    event_types::MESSAGE_EDITED,
+    event_types::MESSAGE_DELETED,
+    event_types::LABELS_CHANGED,
+    event_types::REACTIONS_CHANGED,
+];
+
+/// Parses [`EventsQuery::types`]: event type names joined by commas.
+fn parse_event_types(raw: &str) -> ApiResult<Vec<&'static str>> {
+    raw.split(',')
+        .map(|name| {
+            EVENT_TYPES
+                .iter()
+                .copied()
+                .find(|known| *known == name)
+                .ok_or_else(|| {
+                    AppError::invalid("`types` names an event type this board does not have")
+                        .next(format!("use names from: {}", EVENT_TYPES.join(", ")))
+                })
+        })
+        .collect()
 }
 
 /// Resolves when the server starts shutting down.
@@ -1596,7 +2111,91 @@ async fn stream_events(
 
 #[cfg(test)]
 mod tests {
-    use super::is_loopback_host;
+    use super::*;
+
+    #[test]
+    fn only_the_static_get_routes_join_the_token_exemption() {
+        for (method, path) in [
+            (Method::GET, "/v1/health"),
+            (Method::POST, "/v1/join"),
+            (Method::GET, "/"),
+            (Method::GET, "/join"),
+            (Method::GET, "/assets/app.js"),
+            (Method::GET, "/assets/anything-else"),
+        ] {
+            assert!(needs_no_token(&method, path), "{method} {path}");
+        }
+        for (method, path) in [
+            (Method::POST, "/"),
+            (Method::HEAD, "/"),
+            (Method::PUT, "/join"),
+            (Method::POST, "/assets/app.js"),
+            (Method::DELETE, "/assets/app.js"),
+            (Method::GET, "/assets"),
+            (Method::GET, "/assets/"),
+            (Method::GET, "/assets/a/b"),
+            (Method::GET, "/assets/../v1/boards"),
+            (Method::GET, "/join/"),
+            (Method::GET, "//"),
+            (Method::GET, "/index.html"),
+            (Method::GET, "/v1/boards"),
+            (Method::GET, "/v1/whoami"),
+            (Method::GET, "/v1/web/session"),
+            (Method::POST, "/v1/web/login"),
+            (Method::GET, "/v1/join/"),
+        ] {
+            assert!(!needs_no_token(&method, path), "{method} {path}");
+        }
+    }
+
+    #[test]
+    fn event_type_lists() {
+        assert_eq!(
+            parse_event_types("message.posted,labels.changed").unwrap(),
+            ["message.posted", "labels.changed"]
+        );
+        for bad in [
+            "",
+            "message.posted,",
+            "posted",
+            "message.posted, message.edited",
+            "*",
+        ] {
+            assert!(parse_event_types(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn label_filters() {
+        let filter = |raw: &str| parse_label_filter(raw).ok();
+        assert_eq!(
+            filter("status"),
+            Some(LabelFilter {
+                key: "status".into(),
+                values: vec![]
+            })
+        );
+        assert_eq!(
+            filter("status=open|in progress"),
+            Some(LabelFilter {
+                key: "status".into(),
+                values: vec!["open".into(), "in progress".into()]
+            })
+        );
+        // Only the first `=` separates the key from the values.
+        assert_eq!(filter("k=a=b").unwrap().values, ["a=b"]);
+        for bad in [
+            "",
+            "=x",
+            "Status",
+            "status=",
+            "status=a|",
+            "board.x",
+            "a b=c",
+        ] {
+            assert_eq!(filter(bad), None, "{bad:?}");
+        }
+    }
 
     #[test]
     fn loopback_hosts() {

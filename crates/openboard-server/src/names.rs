@@ -75,6 +75,59 @@ pub(crate) fn validate_profile(name: &str) -> Result<(), &'static str> {
     }
 }
 
+/// Longest label key, in bytes. Keys are ASCII, so also in characters.
+const MAX_LABEL_KEY_LEN: usize = 64;
+/// Longest label value, in bytes.
+const MAX_LABEL_VALUE_LEN: usize = 256;
+/// Longest reaction name.
+const MAX_REACTION_LEN: usize = 32;
+/// Label keys under this prefix are reserved for the board itself.
+const RESERVED_LABEL_PREFIX: &str = "board.";
+
+/// A label key is 1 to 64 characters from lowercase letters, digits, `.`,
+/// `_` and `-`, and does not start with `board.`.
+pub(crate) fn validate_label_key(key: &str) -> Result<(), &'static str> {
+    let shaped = !key.is_empty()
+        && key.len() <= MAX_LABEL_KEY_LEN
+        && key.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')
+        });
+    if !shaped {
+        return Err(
+            "a label key is 1 to 64 characters from lowercase letters, digits, '.', '_' and '-'",
+        );
+    }
+    if key.starts_with(RESERVED_LABEL_PREFIX) {
+        return Err("label keys that start with 'board.' are reserved");
+    }
+    Ok(())
+}
+
+/// A label value is 1 to 256 bytes with no control characters.
+pub(crate) fn validate_label_value(value: &str) -> Result<(), &'static str> {
+    if value.is_empty() || value.len() > MAX_LABEL_VALUE_LEN || value.chars().any(char::is_control)
+    {
+        Err("a label value is 1 to 256 bytes with no control characters")
+    } else {
+        Ok(())
+    }
+}
+
+/// A reaction name is 1 to 32 characters from lowercase letters, digits,
+/// `_`, `+` and `-`.
+pub(crate) fn validate_reaction(name: &str) -> Result<(), &'static str> {
+    let shaped = !name.is_empty()
+        && name.len() <= MAX_REACTION_LEN
+        && name.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'+' | b'-')
+        });
+    if shaped {
+        Ok(())
+    } else {
+        Err("a reaction name is 1 to 32 characters from lowercase letters, digits, '_', '+' and '-'")
+    }
+}
+
 /// Handles no principal may take: the local principal's, and the name the
 /// server uses for a caller it has not authenticated.
 const RESERVED_HANDLES: [&str; 2] = ["local", "anonymous"];
@@ -142,6 +195,68 @@ mod tests {
         }
         for bad in ["", "1a", "-a", "a_b", "a/b", "a b", &"a".repeat(33)] {
             assert!(validate_profile(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn label_keys_and_values() {
+        for ok in [
+            "a",
+            "status",
+            "task.state",
+            "a_b-c.9",
+            &"k".repeat(64),
+            "boards",
+            "board",
+        ] {
+            assert!(validate_label_key(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "",
+            "A",
+            "a b",
+            "a=b",
+            "a|b",
+            "é",
+            "board.x",
+            "board.",
+            &"k".repeat(65),
+        ] {
+            assert!(validate_label_key(bad).is_err(), "{bad}");
+        }
+        for ok in ["x", "In Progress", "a=b|c", "é", &"v".repeat(256)] {
+            assert!(validate_label_value(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "",
+            "a\nb",
+            "a\tb",
+            "a\u{0}b",
+            "a\u{7f}",
+            "a\u{85}",
+            &"v".repeat(257),
+            &"é".repeat(129),
+        ] {
+            assert!(validate_label_value(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn reaction_names() {
+        for ok in ["thumbsup", "+1", "-1", "a_b", "100", &"a".repeat(32)] {
+            assert!(validate_reaction(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "",
+            "Thumbsup",
+            "a b",
+            "👍",
+            "a.b",
+            "a/b",
+            ":a:",
+            &"a".repeat(33),
+        ] {
+            assert!(validate_reaction(bad).is_err(), "{bad}");
         }
     }
 

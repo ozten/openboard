@@ -510,7 +510,7 @@ async fn validation_errors() {
         expect_error(board.get(path).await, bad, codes::INVALID_CHANNEL).await;
     }
 
-    for path in ["/", "/v1", "/v1/nope", "/v2/health", "/v1/boards/general"] {
+    for path in ["/v1", "/v1/nope", "/v2/health", "/v1/boards/general"] {
         expect_error(
             board.get(path).await,
             StatusCode::NOT_FOUND,

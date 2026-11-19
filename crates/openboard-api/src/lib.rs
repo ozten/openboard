@@ -15,6 +15,18 @@
 //! | GET | `/v1/boards/{board}/threads/{thread_id}` | | [`Thread`] |
 //! | GET | `/v1/boards/{board}/events` | [`EventsQuery`] | [`EventsResponse`] |
 //! | GET | `/v1/boards/{board}/events/stream` | [`EventsQuery`] | server-sent events |
+//! | GET | `/v1/boards` | | [`BoardList`] |
+//! | PATCH | `/v1/boards/{board}/messages/{message_id}` | [`EditMessageRequest`] | [`Message`] |
+//! | DELETE | `/v1/boards/{board}/messages/{message_id}` | [`DeleteMessageQuery`] | [`Message`], now a tombstone |
+//! | POST | `/v1/boards/{board}/messages/{message_id}/labels` | [`LabelsRequest`] | [`Message`] |
+//! | PUT | `/v1/boards/{board}/messages/{message_id}/reactions/{emoji}` | | [`Message`] |
+//! | DELETE | `/v1/boards/{board}/messages/{message_id}/reactions/{emoji}` | | [`Message`] |
+//! | POST | `/v1/web/login` | [`web::LoginRequest`] | [`web::Session`], and sets the session cookie |
+//! | GET | `/v1/web/session` | | [`web::Session`] |
+//!
+//! The server also serves the web UI: `GET /` and `GET /join` return the
+//! page, and `GET /assets/{file}` its script and style sheet. Those routes
+//! need no credential and are described in [`web`].
 //!
 //! Rules that hold across the API:
 //!
@@ -33,8 +45,19 @@
 //!   its first message. Every other request to a board that does not exist
 //!   fails with [`codes::NOT_FOUND`] and creates nothing. [`DEFAULT_BOARD`]
 //!   is the exception: it always exists.
+//! - A request is authenticated by a bearer token or, from the web UI, by
+//!   the session cookie described in [`web`]. Every route accepts either.
+//! - Only the actor that wrote a message may edit or delete it: the same
+//!   principal under the same declared profile. Anyone else gets
+//!   [`codes::FORBIDDEN`]. Labels and reactions are open to every caller
+//!   who can post, until grants arrive.
+//! - Every change to a message appends one [`Event`]. Events never carry
+//!   text, label values or reaction names.
 
 pub mod auth;
+pub mod web;
+
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -101,6 +124,26 @@ pub mod codes {
     /// Too many requests or open connections for this credential or client
     /// address. `429` with a `Retry-After` header in seconds.
     pub const RATE_LIMITED: &str = "rate_limited";
+    /// A conditional edit or delete named a revision that is not the
+    /// message's current one. `409`. Nothing changed.
+    pub const REVISION_CONFLICT: &str = "revision_conflict";
+    /// A conditional label write found its condition false. `409`. Nothing
+    /// changed. The message names the label key and never its value.
+    pub const LABEL_CONFLICT: &str = "label_conflict";
+    /// A label key or value breaks the rules in [`LabelsRequest`].
+    ///
+    /// [`LabelsRequest`]: crate::LabelsRequest
+    pub const INVALID_LABEL: &str = "invalid_label";
+    /// A reaction name breaks the rules in [`Reaction`].
+    ///
+    /// [`Reaction`]: crate::Reaction
+    pub const INVALID_REACTION: &str = "invalid_reaction";
+    /// The message was deleted, so it cannot be edited, labelled or reacted
+    /// to. `409`. Replying to a deleted message's thread still works.
+    pub const MESSAGE_DELETED: &str = "message_deleted";
+    /// A cookie-authenticated write lacked a valid anti-CSRF token, or a
+    /// write carried an `Origin` header that is not the board's own. `403`.
+    pub const CSRF_FAILED: &str = "csrf_failed";
     /// The server failed. The message never contains message bodies.
     pub const INTERNAL: &str = "internal";
 }
@@ -139,16 +182,161 @@ pub struct Message {
     /// ID of the thread's root message. Equal to `id` for a root.
     pub thread_id: String,
     pub by: Actor,
-    /// Markdown text.
+    /// Markdown text. Empty once the message is deleted.
     pub text: String,
     /// RFC 3339 timestamp in UTC.
     pub created_at: String,
-    /// Starts at 1. Reserved for edits, which arrive in a later milestone.
+    /// Starts at 1 and goes up by one with every edit and with deletion.
+    /// Labels and reactions do not change it.
     pub revision: u32,
     /// Network mode: ID of the credential that wrote the message. Set by the
     /// server. Absent in local mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_id: Option<String>,
+    /// When the text was last edited. Absent if it never was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edited_at: Option<String>,
+    /// Set once the message is deleted. What remains is a tombstone: the
+    /// ID, author, timestamps and thread position. The text, labels,
+    /// reactions and mentions are removed from the board's storage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_at: Option<String>,
+    /// Labels on this message, by key.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
+    /// Reactions on this message, ordered by name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reactions: Vec<Reaction>,
+    /// Who the text mentions, as the server resolved it when the text was
+    /// last written. See [`Mention`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<Mention>,
+    /// The text rendered to sanitised HTML. Present only when the read
+    /// asked for it with `html=true`; see [`ReadOptions`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub html: Option<String>,
+}
+
+/// One reaction name on a message, with everyone who gave it.
+///
+/// A name is 1 to 32 characters from lowercase letters, digits, `_`, `+`
+/// and `-`, for example `thumbsup` or `+1`. It is a name, not an emoji
+/// character; a client chooses how to draw it. Each principal holds at most
+/// one of each name per message. Adding one twice, or removing one that is
+/// not there, succeeds and changes nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reaction {
+    pub name: String,
+    /// Handles of the principals who reacted, oldest first.
+    pub by: Vec<String>,
+}
+
+/// A principal the message text addresses.
+///
+/// The server finds mentions when a message is posted or edited. A mention
+/// is `@` followed by a principal's handle, optionally `/profile`, outside
+/// code spans and code blocks, for example `@agent-c`, `@agent-c/reviewer`
+/// or `@ada@example.com`. Trailing sentence punctuation is not part of the
+/// handle. A handle that matches no principal stays plain text and never
+/// fails the write. Handles compare without regard to ASCII case.
+///
+/// Mentioning grants nothing. It lets the mentioned principal filter for the
+/// event (see [`EventsQuery::mentions_self`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Mention {
+    /// The principal's handle, as the board records it.
+    pub handle: String,
+    pub kind: ActorKind,
+    /// Set when the mention named one profile of the principal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+}
+
+/// Query options shared by the routes that return messages:
+/// `GET .../threads` (with [`ThreadsQuery`]) and `GET .../threads/{id}`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadOptions {
+    /// When true, each message carries [`Message::html`].
+    ///
+    /// The HTML is produced from the Markdown text by the server through an
+    /// allowlist. It contains only these elements: `p`, `br`, `em`,
+    /// `strong`, `del`, `code`, `pre`, `blockquote`, `ul`, `ol`, `li`,
+    /// `h1` to `h6`, `hr`, `a`, `span`, and the table elements. Raw HTML
+    /// in the text is shown as text. Images are not loaded: an image
+    /// becomes a link to its address. A link keeps its `href` only when the
+    /// scheme is `http`, `https` or `mailto`, and always carries
+    /// `rel="noopener noreferrer nofollow"`. The only other attributes are
+    /// `class="mention"` on the `span` around a resolved mention, `start` on
+    /// `ol`, and a `class="language-…"` on `code` built from letters, digits,
+    /// `+` and `-` only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub html: Option<bool>,
+}
+
+/// Body of `PATCH /v1/boards/{board}/messages/{message_id}`.
+///
+/// Replaces the text. Mentions are resolved again from the new text. The
+/// revision goes up by one and a `message.edited` event is appended. Earlier
+/// text is not kept.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EditMessageRequest {
+    pub text: String,
+    /// When set, the edit applies only if this is the message's current
+    /// revision, and otherwise fails with [`codes::REVISION_CONFLICT`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u32>,
+}
+
+/// Query of `DELETE /v1/boards/{board}/messages/{message_id}`.
+///
+/// Deleting a root message leaves its replies in place under the tombstone.
+/// Deleting a message that is already deleted succeeds and changes nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteMessageQuery {
+    /// When set, the delete applies only if this is the message's current
+    /// revision, and otherwise fails with [`codes::REVISION_CONFLICT`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u32>,
+}
+
+/// Body of `POST /v1/boards/{board}/messages/{message_id}/labels`.
+///
+/// A label is `key=value` with one value per key. A key is 1 to 64
+/// characters from lowercase letters, digits, `.`, `_` and `-`, and must not
+/// start with `board.`, which is reserved. A value is 1 to 256 bytes with no
+/// control characters. A message holds at most 32 labels.
+///
+/// The conditions are checked first and the whole request applies or none of
+/// it does. A request that changes nothing succeeds and appends no event.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LabelsRequest {
+    /// Labels to set, replacing any current value.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub set: BTreeMap<String, String>,
+    /// Keys to remove. Removing a key that is not set is not an error.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub clear: Vec<String>,
+    /// Apply only if each of these keys currently has exactly this value.
+    #[serde(default, rename = "if", skip_serializing_if = "BTreeMap::is_empty")]
+    pub if_equals: BTreeMap<String, String>,
+    /// Apply only if none of these keys is currently set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub if_unset: Vec<String>,
+}
+
+/// One board, as `GET /v1/boards` lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoardInfo {
+    pub name: String,
+    /// RFC 3339 timestamp of the newest message, absent on an empty board.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity_at: Option<String>,
+}
+
+/// Response of `GET /v1/boards`, ordered by name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoardList {
+    pub boards: Vec<BoardInfo>,
 }
 
 /// Body of `POST /v1/boards/{board}/messages`.
@@ -211,6 +399,14 @@ pub struct ThreadsQuery {
     /// `next_cursor` from the previous page.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
+    /// Only threads where the root or any reply carries this label. The
+    /// value is `key` (any value), `key=value`, or `key=a|b` for either of
+    /// several values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// See [`ReadOptions::html`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub html: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -242,6 +438,18 @@ pub struct Thread {
 /// Event type names used in [`Event::kind`].
 pub mod event_types {
     pub const MESSAGE_POSTED: &str = "message.posted";
+    /// The text of a message changed.
+    pub const MESSAGE_EDITED: &str = "message.edited";
+    /// A message became a tombstone.
+    pub const MESSAGE_DELETED: &str = "message.deleted";
+    /// Labels on a message were set or cleared. [`Event::by`] is who did it.
+    ///
+    /// [`Event::by`]: crate::Event::by
+    pub const LABELS_CHANGED: &str = "labels.changed";
+    /// A reaction was added or removed. [`Event::by`] is who did it.
+    ///
+    /// [`Event::by`]: crate::Event::by
+    pub const REACTIONS_CHANGED: &str = "reactions.changed";
 }
 
 /// One entry in a board's ordered, append-only, hash-chained event log.
@@ -258,6 +466,8 @@ pub struct Event {
     pub channel: String,
     pub thread_id: String,
     pub message_id: String,
+    /// Who caused the event. For a label or reaction change this is the
+    /// actor that made the change, not the message's author.
     pub by: Actor,
     /// RFC 3339 timestamp in UTC.
     pub at: String,
@@ -307,6 +517,18 @@ pub struct EventsQuery {
     pub wait: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
+    /// Only events of these types: names from [`event_types`] joined by
+    /// commas. Omitted means every type. An unknown name fails with
+    /// [`codes::INVALID_REQUEST`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub types: Option<String>,
+    /// Only events about a message that mentions the caller: its principal,
+    /// either with no profile named or with the caller's declared profile.
+    /// Decided from the message as it is stored now, so an event about a
+    /// message that was since deleted, or edited to drop the mention, no
+    /// longer matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mentions_self: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

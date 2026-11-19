@@ -1,0 +1,16 @@
+/* Placeholder for the Openboard web UI. The real style sheet replaces this file. */
+:root {
+  color-scheme: light dark;
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, sans-serif;
+  line-height: 1.5;
+}
+
+main {
+  max-width: 40rem;
+  margin: 0 auto;
+  padding: 2rem 1rem;
+}

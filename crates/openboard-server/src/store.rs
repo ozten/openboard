@@ -8,7 +8,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
-use openboard_api::{event_types, Actor, ChannelInfo, Event, Message, Thread, ThreadSummary};
+use openboard_api::{
+    event_types, Actor, BoardInfo, ChannelInfo, Event, LabelsRequest, Mention, Message, Reaction,
+    Thread, ThreadSummary,
+};
 use rusqlite::types::Value;
 use rusqlite::{
     params, params_from_iter, Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior,
@@ -19,7 +22,8 @@ use crate::identity::{
     self, actor_kind_name, log_kinds, parse_actor_kind, AuthOutcome, Credential, LogEntry,
 };
 use crate::limits::LogRetention;
-use crate::names::{board_key, ChannelSel};
+use crate::markdown::Candidate;
+use crate::names::{board_key, handle_key, ChannelSel};
 use crate::time::{now_ms, now_rfc3339, rfc3339_from_ms};
 use crate::tls::{CERT_FILE_NAME, KEY_FILE_NAME};
 use crate::Mode;
@@ -29,7 +33,16 @@ pub const DB_FILE_NAME: &str = "openboard.db";
 /// File name of the lock a running server holds on the data directory.
 pub const LOCK_FILE_NAME: &str = "openboard.lock";
 
-pub(crate) const SCHEMA_VERSION: i64 = 2;
+pub(crate) const SCHEMA_VERSION: i64 = 3;
+/// The oldest schema that has the identity tables the operator functions
+/// use. A database between this and [`SCHEMA_VERSION`] can be read and
+/// written by them before a newer server has migrated it.
+pub(crate) const OLDEST_IDENTITY_SCHEMA: i64 = 2;
+
+/// Most labels one message holds.
+pub(crate) const MAX_LABELS_PER_MESSAGE: usize = 32;
+/// Most mentions kept for one message. Candidates beyond it stay plain text.
+pub(crate) const MAX_MENTIONS_PER_MESSAGE: usize = 50;
 
 /// The schema milestone M0 shipped, `user_version` 1. It is never edited:
 /// later versions are reached by running the migrations below on top of it,
@@ -161,10 +174,44 @@ ALTER TABLE events ADD COLUMN credential_id TEXT;
 ALTER TABLE events ADD COLUMN hash_version INTEGER NOT NULL DEFAULT 1;
 ";
 
+/// From `user_version` 2 to 3: edits, tombstones, labels, reactions and
+/// mentions. The event log gains new types and no new columns, so events
+/// keep hash encoding 2.
+const MIGRATE_V2_TO_V3: &str = "
+ALTER TABLE messages ADD COLUMN edited_at TEXT;
+ALTER TABLE messages ADD COLUMN deleted_at TEXT;
+CREATE TABLE labels (
+    message_id TEXT NOT NULL REFERENCES messages(id),
+    thread_id  TEXT NOT NULL,
+    key        TEXT NOT NULL,
+    value      TEXT NOT NULL,
+    PRIMARY KEY (message_id, key)
+) WITHOUT ROWID;
+CREATE INDEX labels_by_thread ON labels(thread_id, key);
+CREATE TABLE reactions (
+    id           INTEGER PRIMARY KEY,
+    message_id   TEXT NOT NULL REFERENCES messages(id),
+    name         TEXT NOT NULL,
+    principal_id TEXT NOT NULL,
+    handle       TEXT NOT NULL,
+    UNIQUE (message_id, name, principal_id)
+);
+CREATE TABLE mentions (
+    message_id   TEXT NOT NULL REFERENCES messages(id),
+    position     INTEGER NOT NULL,
+    principal_id TEXT NOT NULL,
+    handle       TEXT NOT NULL,
+    kind         TEXT NOT NULL,
+    profile      TEXT,
+    PRIMARY KEY (message_id, position)
+) WITHOUT ROWID;
+";
+
 const MESSAGE_COLUMNS: &str = "m.id, m.channel, m.thread_id, m.text, m.created_at, m.revision, \
-                               a.id, a.kind, a.handle, a.profile, m.credential_id";
+                               a.id, a.kind, a.handle, a.profile, m.credential_id, \
+                               m.edited_at, m.deleted_at";
 /// Number of columns in [`MESSAGE_COLUMNS`].
-const MESSAGE_COLUMN_COUNT: usize = 11;
+const MESSAGE_COLUMN_COUNT: usize = 13;
 
 #[derive(Debug)]
 pub(crate) enum StoreError {
@@ -172,6 +219,17 @@ pub(crate) enum StoreError {
     IdempotencyConflict,
     /// The thread a reply names does not exist on this board.
     ThreadMissing,
+    /// The message a change names does not exist on this board.
+    MessageMissing,
+    /// The message is a tombstone and cannot be changed.
+    MessageDeleted,
+    /// A conditional edit or delete named a revision that is not current.
+    RevisionConflict,
+    /// A conditional label write found the condition on this key false.
+    /// Holds the key and never a value.
+    LabelConflict(String),
+    /// The change would leave the message with too many labels.
+    TooManyLabels,
     /// Another server holds the lock on the data directory.
     DataDirInUse,
     Sqlite(rusqlite::Error),
@@ -183,6 +241,11 @@ impl fmt::Display for StoreError {
         match self {
             StoreError::IdempotencyConflict => f.write_str("idempotency conflict"),
             StoreError::ThreadMissing => f.write_str("thread missing"),
+            StoreError::MessageMissing => f.write_str("message missing"),
+            StoreError::MessageDeleted => f.write_str("message deleted"),
+            StoreError::RevisionConflict => f.write_str("revision conflict"),
+            StoreError::LabelConflict(_) => f.write_str("label conflict"),
+            StoreError::TooManyLabels => f.write_str("too many labels"),
             StoreError::DataDirInUse => f.write_str("the data directory is in use"),
             StoreError::Sqlite(error) => write!(f, "sqlite: {error}"),
             StoreError::Other(detail) => f.write_str(detail),
@@ -230,6 +293,60 @@ pub(crate) struct NewPost {
     pub text: String,
     /// Key and request fingerprint.
     pub idempotency: Option<(String, String)>,
+    /// What the text addresses.
+    pub mentions: MentionInput,
+}
+
+/// The mention candidates of a text, to be resolved against the board's
+/// principals in the transaction that stores the text.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct MentionInput {
+    pub candidates: Vec<Candidate>,
+    /// True on a local board, whose only principal is the local one and is
+    /// not in the principals table.
+    pub local: bool,
+}
+
+/// Who is changing a message: the actor, the principal behind it and the
+/// credential it authenticated with.
+#[derive(Debug, Clone)]
+pub(crate) struct Writer {
+    pub actor: Actor,
+    pub principal_id: String,
+    /// `None` on a local board.
+    pub credential_id: Option<String>,
+}
+
+/// The outcome of a change to a message.
+pub(crate) struct Changed {
+    /// The message as it now stands.
+    pub message: Message,
+    /// Position of the event the change appended, or `None` when nothing
+    /// changed and so nothing was appended.
+    pub seq: Option<i64>,
+}
+
+/// What the handlers need to know about a message before changing it.
+#[derive(Debug, Clone)]
+pub(crate) struct MessageMeta {
+    pub channel: String,
+    /// ID of the actor that wrote the message.
+    pub actor_id: String,
+}
+
+/// A label condition on a thread listing: the key, and the values that
+/// match. No values means any value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LabelFilter {
+    pub key: String,
+    pub values: Vec<String>,
+}
+
+/// The caller, for the `mentions_self` filter.
+#[derive(Debug, Clone)]
+pub(crate) struct MentionedSelf {
+    pub principal_id: String,
+    pub profile: Option<String>,
 }
 
 pub(crate) struct Posted {
@@ -248,6 +365,10 @@ pub(crate) struct EventFilter {
     pub not_from: Option<String>,
     /// Skip events written by the actor with this ID.
     pub not_from_actor: Option<String>,
+    /// Only events of these types.
+    pub kinds: Option<Vec<&'static str>>,
+    /// Only events about a message whose stored mentions name this caller.
+    pub mentions: Option<MentionedSelf>,
 }
 
 pub(crate) struct EventPage {
@@ -319,6 +440,10 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // Deleted and replaced content is overwritten with zeros in the
+        // database file, so the text of a deleted message does not linger
+        // in free space. See also `scrub_wal`.
+        conn.pragma_update(None, "secure_delete", "ON")?;
 
         // Migrations are forward-only and run here, in one transaction, so
         // a database is either at the old version or fully at the new one.
@@ -329,12 +454,16 @@ impl Store {
                 // A new database. Its mode is decided by the first start.
                 tx.execute_batch(SCHEMA_V1)?;
                 tx.execute_batch(MIGRATE_V1_TO_V2)?;
+                tx.execute_batch(MIGRATE_V2_TO_V3)?;
             }
             1 => {
                 // Milestone M0 knew only local mode.
                 tx.execute_batch(MIGRATE_V1_TO_V2)?;
                 identity::meta_set(&tx, identity::META_MODE, Mode::Local.as_str())?;
+                tx.execute_batch(MIGRATE_V2_TO_V3)?;
             }
+            // Milestone M1.
+            2 => tx.execute_batch(MIGRATE_V2_TO_V3)?,
             SCHEMA_VERSION => {}
             other => {
                 return Err(StoreError::Other(format!(
@@ -569,6 +698,27 @@ impl Store {
             .optional()?)
     }
 
+    /// The channel and author of a message on this board.
+    pub(crate) fn message_meta(
+        &self,
+        board_id: i64,
+        message_id: &str,
+    ) -> Result<Option<MessageMeta>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT channel, actor_id FROM messages WHERE board_id = ?1 AND id = ?2",
+                params![board_id, message_id],
+                |row| {
+                    Ok(MessageMeta {
+                        channel: row.get(0)?,
+                        actor_id: row.get(1)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
     /// Stores a message and appends its event in one transaction. A
     /// [`PostTarget::NewBoard`] is created in that same transaction, so a
     /// board never exists without a message unless it is the default one.
@@ -594,7 +744,7 @@ impl Store {
                 if &earlier_fingerprint != fingerprint {
                     return Err(StoreError::IdempotencyConflict);
                 }
-                let (message, seq) = tx.query_row(
+                let (mut message, seq) = tx.query_row(
                     &format!(
                         "SELECT {MESSAGE_COLUMNS}, m.seq FROM messages m
                          JOIN actors a ON a.id = m.actor_id WHERE m.id = ?1"
@@ -607,6 +757,7 @@ impl Store {
                         ))
                     },
                 )?;
+                fill_message(&tx, &mut message)?;
                 return Ok(Posted {
                     board: board.clone(),
                     message,
@@ -616,30 +767,20 @@ impl Store {
             }
         }
 
-        let (head_seq, head_hash): (i64, String) = tx.query_row(
-            "SELECT head_seq, head_hash FROM boards WHERE id = ?1",
-            [board.id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        let seq = head_seq + 1;
+        // The message records the position its event is about to take.
+        let seq = head(&tx, board.id)? + 1;
         let now = now_rfc3339();
         let id = format!("msg_{}", random_hex(&tx, 12)?);
         let is_root = post.thread_id.is_none();
         let thread_id = post.thread_id.unwrap_or_else(|| id.clone());
-        let actor = post.actor;
-        let kind = actor_kind_name(actor.kind);
+        let by = Writer {
+            actor: post.actor,
+            principal_id: post.principal_id,
+            credential_id: post.credential_id,
+        };
+        let actor = &by.actor;
 
-        tx.execute(
-            "INSERT OR IGNORE INTO actors (id, kind, principal, profile, handle)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                actor.id,
-                kind,
-                post.principal_id,
-                actor.profile,
-                actor.handle
-            ],
-        )?;
+        upsert_actor(&tx, &by)?;
         tx.execute(
             "INSERT INTO messages (id, board_id, channel, thread_id, actor_id, text, created_at, seq, credential_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -652,9 +793,11 @@ impl Store {
                 post.text,
                 now,
                 seq,
-                post.credential_id
+                by.credential_id
             ],
         )?;
+        let mentions = resolve_mentions(&tx, &post.mentions)?;
+        write_mentions(&tx, &id, &mentions)?;
         tx.execute(
             "INSERT INTO channels (board_id, path, created_at, thread_count, last_activity_at)
              VALUES (?1, ?2, ?3, ?4, ?3)
@@ -680,47 +823,19 @@ impl Store {
             }
         }
 
-        let hash = event_hash(
-            HASH_VERSION,
-            &EventFields {
-                prev_hash: &head_hash,
-                board: &board.name,
-                seq,
-                kind: event_types::MESSAGE_POSTED,
-                channel: &post.channel,
-                thread_id: &thread_id,
-                message_id: &id,
-                actor_id: &actor.id,
-                actor_kind: kind,
-                actor_handle: &actor.handle,
-                actor_profile: actor.profile.as_deref(),
-                at: &now,
-                credential_id: post.credential_id.as_deref(),
-            },
-        )
-        .ok_or_else(|| StoreError::Other("the current hash encoding is unknown".to_owned()))?;
-        tx.execute(
-            "INSERT INTO events (board_id, seq, kind, channel, thread_id, message_id, actor_id, at, prev_hash, hash, credential_id, hash_version)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            params![
-                board.id,
-                seq,
-                event_types::MESSAGE_POSTED,
-                post.channel,
-                thread_id,
-                id,
-                actor.id,
-                now,
-                head_hash,
-                hash,
-                post.credential_id,
-                HASH_VERSION
-            ],
+        let appended = append_event(
+            &tx,
+            board,
+            event_types::MESSAGE_POSTED,
+            (&post.channel, &thread_id, &id),
+            &by,
+            &now,
         )?;
-        tx.execute(
-            "UPDATE boards SET head_seq = ?1, head_hash = ?2 WHERE id = ?3",
-            params![seq, hash, board.id],
-        )?;
+        if appended != seq {
+            return Err(StoreError::Other(
+                "the event log moved inside a write transaction".to_owned(),
+            ));
+        }
         if let Some((key, fingerprint)) = &post.idempotency {
             tx.execute(
                 "INSERT INTO idempotency (board_id, actor_id, key, fingerprint, message_id)
@@ -737,15 +852,262 @@ impl Store {
                 board: board.name.clone(),
                 channel: post.channel,
                 thread_id,
-                by: actor,
+                by: by.actor,
                 text: post.text,
                 created_at: now,
                 revision: 1,
-                credential_id: post.credential_id,
+                credential_id: by.credential_id,
+                edited_at: None,
+                deleted_at: None,
+                labels: Default::default(),
+                reactions: Vec::new(),
+                mentions: mentions.into_iter().map(|(_, mention)| mention).collect(),
+                html: None,
             },
             seq,
             duplicate: false,
         })
+    }
+
+    /// Replaces a message's text. The earlier text is not kept: it is
+    /// overwritten in the database file.
+    pub(crate) fn edit(
+        &self,
+        board: &BoardRef,
+        message_id: &str,
+        by: &Writer,
+        text: &str,
+        revision: Option<u32>,
+        mentions: &MentionInput,
+    ) -> Result<Changed> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = current_message(&tx, board, message_id)?;
+        if current.deleted {
+            return Err(StoreError::MessageDeleted);
+        }
+        if revision.is_some_and(|expected| expected != current.revision) {
+            return Err(StoreError::RevisionConflict);
+        }
+        let now = now_rfc3339();
+        tx.execute(
+            "UPDATE messages SET text = ?1, revision = revision + 1, edited_at = ?2 WHERE id = ?3",
+            params![text, now, message_id],
+        )?;
+        let resolved = resolve_mentions(&tx, mentions)?;
+        write_mentions(&tx, message_id, &resolved)?;
+        upsert_actor(&tx, by)?;
+        let seq = append_event(
+            &tx,
+            board,
+            event_types::MESSAGE_EDITED,
+            (&current.channel, &current.thread_id, message_id),
+            by,
+            &now,
+        )?;
+        let message = load_message(&tx, board, message_id)?;
+        tx.commit()?;
+        scrub_wal(&conn);
+        Ok(Changed {
+            message,
+            seq: Some(seq),
+        })
+    }
+
+    /// Turns a message into a tombstone: its text, labels, reactions and
+    /// mentions are removed, and so is the digest of its text that an
+    /// idempotency key kept. Deleting a tombstone changes nothing.
+    pub(crate) fn delete(
+        &self,
+        board: &BoardRef,
+        message_id: &str,
+        by: &Writer,
+        revision: Option<u32>,
+    ) -> Result<Changed> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = current_message(&tx, board, message_id)?;
+        if current.deleted {
+            let message = load_message(&tx, board, message_id)?;
+            return Ok(Changed { message, seq: None });
+        }
+        if revision.is_some_and(|expected| expected != current.revision) {
+            return Err(StoreError::RevisionConflict);
+        }
+        let now = now_rfc3339();
+        tx.execute(
+            "UPDATE messages SET text = '', revision = revision + 1, deleted_at = ?1 WHERE id = ?2",
+            params![now, message_id],
+        )?;
+        for table in ["labels", "reactions", "mentions"] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE message_id = ?1"),
+                [message_id],
+            )?;
+        }
+        // The fingerprint is a digest of the text. With it gone, the key
+        // can never be matched again, and never posts the text a second
+        // time either.
+        tx.execute(
+            "UPDATE idempotency SET fingerprint = '' WHERE message_id = ?1",
+            [message_id],
+        )?;
+        upsert_actor(&tx, by)?;
+        let seq = append_event(
+            &tx,
+            board,
+            event_types::MESSAGE_DELETED,
+            (&current.channel, &current.thread_id, message_id),
+            by,
+            &now,
+        )?;
+        let message = load_message(&tx, board, message_id)?;
+        tx.commit()?;
+        scrub_wal(&conn);
+        Ok(Changed {
+            message,
+            seq: Some(seq),
+        })
+    }
+
+    /// Applies a label request: conditions first, then all of it or none.
+    pub(crate) fn label(
+        &self,
+        board: &BoardRef,
+        message_id: &str,
+        by: &Writer,
+        request: &LabelsRequest,
+    ) -> Result<Changed> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = current_message(&tx, board, message_id)?;
+        if current.deleted {
+            return Err(StoreError::MessageDeleted);
+        }
+        let before = labels_of(&tx, message_id)?;
+        for (key, value) in &request.if_equals {
+            if before.get(key) != Some(value) {
+                return Err(StoreError::LabelConflict(key.clone()));
+            }
+        }
+        if let Some(key) = request
+            .if_unset
+            .iter()
+            .find(|key| before.contains_key(*key))
+        {
+            return Err(StoreError::LabelConflict(key.clone()));
+        }
+        let mut after = before.clone();
+        for key in &request.clear {
+            after.remove(key);
+        }
+        for (key, value) in &request.set {
+            after.insert(key.clone(), value.clone());
+        }
+        if after.len() > MAX_LABELS_PER_MESSAGE {
+            return Err(StoreError::TooManyLabels);
+        }
+        if after == before {
+            let message = load_message(&tx, board, message_id)?;
+            return Ok(Changed { message, seq: None });
+        }
+        for key in before.keys().filter(|key| !after.contains_key(*key)) {
+            tx.execute(
+                "DELETE FROM labels WHERE message_id = ?1 AND key = ?2",
+                params![message_id, key],
+            )?;
+        }
+        for (key, value) in &after {
+            if before.get(key) != Some(value) {
+                tx.execute(
+                    "INSERT INTO labels (message_id, thread_id, key, value) VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT (message_id, key) DO UPDATE SET value = excluded.value",
+                    params![message_id, current.thread_id, key, value],
+                )?;
+            }
+        }
+        upsert_actor(&tx, by)?;
+        let seq = append_event(
+            &tx,
+            board,
+            event_types::LABELS_CHANGED,
+            (&current.channel, &current.thread_id, message_id),
+            by,
+            &now_rfc3339(),
+        )?;
+        let message = load_message(&tx, board, message_id)?;
+        tx.commit()?;
+        Ok(Changed {
+            message,
+            seq: Some(seq),
+        })
+    }
+
+    /// Adds (`add`) or removes the principal's reaction `name`. `handle` is
+    /// the principal's handle, without any profile.
+    pub(crate) fn react(
+        &self,
+        board: &BoardRef,
+        message_id: &str,
+        by: &Writer,
+        handle: &str,
+        name: &str,
+        add: bool,
+    ) -> Result<Changed> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = current_message(&tx, board, message_id)?;
+        if current.deleted {
+            return Err(StoreError::MessageDeleted);
+        }
+        let changed = if add {
+            tx.execute(
+                "INSERT OR IGNORE INTO reactions (message_id, name, principal_id, handle)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![message_id, name, by.principal_id, handle],
+            )?
+        } else {
+            tx.execute(
+                "DELETE FROM reactions WHERE message_id = ?1 AND name = ?2 AND principal_id = ?3",
+                params![message_id, name, by.principal_id],
+            )?
+        };
+        if changed == 0 {
+            let message = load_message(&tx, board, message_id)?;
+            return Ok(Changed { message, seq: None });
+        }
+        upsert_actor(&tx, by)?;
+        let seq = append_event(
+            &tx,
+            board,
+            event_types::REACTIONS_CHANGED,
+            (&current.channel, &current.thread_id, message_id),
+            by,
+            &now_rfc3339(),
+        )?;
+        let message = load_message(&tx, board, message_id)?;
+        tx.commit()?;
+        Ok(Changed {
+            message,
+            seq: Some(seq),
+        })
+    }
+
+    /// Every board, ordered by name, with the time of its newest message.
+    pub(crate) fn boards(&self) -> Result<Vec<BoardInfo>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT b.name,
+                    (SELECT max(c.last_activity_at) FROM channels c WHERE c.board_id = b.id)
+             FROM boards b ORDER BY b.name_key, b.name",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(BoardInfo {
+                name: row.get(0)?,
+                last_activity_at: row.get(1)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     pub(crate) fn channels(&self, board_id: i64) -> Result<Vec<ChannelInfo>> {
@@ -770,6 +1132,7 @@ impl Store {
         &self,
         board: &BoardRef,
         channel: &ChannelSel,
+        label: Option<&LabelFilter>,
         before: Option<i64>,
         limit: u32,
     ) -> Result<ThreadPage> {
@@ -782,6 +1145,20 @@ impl Store {
              WHERE t.board_id = ? AND {}",
             channel_clause("t.channel", channel, &mut values)
         );
+        if let Some(label) = label {
+            // The root or any reply carries the label.
+            sql.push_str(
+                " AND EXISTS (SELECT 1 FROM labels l WHERE l.thread_id = t.root_id AND l.key = ?",
+            );
+            values.push(Value::Text(label.key.clone()));
+            if !label.values.is_empty() {
+                sql.push_str(" AND l.value IN (");
+                sql.push_str(&vec!["?"; label.values.len()].join(", "));
+                sql.push(')');
+                values.extend(label.values.iter().cloned().map(Value::Text));
+            }
+            sql.push(')');
+        }
         if let Some(before) = before {
             sql.push_str(" AND t.last_seq < ?");
             values.push(Value::Integer(before));
@@ -789,7 +1166,11 @@ impl Store {
         sql.push_str(" ORDER BY t.last_seq DESC LIMIT ?");
         values.push(Value::Integer(i64::from(limit) + 1));
 
-        let conn = self.conn();
+        // One read transaction, so each root and what hangs off it come
+        // from the same snapshot.
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let conn = &tx;
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(params_from_iter(values), |row| {
             Ok((
@@ -804,12 +1185,17 @@ impl Store {
         let mut threads = rows.collect::<rusqlite::Result<Vec<_>>>()?;
         let more = threads.len() > limit as usize;
         threads.truncate(limit as usize);
+        for (_, summary) in &mut threads {
+            fill_message(conn, &mut summary.root)?;
+        }
         Ok(ThreadPage { threads, more })
     }
 
     /// The thread rooted at `root_id`: the root and its replies, oldest first.
     pub(crate) fn thread(&self, board: &BoardRef, root_id: &str) -> Result<Option<Thread>> {
-        let conn = self.conn();
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let conn = &tx;
         let mut stmt = conn.prepare(&format!(
             "SELECT {MESSAGE_COLUMNS} FROM messages m JOIN actors a ON a.id = m.actor_id
              WHERE m.board_id = ?1 AND m.thread_id = ?2 ORDER BY m.seq"
@@ -820,6 +1206,9 @@ impl Store {
         let mut messages = rows.collect::<rusqlite::Result<Vec<Message>>>()?;
         if messages.first().is_none_or(|first| first.id != root_id) {
             return Ok(None);
+        }
+        for message in &mut messages {
+            fill_message(conn, message)?;
         }
         let root = messages.remove(0);
         Ok(Some(Thread {
@@ -863,6 +1252,27 @@ impl Store {
         if let Some(actor_id) = &filter.not_from_actor {
             sql.push_str(" AND e.actor_id <> ?");
             values.push(Value::Text(actor_id.clone()));
+        }
+        if let Some(kinds) = &filter.kinds {
+            sql.push_str(" AND e.kind IN (");
+            sql.push_str(&vec!["?"; kinds.len()].join(", "));
+            sql.push(')');
+            values.extend(kinds.iter().map(|kind| Value::Text((*kind).to_owned())));
+        }
+        if let Some(caller) = &filter.mentions {
+            // Decided from the mentions as they are stored now. A tombstone
+            // has none, and an edit replaces them. A mention that names a
+            // profile is for that profile alone; `lower` folds ASCII only.
+            sql.push_str(
+                " AND EXISTS (SELECT 1 FROM mentions mn WHERE mn.message_id = e.message_id
+                              AND mn.principal_id = ? AND (mn.profile IS NULL",
+            );
+            values.push(Value::Text(caller.principal_id.clone()));
+            if let Some(profile) = &caller.profile {
+                sql.push_str(" OR lower(mn.profile) = lower(?)");
+                values.push(Value::Text(profile.clone()));
+            }
+            sql.push_str("))");
         }
         sql.push_str(" ORDER BY e.seq LIMIT ?");
         values.push(Value::Integer(i64::from(limit)));
@@ -932,13 +1342,13 @@ pub(crate) fn peek_mode(data_dir: &Path) -> Option<Mode> {
         .ok()?;
     match version {
         1 => Some(Mode::Local),
-        SCHEMA_VERSION => mode_of(&conn, data_dir).ok()?,
+        OLDEST_IDENTITY_SCHEMA..=SCHEMA_VERSION => mode_of(&conn, data_dir).ok()?,
         _ => None,
     }
 }
 
-/// The mode of a data directory whose database, at the current schema, is
-/// open on `conn`: the recorded one, except that a certificate, a key or
+/// The mode of a data directory whose database, at a schema that has the
+/// identity tables, is open on `conn`: the recorded one, except that a certificate, a key or
 /// any agent makes it a network one. `None` when nothing says.
 pub(crate) fn mode_of(conn: &Connection, data_dir: &Path) -> rusqlite::Result<Option<Mode>> {
     let recorded =
@@ -1065,7 +1475,296 @@ fn message_from_row(row: &Row<'_>, at: usize, board: &str) -> rusqlite::Result<M
         revision: row.get(at + 5)?,
         by: actor_from_row(row, at + 6)?,
         credential_id: row.get(at + 10)?,
+        edited_at: row.get(at + 11)?,
+        deleted_at: row.get(at + 12)?,
+        labels: Default::default(),
+        reactions: Vec::new(),
+        mentions: Vec::new(),
+        html: None,
     })
+}
+
+/// Adds what is stored beside a message's row: its labels, reactions and
+/// mentions. A tombstone has none.
+fn fill_message(conn: &Connection, message: &mut Message) -> Result<()> {
+    if message.deleted_at.is_some() {
+        return Ok(());
+    }
+    message.labels = labels_of(conn, &message.id)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT name, handle FROM reactions WHERE message_id = ?1 ORDER BY name, id",
+    )?;
+    let rows = stmt.query_map([&message.id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (name, handle) = row?;
+        match message.reactions.last_mut() {
+            Some(last) if last.name == name => last.by.push(handle),
+            _ => message.reactions.push(Reaction {
+                name,
+                by: vec![handle],
+            }),
+        }
+    }
+    let mut stmt = conn.prepare_cached(
+        "SELECT handle, kind, profile FROM mentions WHERE message_id = ?1 ORDER BY position",
+    )?;
+    let rows = stmt.query_map([&message.id], |row| {
+        let kind: String = row.get(1)?;
+        let kind = parse_actor_kind(&kind).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                1,
+                rusqlite::types::Type::Text,
+                "unknown principal kind".into(),
+            )
+        })?;
+        Ok(Mention {
+            handle: row.get(0)?,
+            kind,
+            profile: row.get(2)?,
+        })
+    })?;
+    message.mentions = rows.collect::<rusqlite::Result<_>>()?;
+    Ok(())
+}
+
+fn labels_of(
+    conn: &Connection,
+    message_id: &str,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut stmt = conn.prepare_cached("SELECT key, value FROM labels WHERE message_id = ?1")?;
+    let rows = stmt.query_map([message_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// One message with everything stored beside it.
+fn load_message(conn: &Connection, board: &BoardRef, message_id: &str) -> Result<Message> {
+    let mut message = conn.query_row(
+        &format!(
+            "SELECT {MESSAGE_COLUMNS} FROM messages m JOIN actors a ON a.id = m.actor_id
+             WHERE m.board_id = ?1 AND m.id = ?2"
+        ),
+        params![board.id, message_id],
+        |row| message_from_row(row, 0, &board.name),
+    )?;
+    fill_message(conn, &mut message)?;
+    Ok(message)
+}
+
+/// The state of a message that a change is checked against.
+struct Current {
+    channel: String,
+    thread_id: String,
+    revision: u32,
+    deleted: bool,
+}
+
+fn current_message(conn: &Connection, board: &BoardRef, message_id: &str) -> Result<Current> {
+    conn.query_row(
+        "SELECT channel, thread_id, revision, deleted_at IS NOT NULL FROM messages
+         WHERE board_id = ?1 AND id = ?2",
+        params![board.id, message_id],
+        |row| {
+            Ok(Current {
+                channel: row.get(0)?,
+                thread_id: row.get(1)?,
+                revision: row.get(2)?,
+                deleted: row.get(3)?,
+            })
+        },
+    )
+    .optional()?
+    .ok_or(StoreError::MessageMissing)
+}
+
+/// Records the actor behind a write, the first time it writes.
+fn upsert_actor(conn: &Connection, by: &Writer) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO actors (id, kind, principal, profile, handle)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            by.actor.id,
+            actor_kind_name(by.actor.kind),
+            by.principal_id,
+            by.actor.profile,
+            by.actor.handle
+        ],
+    )?;
+    Ok(())
+}
+
+/// Appends one event to the board's log, chained to the one before it, and
+/// moves the board's head. Returns the event's position. Every event of
+/// every type is written here, so every one is covered by the hash chain.
+/// The caller holds a write transaction and has recorded the actor.
+fn append_event(
+    conn: &Connection,
+    board: &BoardRef,
+    kind: &str,
+    (channel, thread_id, message_id): (&str, &str, &str),
+    by: &Writer,
+    at: &str,
+) -> Result<i64> {
+    let (head_seq, head_hash): (i64, String) = conn.query_row(
+        "SELECT head_seq, head_hash FROM boards WHERE id = ?1",
+        [board.id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let seq = head_seq + 1;
+    let hash = event_hash(
+        HASH_VERSION,
+        &EventFields {
+            prev_hash: &head_hash,
+            board: &board.name,
+            seq,
+            kind,
+            channel,
+            thread_id,
+            message_id,
+            actor_id: &by.actor.id,
+            actor_kind: actor_kind_name(by.actor.kind),
+            actor_handle: &by.actor.handle,
+            actor_profile: by.actor.profile.as_deref(),
+            at,
+            credential_id: by.credential_id.as_deref(),
+        },
+    )
+    .ok_or_else(|| StoreError::Other("the current hash encoding is unknown".to_owned()))?;
+    conn.execute(
+        "INSERT INTO events (board_id, seq, kind, channel, thread_id, message_id, actor_id, at, prev_hash, hash, credential_id, hash_version)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            board.id,
+            seq,
+            kind,
+            channel,
+            thread_id,
+            message_id,
+            by.actor.id,
+            at,
+            head_hash,
+            hash,
+            by.credential_id,
+            HASH_VERSION
+        ],
+    )?;
+    conn.execute(
+        "UPDATE boards SET head_seq = ?1, head_hash = ?2 WHERE id = ?3",
+        params![seq, hash, board.id],
+    )?;
+    Ok(seq)
+}
+
+/// Resolves mention candidates to the principals they name, in order,
+/// without repeats, at most [`MAX_MENTIONS_PER_MESSAGE`]. A candidate that
+/// names nobody is dropped. Returns each principal's ID with its mention.
+fn resolve_mentions(conn: &Connection, input: &MentionInput) -> Result<Vec<(String, Mention)>> {
+    let mut known: std::collections::HashMap<String, Option<(String, Mention)>> =
+        std::collections::HashMap::new();
+    let mut resolved: Vec<(String, Mention)> = Vec::new();
+    for candidate in &input.candidates {
+        if resolved.len() >= MAX_MENTIONS_PER_MESSAGE {
+            break;
+        }
+        let key = handle_key(&candidate.handle);
+        let principal = match known.get(&key) {
+            Some(found) => found.clone(),
+            None => {
+                let found = find_mentioned(conn, &key, input.local)?;
+                known.insert(key, found.clone());
+                found
+            }
+        };
+        let Some((principal_id, mut mention)) = principal else {
+            continue;
+        };
+        mention.profile = candidate.profile.clone();
+        let repeated = resolved.iter().any(|(id, earlier)| {
+            *id == principal_id
+                && match (&earlier.profile, &mention.profile) {
+                    (None, None) => true,
+                    (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+                    _ => false,
+                }
+        });
+        if !repeated {
+            resolved.push((principal_id, mention));
+        }
+    }
+    Ok(resolved)
+}
+
+/// The principal a mention's handle names, by its comparison key, with a
+/// mention of it that names no profile.
+fn find_mentioned(conn: &Connection, key: &str, local: bool) -> Result<Option<(String, Mention)>> {
+    let (id, handle, kind) = if local {
+        // A local board's one principal is in no table.
+        let local = crate::authz::Principal::local();
+        if key != handle_key(&local.handle) {
+            return Ok(None);
+        }
+        (local.id, local.handle, local.kind)
+    } else {
+        let found: Option<(String, String, String)> = conn
+            .query_row(
+                "SELECT id, handle, kind FROM principals WHERE handle_key = ?1",
+                [key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((id, handle, kind)) = found else {
+            return Ok(None);
+        };
+        let Some(kind) = parse_actor_kind(&kind) else {
+            return Ok(None);
+        };
+        (id, handle, kind)
+    };
+    Ok(Some((
+        id,
+        Mention {
+            handle,
+            kind,
+            profile: None,
+        },
+    )))
+}
+
+/// Replaces the stored mentions of a message.
+fn write_mentions(
+    conn: &Connection,
+    message_id: &str,
+    mentions: &[(String, Mention)],
+) -> Result<()> {
+    conn.execute("DELETE FROM mentions WHERE message_id = ?1", [message_id])?;
+    for (position, (principal_id, mention)) in mentions.iter().enumerate() {
+        conn.execute(
+            "INSERT INTO mentions (message_id, position, principal_id, handle, kind, profile)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                message_id,
+                position as i64,
+                principal_id,
+                mention.handle,
+                actor_kind_name(mention.kind),
+                mention.profile
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// Moves the write-ahead log into the database file and empties it.
+///
+/// `secure_delete` overwrites removed text in the database file, but the
+/// log still holds the pages as they were before, and SQLite would only
+/// overwrite those as later writes happen to reuse the space. Running this
+/// after text is removed leaves no copy in either file. It is best effort:
+/// while another process reads the database the log cannot be emptied, and
+/// it is emptied by the next removal instead.
+fn scrub_wal(conn: &Connection) {
+    let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
 }
 
 fn actor_from_row(row: &Row<'_>, at: usize) -> rusqlite::Result<Actor> {

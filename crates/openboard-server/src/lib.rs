@@ -7,8 +7,13 @@
 //!   that is refused unless it binds to loopback.
 //! - **Network**: TLS 1.3 on every listener, loopback included, with a
 //!   self-signed certificate that clients pin by fingerprint, and a bearer
-//!   token on every request except the health check and enrolment. See
-//!   `openboard_api::auth` for the contract.
+//!   token on every request except the health check, enrolment and the web
+//!   UI's static files. See `openboard_api::auth` for the contract.
+//!
+//! In both modes the server also serves the web UI's page and its assets,
+//! which are compiled into the binary from this crate's `web/` directory
+//! and hold no board content, and it renders message text to HTML through
+//! an allowlist when a read asks for it. See `openboard_api::web`.
 //!
 //! The mode belongs to the data directory. A new directory takes the mode
 //! of its first start. A local directory started with [`Config::network`]
@@ -70,7 +75,9 @@
 //!   digests), the security log, the mode, and the URL and fingerprint the
 //!   last network start recorded. A database written by an older version is
 //!   migrated forward when a server opens it. The security log is trimmed
-//!   to [`Config::security_log`].
+//!   to [`Config::security_log`]. The text of a deleted or edited message
+//!   is overwritten in this file, and the `-wal` file is emptied straight
+//!   after, so neither keeps a copy.
 //! - [`LOCK_FILE_NAME`]: see below.
 //! - [`CERT_FILE_NAME`] and [`KEY_FILE_NAME`], on a network board: the
 //!   self-signed certificate and its private key in PEM. They are created
@@ -102,8 +109,10 @@ mod chain;
 mod http;
 mod identity;
 mod limits;
+mod markdown;
 mod names;
 pub mod operator;
+mod pages;
 mod serve;
 mod store;
 mod time;

@@ -245,6 +245,12 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".into(),
             revision: 1,
             credential_id: None,
+            edited_at: None,
+            deleted_at: None,
+            labels: Default::default(),
+            reactions: Vec::new(),
+            mentions: Vec::new(),
+            html: None,
         }
     }
 
