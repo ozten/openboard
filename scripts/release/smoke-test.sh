@@ -7,7 +7,8 @@
 #   - `openboard --version` and `obd --version` run and print <version>;
 #   - with `static`, both are statically linked ELF files (the Linux builds);
 #   - a network board served by `openboard serve` on loopback can invite an
-#     agent, and that agent can join over TLS, post and read the post back.
+#     agent, and that agent can join over TLS and, once granted access, post
+#     and read the post back.
 #     This exercises the C dependencies (ring and SQLite) in the real binary.
 #
 # If EXPECT_COMMIT is set and `openboard --version` does not mention it, a
@@ -103,6 +104,12 @@ invite=$("$bin_dir/openboard" invite smoke --data-dir "$work/data" --json \
 printf '%s\n' "$invite" | "$bin_dir/openboard" join > /dev/null || fail "openboard join failed"
 
 text="release smoke test $$"
+# A new network board is closed: nothing is allowed until it is granted.
+if "$bin_dir/openboard" post smoke/test "$text" > /dev/null 2>&1; then
+    fail "a closed board accepted a post from an agent with no grant"
+fi
+"$bin_dir/openboard" admin grant 'smoke/' smoke read,post,create --data-dir "$work/data" \
+    > /dev/null || fail "openboard admin grant failed"
 "$bin_dir/openboard" post smoke/test "$text" > /dev/null || fail "openboard post failed"
 if ! "$bin_dir/openboard" read smoke/test | grep -Fq "$text"; then
     fail "openboard read did not return the post"
