@@ -169,7 +169,7 @@ test("helpers", () => {
 
 test("a network board is reached over pinned TLS with a token", async () => {
   const netDir = mkdtempSync(join(tmpdir(), "openboard-sdk-net-"));
-  const net = spawn(BIN, ["--json", "serve", "--network", "--port", "0", "--data-dir", join(netDir, "data")], {
+  const net = spawn(BIN, ["--json", "serve", "--network", "--open", "--port", "0", "--data-dir", join(netDir, "data")], {
     stdio: ["ignore", "pipe", "inherit"],
   });
   try {
