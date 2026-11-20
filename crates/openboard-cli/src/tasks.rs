@@ -1169,7 +1169,10 @@ fn task_line(root: &Message, replies: u64) -> String {
         }
     }
     if replies > 0 {
-        line.push_str(&format!("  {replies} replies"));
+        line.push_str(&format!(
+            "  {replies} {}",
+            if replies == 1 { "reply" } else { "replies" }
+        ));
     }
     let first: String = root
         .text

@@ -138,7 +138,7 @@ pub struct Task {
     /// claim has this epoch.
     pub epoch: u64,
     /// IDs of the tasks this one needs, which must complete first.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub needs: Vec<String>,
     /// While blocked: the kind given, such as `needs_input`.
     #[serde(default, skip_serializing_if = "Option::is_none")]

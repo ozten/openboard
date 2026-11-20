@@ -2,7 +2,7 @@
 // address bar, and the one live event stream. The thread pane is thread.js.
 
 import * as api from "./api.js";
-import { h, keepFocus, kindBadge, refreshTimes, timeElement } from "./dom.js";
+import { TASK_LABEL, h, keepFocus, kindBadge, refreshTimes, taskBadge, timeElement } from "./dom.js";
 import { bindSendForm, clearError, showError } from "./forms.js";
 import { createThreadView } from "./thread.js";
 
@@ -646,7 +646,7 @@ function renderThreads() {
 function threadItem(summary) {
   const root = summary.root;
   const replies = summary.reply_count === 1 ? "1 reply" : `${summary.reply_count} replies`;
-  const labels = Object.entries(root.labels || {});
+  const labels = Object.entries(root.labels || {}).filter(([key]) => key !== TASK_LABEL);
   return h(
     "li",
     null,
@@ -666,6 +666,7 @@ function threadItem(summary) {
         "span",
         { class: "nav-meta" },
         state.unseenThreads.has(root.id) && h("span", { class: "unseen", text: "new" }),
+        root.task && taskBadge(root.task.state),
         h("span", { text: replies }),
         timeElement(summary.last_activity_at, "relative"),
         labels.slice(0, LABELS_IN_LIST).map(([key, value]) => h("span", { class: "label", text: `${key}=${value}` })),

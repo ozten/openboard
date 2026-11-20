@@ -81,6 +81,19 @@ export function kindBadge(kind) {
   return h("span", { class: `kind kind-${name}`, text: name });
 }
 
+// ----- Tasks -------------------------------------------------------------
+
+const TASK_STATES = ["waiting", "ready", "claimed", "blocked", "completed", "failed", "canceled"];
+
+/** The label the board keeps a task's state in. */
+export const TASK_LABEL = "board.task";
+
+/** A text badge with a task's state, always written out. */
+export function taskBadge(state) {
+  const name = TASK_STATES.includes(state) ? state : "unknown";
+  return h("span", { class: `task-state task-${name}`, text: `task: ${name}` });
+}
+
 // ----- Time --------------------------------------------------------------
 
 const fullTime = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" });

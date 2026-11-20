@@ -989,3 +989,91 @@ textarea {
     transition: background-color 0.1s, border-color 0.1s;
   }
 }
+
+/* ----- Tasks ----------------------------------------------------------- */
+
+/* The state is always written out; colour only reinforces it. */
+.task-state {
+  flex: none;
+  padding: 0 0.375rem;
+  border: 1px solid currentColor;
+  border-radius: 3px;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  line-height: 1.5;
+  white-space: nowrap;
+  color: var(--local);
+  background: var(--local-soft);
+}
+
+.task-ready,
+.task-claimed {
+  --task: var(--accent);
+  --task-soft: var(--accent-soft);
+}
+
+.task-completed {
+  --task: var(--person);
+  --task-soft: var(--person-soft);
+}
+
+.task-blocked {
+  --task: var(--service);
+  --task-soft: var(--service-soft);
+}
+
+.task-failed {
+  --task: var(--danger);
+  --task-soft: var(--danger-soft);
+}
+
+.task-state.task-ready,
+.task-state.task-claimed,
+.task-state.task-completed,
+.task-state.task-blocked,
+.task-state.task-failed {
+  color: var(--task);
+  background: var(--task-soft);
+}
+
+.task-state.task-canceled {
+  text-decoration: line-through;
+}
+
+.task-panel {
+  margin: 0.375rem 0 0.5rem;
+  padding: 0.5rem 0.625rem;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--task, var(--local));
+  border-radius: var(--radius);
+  background: var(--sunken);
+  font-size: 0.875rem;
+}
+
+.task-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.25rem;
+}
+
+.task-epoch {
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.task-facts {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 0.125rem 0.75rem;
+  margin: 0;
+}
+
+.task-facts dt {
+  color: var(--muted);
+}
+
+.task-facts dd {
+  margin: 0;
+  white-space: pre-wrap;
+}

@@ -2,7 +2,7 @@
 // message, and the reply box.
 
 import * as api from "./api.js";
-import { focusKey, h, keepFocus, kindBadge, kindName, timeElement } from "./dom.js";
+import { TASK_LABEL, focusKey, h, keepFocus, kindBadge, kindName, taskBadge, timeElement } from "./dom.js";
 import { bindSendForm, clearError, showError } from "./forms.js";
 
 /** How a reaction name is drawn. A name that is not here is drawn as `:name:`. */
@@ -303,6 +303,9 @@ export function createThreadView({ getMe, onLoaded }) {
       return node;
     }
 
+    if (message.task) {
+      node.append(taskPanel(message.task, view.thread.trust));
+    }
     const body = h("div", { class: "body" });
     if (typeof message.html === "string") {
       insertSanitisedMessageHtml(body, message.html);
@@ -347,6 +350,52 @@ export function createThreadView({ getMe, onLoaded }) {
     return node;
   }
 
+  /**
+   * What the board keeps about a task: its state, who created it, who it is
+   * kept for, who holds it and until when. The reason and the result are
+   * text from an agent, shown as plain text.
+   */
+  function taskPanel(task, trust) {
+    const facts = h("dl", { class: "task-facts" });
+    const fact = (term, ...value) => {
+      facts.append(h("dt", { text: term }), h("dd", null, ...value));
+    };
+    fact("Created by", task.creator.handle);
+    if (task.assignee) {
+      fact("Kept for", task.assignee);
+    }
+    if (task.holder) {
+      fact(
+        "Held by",
+        task.holder.handle,
+        task.lease_until && h("span", { class: "task-lease" }, " until ", timeElement(task.lease_until, "clock")),
+      );
+    }
+    const needs = task.needs || [];
+    if (needs.length > 0) {
+      fact("Needs", `${needs.length} ${needs.length === 1 ? "task" : "tasks"}`);
+    }
+    if (task.block_kind) {
+      fact("Kind", task.block_kind);
+    }
+    if (task.reason) {
+      fact("Reason", task.reason);
+    }
+    if (task.result) {
+      fact("Result", task.result);
+    }
+    fact("Changed", task.changed_by.handle, " ", timeElement(task.changed_at, "clock"));
+    if (trust && trust.brief_edited) {
+      fact("Brief", "edited after it became a task");
+    }
+    return h(
+      "section",
+      { class: `task-panel task-${task.state}`, "aria-label": `Task, ${task.state}` },
+      h("div", { class: "task-head" }, taskBadge(task.state), h("span", { class: "task-epoch", text: `claim ${task.epoch}` })),
+      facts,
+    );
+  }
+
   /** Touches up rendered Markdown through the DOM, never by rewriting HTML. */
   function finishBody(body, me) {
     for (const link of body.querySelectorAll("a[href]")) {
@@ -367,6 +416,14 @@ export function createThreadView({ getMe, onLoaded }) {
     const message = card.message;
     const row = h("div", { class: "chips" });
     for (const [key, value] of Object.entries(message.labels || {})) {
+      // The task panel shows the state; the board keeps its own labels.
+      if (key === TASK_LABEL) {
+        continue;
+      }
+      if (key.startsWith("board.")) {
+        row.append(h("span", { class: "label" }, h("span", { class: "label-text", text: `${key}=${value}` })));
+        continue;
+      }
       row.append(
         h(
           "span",
