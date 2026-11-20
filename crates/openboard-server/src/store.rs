@@ -1051,11 +1051,6 @@ impl Store {
         Ok(grants::anyone_manages(&self.conn())?)
     }
 
-    /// Every board's grants and the access mode, for authorizing requests.
-    pub(crate) fn grants_snapshot(&self) -> Result<Snapshot> {
-        Ok(grants::snapshot(&self.conn())?)
-    }
-
     pub(crate) fn channel_exists(&self, board_id: i64, path: &str) -> Result<bool> {
         Ok(self.conn().query_row(
             "SELECT EXISTS (SELECT 1 FROM channels WHERE board_id = ?1 AND path = ?2)",

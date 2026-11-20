@@ -280,6 +280,14 @@ pub(crate) fn router(parts: Parts) -> (Router, Maintenance) {
             axum::routing::delete(grants_routes::remove_grant),
         )
         .route("/v1/boards/{board}/explain", get(grants_routes::explain))
+        .route(
+            "/v1/boards/{board}/profiles",
+            get(tokens_routes::list_profiles),
+        )
+        .route(
+            "/v1/boards/{board}/profiles/{profile}",
+            put(tokens_routes::set_profile).delete(tokens_routes::clear_profile),
+        )
         .route("/v1/boards/{board}/threads", get(list_threads))
         .route("/v1/boards/{board}/threads/{thread_id}", get(get_thread))
         .route("/v1/boards/{board}/events", get(get_events))
@@ -414,7 +422,8 @@ impl AppError {
             | codes::INVITE_INVALID
             | codes::CSRF_FAILED
             | codes::NOT_TASK_CREATOR
-            | codes::NO_AUTHORITY => StatusCode::FORBIDDEN,
+            | codes::NO_AUTHORITY
+            | codes::DERIVED_TOKEN => StatusCode::FORBIDDEN,
             codes::UNAUTHENTICATED => StatusCode::UNAUTHORIZED,
             codes::RATE_LIMITED => StatusCode::TOO_MANY_REQUESTS,
             codes::IDEMPOTENCY_CONFLICT
@@ -1212,23 +1221,36 @@ impl AppState {
     ) -> ApiResult<Caller> {
         let mut caller = Caller::new(identity, headers)?;
         if self.mode == Mode::Network && !caller.principal.is_anonymous() {
-            let snapshot = self.db(|state| state.store.grants_snapshot()).await?;
+            let principal_id = caller.principal.id.clone();
+            // A bound token's profile is the profile, whatever the header says.
+            let profile = identity
+                .credential
+                .as_ref()
+                .and_then(|credential| credential.profile.clone())
+                .or_else(|| caller.profile.clone());
+            let (snapshot, limits) = self
+                .db(move |state| {
+                    state
+                        .store
+                        .authority_inputs(&principal_id, profile.as_deref())
+                })
+                .await?;
             let subject = grants::Subject {
                 id: caller.principal.id.clone(),
                 kind: caller.principal.kind,
             };
             let mut authority = access::Authority::new(snapshot, subject);
+            for (board, scope) in &limits {
+                authority
+                    .profile_limits
+                    .push((board.clone(), parse_ceiling(scope)?));
+            }
             if let Some(credential) = &identity.credential {
                 authority.derived = credential.derived();
                 for (board, scope) in &credential.scopes {
-                    let entries = scope
-                        .split_whitespace()
-                        .map(|entry| grants::Ceiling::parse_entry(entry, names::validate_channel))
-                        .collect::<Result<Vec<_>, _>>()
-                        .map_err(|error| AppError::internal(&error))?;
                     authority
                         .ceilings
-                        .push((board.clone(), grants::Ceiling { entries }));
+                        .push((board.clone(), parse_ceiling(scope)?));
                 }
                 // A token bound to a profile writes as it.
                 if let Some(bound) = &credential.profile {
@@ -1460,6 +1482,16 @@ impl HtmlBudget {
             html
         });
     }
+}
+
+/// A stored scope: `pattern=verbs` entries separated by spaces.
+fn parse_ceiling(scope: &str) -> ApiResult<grants::Ceiling> {
+    let entries = scope
+        .split_whitespace()
+        .map(|entry| grants::Ceiling::parse_entry(entry, names::validate_channel))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| AppError::internal(&error))?;
+    Ok(grants::Ceiling { entries })
 }
 
 fn bad_path() -> AppError {

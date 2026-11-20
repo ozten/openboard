@@ -33,6 +33,14 @@ ALTER TABLE credentials ADD COLUMN board TEXT;
 ALTER TABLE credentials ADD COLUMN scope TEXT;
 ALTER TABLE credentials ADD COLUMN profile TEXT;
 CREATE INDEX credentials_by_parent ON credentials(parent_id) WHERE parent_id IS NOT NULL;
+CREATE TABLE profile_limits (
+    principal_id TEXT NOT NULL REFERENCES principals(id),
+    board_id     INTEGER NOT NULL REFERENCES boards(id),
+    profile      TEXT NOT NULL,
+    scope        TEXT NOT NULL,
+    set_ms       INTEGER NOT NULL,
+    PRIMARY KEY (principal_id, board_id, profile)
+);
 ";
 
 /// The `meta` key of the instance's access mode.
@@ -616,6 +624,80 @@ impl super::Store {
     }
 
     /// The grants of `board`, all of them.
+    /// Limits profile `profile` of `principal_id` on `board` to `scope`
+    /// (A8), replacing any earlier limit.
+    pub(crate) fn set_profile_limit(
+        &self,
+        board: &super::BoardRef,
+        principal_id: &str,
+        profile: &str,
+        scope: &[String],
+    ) -> super::Result<()> {
+        self.conn().execute(
+            "INSERT INTO profile_limits (principal_id, board_id, profile, scope, set_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (principal_id, board_id, profile)
+             DO UPDATE SET scope = excluded.scope, set_ms = excluded.set_ms",
+            params![principal_id, board.id, profile, scope.join(" "), now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// Lifts a profile's limit. Whether there was one.
+    pub(crate) fn clear_profile_limit(
+        &self,
+        board: &super::BoardRef,
+        principal_id: &str,
+        profile: &str,
+    ) -> super::Result<bool> {
+        Ok(self.conn().execute(
+            "DELETE FROM profile_limits WHERE principal_id = ?1 AND board_id = ?2 AND profile = ?3",
+            params![principal_id, board.id, profile],
+        )? == 1)
+    }
+
+    /// The limited profiles of `principal_id` on `board`: (profile, scope).
+    pub(crate) fn profile_limits(
+        &self,
+        board: &super::BoardRef,
+        principal_id: &str,
+    ) -> super::Result<Vec<(String, String)>> {
+        Ok(self
+            .conn()
+            .prepare(
+                "SELECT profile, scope FROM profile_limits
+                  WHERE principal_id = ?1 AND board_id = ?2 ORDER BY profile",
+            )?
+            .query_map(params![principal_id, board.id], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// What a request needs to judge its caller: the grants, and the limits
+    /// on the profile it declared, by board name.
+    pub(crate) fn authority_inputs(
+        &self,
+        principal_id: &str,
+        profile: Option<&str>,
+    ) -> super::Result<(Snapshot, Vec<(String, String)>)> {
+        let conn = self.conn();
+        let snapshot = snapshot(&conn)?;
+        let limits = match profile {
+            None => Vec::new(),
+            Some(profile) => conn
+                .prepare_cached(
+                    "SELECT b.name, l.scope FROM profile_limits l JOIN boards b ON b.id = l.board_id
+                      WHERE l.principal_id = ?1 AND l.profile = ?2",
+                )?
+                .query_map(params![principal_id, profile], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })?
+                .collect::<rusqlite::Result<_>>()?,
+        };
+        Ok((snapshot, limits))
+    }
+
     pub(crate) fn board_grants(&self, board_id: i64) -> super::Result<Vec<StoredGrant>> {
         Ok(board_grants(&self.conn(), board_id)?)
     }

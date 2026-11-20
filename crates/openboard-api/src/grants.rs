@@ -23,6 +23,36 @@ pub fn channels_path(board: &str) -> String {
     format!("/v1/boards/{board}/channels")
 }
 
+/// `GET` lists the caller's limited profiles on the board.
+pub fn profiles_path(board: &str) -> String {
+    format!("/v1/boards/{board}/profiles")
+}
+
+/// `PUT` limits one profile, `DELETE` lifts the limit.
+pub fn profile_path(board: &str, profile: &str) -> String {
+    format!("/v1/boards/{board}/profiles/{profile}")
+}
+
+/// A profile's limit on one board (A8): requests made as the profile get
+/// the principal's access intersected with these entries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileLimit {
+    pub profile: String,
+    /// Entries such as `build/=read,post`.
+    pub can: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileLimits {
+    pub profiles: Vec<ProfileLimit>,
+}
+
+/// The body of `PUT /v1/boards/{board}/profiles/{profile}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetProfileLimit {
+    pub can: Vec<String>,
+}
+
 /// One grant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Grant {

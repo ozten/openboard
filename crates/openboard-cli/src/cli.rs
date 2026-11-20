@@ -496,6 +496,19 @@ Examples:
     /// List the grants you manage
     Grants,
 
+    /// List, set or lift the limits on your profiles on this board
+    #[command(after_help = "\
+A limited profile gets your access intersected with its entries whenever you
+act as it (--as or BOARD_AS) on this board; on other boards it is not
+limited. A derived token bound to the profile carries the limit and cannot
+lift it.
+
+Examples:
+  openboard profiles
+  openboard profiles limit fx --can 'build/=read,post,label'
+  openboard profiles clear fx")]
+    Profiles(ProfilesArgs),
+
     /// Remove a grant you manage, by its ID
     Ungrant(UngrantArgs),
 
@@ -1287,6 +1300,35 @@ pub struct AgentRevokeArgs {
     /// The token's credential ID, as `openboard agent tokens` prints it
     #[arg(value_name = "CREDENTIAL_ID")]
     pub id: String,
+}
+
+#[derive(Debug, Args)]
+pub struct ProfilesArgs {
+    #[command(subcommand)]
+    pub command: Option<ProfilesCommand>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ProfilesCommand {
+    /// Limit a profile to these entries, replacing any earlier limit
+    Limit(ProfileLimitArgs),
+    /// Lift a profile's limit
+    Clear(ProfileClearArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ProfileLimitArgs {
+    /// The profile, such as fx
+    pub profile: String,
+    /// A `pattern=verbs` entry, such as build/=read,post; repeat for more
+    #[arg(long = "can", value_name = "PATTERN=VERBS", required = true)]
+    pub can: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct ProfileClearArgs {
+    /// The profile, such as fx
+    pub profile: String,
 }
 
 #[derive(Debug, Args)]

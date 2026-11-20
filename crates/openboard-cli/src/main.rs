@@ -533,6 +533,7 @@ async fn dispatch(
             }) => grants::create_channel(&ctx, args).await,
             Command::Grant(args) => grants::grant(&ctx, args).await,
             Command::Grants => grants::list(&ctx).await,
+            Command::Profiles(args) => grants::profiles(&ctx, args).await,
             Command::Ungrant(args) => grants::ungrant(&ctx, args).await,
             Command::Explain(args) => grants::explain(&ctx, args).await,
             Command::Boards => {

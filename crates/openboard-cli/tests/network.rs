@@ -3208,3 +3208,37 @@ fn a_lead_starts_a_worker_with_a_derived_token_in_its_environment() {
     run(lead.cli().args(["agent", "revoke", &id])).ok();
     run(worker().args(["--json", "post", "build/api", "gone"])).error(1, "unauthenticated");
 }
+
+#[test]
+fn a_profile_limit_is_set_listed_and_lifted_from_the_cli() {
+    let board = NetBoard::start_with(|config| config.open = false);
+    let ada = board.enrol("ada");
+    run(openboard()
+        .args(["admin", "grant", "*", "ada", "all", "--data-dir"])
+        .arg(board.data_dir()))
+    .ok();
+    ada.post("docs", "words");
+    run(ada.cli().args([
+        "profiles",
+        "limit",
+        "fx",
+        "--can",
+        "build/=read,post,create",
+    ]))
+    .ok();
+    let listed = run(ada.cli().args(["profiles"])).ok();
+    assert_eq!(listed.stdout.trim(), "fx  build/=read,post,create");
+    run(ada
+        .cli()
+        .args(["--json", "--as", "fx", "post", "docs", "no"]))
+    .error(1, "forbidden");
+    run(ada
+        .cli()
+        .args(["--json", "--as", "fx", "post", "build/x", "yes"]))
+    .ok();
+    run(ada.cli().args(["profiles", "clear", "fx"])).ok();
+    run(ada
+        .cli()
+        .args(["--json", "--as", "fx", "post", "docs", "now yes"]))
+    .ok();
+}

@@ -17,6 +17,9 @@ pub(crate) struct Authority {
     /// The profile's narrowing and the scopes of the credential and every
     /// credential it was derived from, by board.
     pub ceilings: Vec<(String, Ceiling)>,
+    /// The limits on the declared profile (A8), by board. Unlike a token's
+    /// scope, a profile limited on one board is not limited on another.
+    pub profile_limits: Vec<(String, Ceiling)>,
     /// The request came with a derived token.
     pub derived: bool,
 }
@@ -27,6 +30,7 @@ impl Authority {
             snapshot,
             subject,
             ceilings: Vec::new(),
+            profile_limits: Vec::new(),
             derived: false,
         }
     }
@@ -47,6 +51,12 @@ impl Authority {
                     &NOTHING
                 }
             })
+            .chain(
+                self.profile_limits
+                    .iter()
+                    .filter(|(on, _)| crate::names::board_key(on) == key)
+                    .map(|(_, ceiling)| ceiling),
+            )
             .collect()
     }
 

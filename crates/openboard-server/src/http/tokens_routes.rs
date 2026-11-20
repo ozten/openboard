@@ -177,3 +177,119 @@ pub(super) async fn revoke(
     credential.revoked_ms = Some(crate::time::now_ms());
     Ok(Json(info(&credential, board, &scope)))
 }
+
+// ---------------------------------------------------------------------------
+// Profile limits (A8)
+// ---------------------------------------------------------------------------
+
+use openboard_api::grants::{ProfileLimit, ProfileLimits, SetProfileLimit};
+
+/// A request through a derived token cannot widen what it runs under.
+fn not_derived(identity: &Identity) -> ApiResult<()> {
+    if identity
+        .credential
+        .as_ref()
+        .is_some_and(Credential::derived)
+    {
+        return Err(AppError::new(
+            codes::DERIVED_TOKEN,
+            "a derived token cannot change profile limits",
+        )
+        .next("change them with your own login"));
+    }
+    Ok(())
+}
+
+fn profile_name(raw: String) -> ApiResult<String> {
+    names::validate_profile(&raw)
+        .map_err(|reason| AppError::new(codes::INVALID_PROFILE, reason))?;
+    Ok(raw)
+}
+
+fn limit(profile: String, scope: &str) -> ProfileLimit {
+    ProfileLimit {
+        profile,
+        can: scope.split_whitespace().map(str::to_owned).collect(),
+    }
+}
+
+/// `GET /v1/boards/{board}/profiles`.
+pub(super) async fn list_profiles(
+    State(state): State<Shared>,
+    Extension(identity): Extension<Identity>,
+    headers: HeaderMap,
+    board: Result<Path<String>, PathRejection>,
+) -> ApiResult<Json<ProfileLimits>> {
+    let caller = state.caller(&identity, &headers).await?;
+    let board = state.board(&caller, board).await?;
+    let principal_id = caller.principal.id.clone();
+    let limits = state
+        .db(move |state| state.store.profile_limits(&board, &principal_id))
+        .await?;
+    Ok(Json(ProfileLimits {
+        profiles: limits
+            .into_iter()
+            .map(|(profile, scope)| limit(profile, &scope))
+            .collect(),
+    }))
+}
+
+/// `PUT /v1/boards/{board}/profiles/{profile}`.
+pub(super) async fn set_profile(
+    State(state): State<Shared>,
+    Extension(identity): Extension<Identity>,
+    headers: HeaderMap,
+    path: Result<Path<(String, String)>, PathRejection>,
+    body: Result<Bytes, BytesRejection>,
+) -> ApiResult<Json<ProfileLimit>> {
+    not_derived(&identity)?;
+    let Path((board, profile)) = path.map_err(|_| bad_path())?;
+    let profile = profile_name(profile)?;
+    let caller = state.caller(&identity, &headers).await?;
+    let board = state.board(&caller, Ok(Path(board))).await?;
+    let request: SetProfileLimit = read_json(&headers, body, "profile limit", || {
+        AppError::invalid("the request body is too large for a profile limit")
+            .status(StatusCode::PAYLOAD_TOO_LARGE)
+    })?;
+    let scope = parse_scope(&request.can)?;
+    let principal_id = caller.principal.id.clone();
+    let (stored_profile, stored_scope) = (profile.clone(), scope.clone());
+    state
+        .db(move |state| {
+            state
+                .store
+                .set_profile_limit(&board, &principal_id, &stored_profile, &stored_scope)
+        })
+        .await?;
+    Ok(Json(limit(profile, &scope.join(" "))))
+}
+
+/// `DELETE /v1/boards/{board}/profiles/{profile}`.
+pub(super) async fn clear_profile(
+    State(state): State<Shared>,
+    Extension(identity): Extension<Identity>,
+    headers: HeaderMap,
+    path: Result<Path<(String, String)>, PathRejection>,
+) -> ApiResult<StatusCode> {
+    not_derived(&identity)?;
+    let Path((board, profile)) = path.map_err(|_| bad_path())?;
+    let profile = profile_name(profile)?;
+    let caller = state.caller(&identity, &headers).await?;
+    let board = state.board(&caller, Ok(Path(board))).await?;
+    let principal_id = caller.principal.id.clone();
+    let cleared = state
+        .db(move |state| {
+            state
+                .store
+                .clear_profile_limit(&board, &principal_id, &profile)
+        })
+        .await?;
+    if cleared {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(AppError::new(
+            codes::NOT_FOUND,
+            "that profile has no limit on this board",
+        ))
+    }
+}

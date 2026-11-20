@@ -838,3 +838,105 @@ async fn a_derived_token_cannot_outlive_its_parent_and_binds_its_profile() {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{bad}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Profile limits (A8)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_limited_profile_narrows_only_on_its_board_and_only_when_declared() {
+    let board = Board::closed().await;
+    let ada = board.enrol("ada").await;
+    board.grant("*", "ada", "all");
+    operator::grant(&board.data_dir(), "other", "*", "ada", "all", None).unwrap();
+    board.posted(&ada, "build/api", "work").await;
+    board.posted(&ada, "docs", "words").await;
+
+    let set = board
+        .http
+        .put(board.at("/v1/boards/general/profiles/fx"))
+        .bearer_auth(&ada)
+        .json(&json!({ "can": ["build/=read,post"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(set.status(), StatusCode::OK);
+    let as_fx = |channel: &str| {
+        board
+            .post_json(
+                &ada,
+                "/v1/boards/general/messages",
+                json!({ "channel": channel, "text": "as fx" }),
+            )
+            .header(openboard_api::PROFILE_HEADER, "fx")
+    };
+    assert!(as_fx("build/api")
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .is_success());
+    error_of(
+        as_fx("docs").send().await.unwrap(),
+        StatusCode::FORBIDDEN,
+        codes::FORBIDDEN,
+    )
+    .await;
+    // Undeclared, or declared on another board: Ada's own access.
+    board.posted(&ada, "docs", "as ada").await;
+    let elsewhere = board
+        .post_json(
+            &ada,
+            "/v1/boards/other/messages",
+            json!({ "channel": "docs", "text": "fx elsewhere" }),
+        )
+        .header(openboard_api::PROFILE_HEADER, "fx")
+        .send()
+        .await
+        .unwrap();
+    assert!(elsewhere.status().is_success());
+    let explained: Explained = board
+        .get(&ada, "/v1/boards/general/explain?channel=build/api")
+        .header(openboard_api::PROFILE_HEADER, "fx")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(explained.verbs, "read,post");
+    assert!(explained.narrowed);
+
+    // A token bound to fx carries the limit; it cannot lift it.
+    let bound = board
+        .mint(
+            &ada,
+            json!({ "board": "general", "can": ["*=all"], "profile": "fx" }),
+        )
+        .await;
+    let bound: openboard_api::tokens::TokenMinted = bound.json().await.unwrap();
+    error_of(
+        board.post(&bound.token, "docs", "via token").await,
+        StatusCode::FORBIDDEN,
+        codes::FORBIDDEN,
+    )
+    .await;
+    let lift = board
+        .http
+        .delete(board.at("/v1/boards/general/profiles/fx"))
+        .bearer_auth(&bound.token)
+        .send()
+        .await
+        .unwrap();
+    error_of(lift, StatusCode::FORBIDDEN, codes::DERIVED_TOKEN).await;
+
+    let lift = board
+        .http
+        .delete(board.at("/v1/boards/general/profiles/fx"))
+        .bearer_auth(&ada)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(lift.status(), StatusCode::NO_CONTENT);
+    board.posted(&bound.token, "docs", "lifted").await;
+}

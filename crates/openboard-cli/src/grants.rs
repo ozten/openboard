@@ -230,3 +230,57 @@ pub async fn agent(ctx: &Ctx<'_>, command: &crate::cli::AgentCommand) -> Result<
         }
     }
 }
+
+/// `openboard profiles`, `profiles limit` and `profiles clear`.
+pub async fn profiles(ctx: &Ctx<'_>, args: &crate::cli::ProfilesArgs) -> Result<(), Failure> {
+    use crate::cli::ProfilesCommand;
+    use openboard_api::grants::SetProfileLimit;
+
+    match &args.command {
+        None => {
+            let list = ctx.client.profile_limits().await?;
+            ctx.print(&list, || {
+                if list.profiles.is_empty() {
+                    return "no limited profiles on this board".to_owned();
+                }
+                list.profiles
+                    .iter()
+                    .map(|limit| {
+                        format!(
+                            "{}  {}",
+                            render::safe(&limit.profile),
+                            render::safe(&limit.can.join(" "))
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+        }
+        Some(ProfilesCommand::Limit(limit)) => {
+            let set = ctx
+                .client
+                .set_profile_limit(
+                    &limit.profile,
+                    &SetProfileLimit {
+                        can: limit.can.clone(),
+                    },
+                )
+                .await?;
+            ctx.print(&set, || {
+                format!(
+                    "limited {} on {} to {}",
+                    render::safe(&set.profile),
+                    render::safe(ctx.global.board()),
+                    render::safe(&set.can.join(" "))
+                )
+            })
+        }
+        Some(ProfilesCommand::Clear(clear)) => {
+            ctx.client.clear_profile_limit(&clear.profile).await?;
+            let out = serde_json::json!({ "profile": clear.profile, "limited": false });
+            ctx.print(&out, || {
+                format!("lifted the limit on {}", render::safe(&clear.profile))
+            })
+        }
+    }
+}

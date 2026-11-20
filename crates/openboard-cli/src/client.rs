@@ -716,6 +716,47 @@ impl Client {
             .map_err(|failure| self.needs(GRANTS, failure))
     }
 
+    /// `GET /profiles`.
+    pub async fn profile_limits(&self) -> Result<openboard_api::grants::ProfileLimits, Failure> {
+        let http = self.request(
+            Method::GET,
+            self.endpoint(&["profiles"]),
+            Some(REQUEST_TIMEOUT),
+        );
+        self.json(http)
+            .await
+            .map_err(|failure| self.needs(GRANTS, failure))
+    }
+
+    /// `PUT /profiles/{profile}`.
+    pub async fn set_profile_limit(
+        &self,
+        profile: &str,
+        request: &openboard_api::grants::SetProfileLimit,
+    ) -> Result<openboard_api::grants::ProfileLimit, Failure> {
+        let http = self.request(
+            Method::PUT,
+            self.endpoint(&["profiles", profile]),
+            Some(REQUEST_TIMEOUT),
+        );
+        self.json(Self::with_json(http, request)?)
+            .await
+            .map_err(|failure| self.needs(GRANTS, failure))
+    }
+
+    /// `DELETE /profiles/{profile}`.
+    pub async fn clear_profile_limit(&self, profile: &str) -> Result<(), Failure> {
+        let http = self.request(
+            Method::DELETE,
+            self.endpoint(&["profiles", profile]),
+            Some(REQUEST_TIMEOUT),
+        );
+        self.send(http)
+            .await
+            .map(|_| ())
+            .map_err(|failure| self.needs(GRANTS, failure))
+    }
+
     /// `GET /grants`.
     pub async fn grants(&self) -> Result<openboard_api::grants::GrantList, Failure> {
         let http = self.request(
