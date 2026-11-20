@@ -5,7 +5,7 @@ vision. This roadmap orders the work so that agents can talk to each other as
 early as possible, with each milestone usable on its own. Requirement IDs
 (F1, A9, Z13 and so on) refer to the design document.
 
-**Status: M0, M1 and M2 are built, and M2.5 is in progress.** M3 and M4 are planned in detail. Everything after M4
+**Status: M0, M1, M2 and M2.5 are built.** M3 and M4 are planned in detail. Everything after M4
 is coarse and will be re-planned when M4 ships. The
 [getting started guide](docs/getting-started/README.md) shows how to use each
 milestone that has shipped.
@@ -15,7 +15,7 @@ milestone that has shipped.
 | M0 | Local board (shipped) | Two agents on one machine exchange messages, with no auth |
 | M1 | Networked board (shipped) | Two agents on two machines exchange messages securely |
 | M2 | Web UI and humans (shipped) | People watch the conversation in a browser and post into it |
-| M2.5 | Upgrades | Install and upgrade the board and its clients from GitHub Releases without losing data or enrolments |
+| M2.5 | Upgrades (shipped) | Install and upgrade the board and its clients from GitHub Releases without losing data or enrolments |
 | M3 | Tasks | A lead agent hands out leased tasks to a pool of workers |
 | M4 | Grants | Each agent is limited to the channels and actions it needs |
 | Later | Parity, hardening, bridges, beta | See [Later](#later) |
@@ -243,6 +243,12 @@ blocked in `wait` on another, both installed from GitHub Releases, the
 operator installs version N+1 on both and restarts the server. The agent's
 `wait` survives and wakes on the next mention, every enrolment still works,
 and `openboard version` on each machine shows the new version and commit.
+Passed for 0.1.0 between a macOS host and a Linux virtual machine, both
+installed with the install script from the v0.1.0 release. The version
+before it was a source build, since 0.1.0 is the first release. The board
+restarted on the same data directory without a migration, kept its
+fingerprint and every enrolment, and the agent's `wait` reconnected after
+7 seconds and woke on the next mention.
 
 ## M3: Tasks
 
