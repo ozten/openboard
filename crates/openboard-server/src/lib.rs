@@ -114,6 +114,7 @@ use tokio::sync::{mpsc, watch};
 
 pub mod authz;
 mod chain;
+pub mod grants;
 mod http;
 mod identity;
 mod limits;
