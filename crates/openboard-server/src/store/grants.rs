@@ -281,6 +281,11 @@ pub(crate) struct Snapshot {
 }
 
 impl Snapshot {
+    /// Whether the board exists.
+    pub(crate) fn has_board(&self, board: &str) -> bool {
+        self.boards.contains_key(&board_key(board))
+    }
+
     pub(crate) fn grants(&self, board: &str) -> &[Grant] {
         self.boards
             .get(&board_key(board))
@@ -291,6 +296,15 @@ impl Snapshot {
 
 pub(crate) fn snapshot(conn: &Connection) -> rusqlite::Result<Snapshot> {
     let mut boards: HashMap<String, Vec<Grant>> = HashMap::new();
+    // Every board, so that one without grants is told apart from one that
+    // does not exist.
+    let names: Vec<String> = conn
+        .prepare("SELECT name FROM boards")?
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for name in names {
+        boards.entry(board_key(&name)).or_default();
+    }
     for stored in list(conn, None)? {
         boards
             .entry(board_key(&stored.board))
@@ -338,4 +352,334 @@ pub(crate) fn anyone_manages(conn: &Connection) -> rusqlite::Result<bool> {
                 .verbs
                 .contains(crate::grants::Verb::GrantManage)
     }))
+}
+
+/// Who a grant is for, as a request names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Who {
+    Handle(String),
+    Group(Group),
+    Everyone,
+}
+
+impl Who {
+    pub(crate) fn parse(raw: &str) -> Self {
+        if raw == "everyone" {
+            return Who::Everyone;
+        }
+        match Group::parse(raw) {
+            Some(group) => Who::Group(group),
+            None => Who::Handle(raw.to_owned()),
+        }
+    }
+}
+
+/// The caller changing grants, as the store checks it.
+#[derive(Debug, Clone)]
+pub(crate) struct IssuerSpec {
+    pub subject: crate::grants::Subject,
+    /// The ceilings that apply on this board.
+    pub ceilings: Vec<crate::grants::Ceiling>,
+    pub derived: bool,
+}
+
+impl IssuerSpec {
+    fn check<'a, T>(&self, work: impl FnOnce(&crate::grants::Issuer<'_>) -> T + 'a) -> T {
+        let ceilings: Vec<&crate::grants::Ceiling> = self.ceilings.iter().collect();
+        work(&crate::grants::Issuer {
+            subject: &self.subject,
+            ceilings: &ceilings,
+            derived: self.derived,
+        })
+    }
+}
+
+/// Why a grant change or a channel creation was refused.
+#[derive(Debug)]
+pub(crate) enum GrantFailure {
+    /// The grant breaks a rule every grant obeys, or the request is not one
+    /// a grant change can be made with.
+    Invalid(crate::grants::GrantError),
+    /// The caller lacks the authority.
+    NoAuthority(crate::grants::GrantError),
+    NoSuchPrincipal(String),
+    NoSuchGrant,
+    /// The channel, or one under it, exists, or a grant reaches it.
+    ChannelExists,
+}
+
+fn refused(error: crate::grants::GrantError) -> super::StoreError {
+    use crate::grants::GrantError as E;
+    super::StoreError::Grant(match error {
+        E::DerivedToken | E::NoAuthority { .. } | E::OutlivesAuthority { .. } => {
+            GrantFailure::NoAuthority(error)
+        }
+        E::NoSuchGrant => GrantFailure::NoSuchGrant,
+        E::AlreadyReached => GrantFailure::ChannelExists,
+        other => GrantFailure::Invalid(other),
+    })
+}
+
+/// A grant just added.
+#[derive(Debug)]
+pub(crate) struct GrantAdded {
+    pub grant: StoredGrant,
+    pub authorized_by: String,
+    /// The notices posted (Z9), and the event position of the last one.
+    pub notices: Vec<String>,
+    pub seq: Option<i64>,
+}
+
+/// A channel just created.
+#[derive(Debug)]
+pub(crate) struct ChannelMade {
+    pub grants: Vec<StoredGrant>,
+}
+
+fn board_grants(conn: &Connection, board_id: i64) -> rusqlite::Result<Vec<StoredGrant>> {
+    list(conn, Some(board_id))
+}
+
+fn channel_paths(conn: &Connection, board_id: i64) -> rusqlite::Result<Vec<String>> {
+    conn.prepare("SELECT path FROM channels WHERE board_id = ?1 ORDER BY path")?
+        .query_map([board_id], |row| row.get(0))?
+        .collect()
+}
+
+impl super::Store {
+    /// Adds a grant on `board` for `by`, checked against the grants as they
+    /// are in the same transaction. A grant that gives its own issuer `read`
+    /// in an existing channel it could not read posts a notice there (Z9).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn add_grant(
+        &self,
+        board: &super::BoardRef,
+        by: &super::Writer,
+        issuer: &IssuerSpec,
+        pattern: Pattern,
+        who: &Who,
+        verbs: Verbs,
+        expires_at: Option<i64>,
+    ) -> super::Result<GrantAdded> {
+        use crate::grants::{evaluate, Grant, Verb};
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = now_ms();
+        let grantee = match who {
+            Who::Everyone => Grantee::Everyone,
+            Who::Group(group) => Grantee::Group(*group),
+            Who::Handle(handle) => match principal_by_handle(&tx, handle)? {
+                Some((id, _, _)) => Grantee::Principal(id),
+                None => {
+                    return Err(super::StoreError::Grant(GrantFailure::NoSuchPrincipal(
+                        handle.clone(),
+                    )))
+                }
+            },
+        };
+        let mut new = Grant {
+            id: String::new(),
+            pattern,
+            grantee,
+            verbs,
+            expires_at,
+        };
+        let held: Vec<Grant> = board_grants(&tx, board.id)?
+            .into_iter()
+            .map(|stored| stored.grant)
+            .collect();
+        let authorized_by = issuer
+            .check(|iss| crate::grants::check_add(&held, iss, &new, now).map(|g| g.id.clone()))
+            .map_err(refused)?;
+        new.id = insert(
+            &tx,
+            board.id,
+            &new.pattern,
+            &new.grantee,
+            new.verbs,
+            new.expires_at,
+            &by.actor.handle,
+        )?;
+
+        let mut notices = Vec::new();
+        let mut seq = None;
+        let mut after = held.clone();
+        after.push(new.clone());
+        for channel in channel_paths(&tx, board.id)? {
+            let before = evaluate(&held, &issuer.subject, &channel, now);
+            let now_reads = evaluate(&after, &issuer.subject, &channel, now);
+            if before.verbs.contains(Verb::Read) || !now_reads.verbs.contains(Verb::Read) {
+                continue;
+            }
+            let text = format!(
+                "**Admin access:** {} gave themselves {} at `{}` (grant {}), so they can now \
+                 read this channel. The board posts this notice whenever an administrator \
+                 grants themselves access to a channel, and it cannot be turned off.",
+                by.actor.handle, new.verbs, new.pattern, new.id
+            );
+            let inserted = super::insert_message(
+                &tx,
+                board,
+                &channel,
+                None,
+                by,
+                &text,
+                &super::MentionInput {
+                    candidates: Vec::new(),
+                    local: false,
+                },
+            )?;
+            tx.execute(
+                "INSERT INTO labels (message_id, thread_id, key, value) VALUES (?1, ?1, ?2, ?3)",
+                params![
+                    inserted.id,
+                    openboard_api::grants::NOTICE_LABEL,
+                    openboard_api::grants::NOTICE_ACCESS_GRANTED
+                ],
+            )?;
+            seq = Some(inserted.seq);
+            notices.push(inserted.id);
+        }
+        let grant = board_grants(&tx, board.id)?
+            .into_iter()
+            .find(|stored| stored.grant.id == new.id)
+            .ok_or_else(|| super::StoreError::Other("the new grant vanished".to_owned()))?;
+        tx.commit()?;
+        Ok(GrantAdded {
+            grant,
+            authorized_by,
+            notices,
+            seq,
+        })
+    }
+
+    /// Removes a grant of `board`, checked against the grants as they are.
+    /// Returns it, and the caller's grant that authorized the removal.
+    pub(crate) fn remove_grant(
+        &self,
+        board: &super::BoardRef,
+        by: &super::Writer,
+        issuer: &IssuerSpec,
+        id: &str,
+    ) -> super::Result<(StoredGrant, String)> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let stored = board_grants(&tx, board.id)?;
+        let held: Vec<Grant> = stored.iter().map(|stored| stored.grant.clone()).collect();
+        let authorized_by = issuer
+            .check(|iss| {
+                crate::grants::check_remove(&held, iss, id, now_ms()).map(|g| g.id.clone())
+            })
+            .map_err(refused)?;
+        let target = stored
+            .into_iter()
+            .find(|stored| stored.grant.id == id)
+            .ok_or(super::StoreError::Grant(GrantFailure::NoSuchGrant))?;
+        remove(&tx, board.id, id, &by.actor.handle)?;
+        tx.commit()?;
+        Ok((target, authorized_by))
+    }
+
+    /// The grants of `board` that `issuer` may manage.
+    pub(crate) fn manageable_grants(
+        &self,
+        board: &super::BoardRef,
+        issuer: &IssuerSpec,
+    ) -> super::Result<Vec<StoredGrant>> {
+        let stored = board_grants(&self.conn(), board.id)?;
+        let held: Vec<Grant> = stored.iter().map(|stored| stored.grant.clone()).collect();
+        let now = now_ms();
+        Ok(stored
+            .into_iter()
+            .filter(|stored| {
+                issuer.check(|iss| {
+                    crate::grants::authority(&held, iss, &stored.grant.pattern, Verbs::NONE, now)
+                        .is_ok()
+                })
+            })
+            .collect())
+    }
+
+    /// The principal with this handle, as a subject of grants, with its
+    /// handle as stored.
+    pub(crate) fn principal_named(
+        &self,
+        handle: &str,
+    ) -> super::Result<Option<(crate::grants::Subject, String)>> {
+        Ok(principal_by_handle(&self.conn(), handle)?
+            .map(|(id, kind, handle)| (crate::grants::Subject { id, kind }, handle)))
+    }
+
+    /// The grants of `board`, all of them.
+    pub(crate) fn board_grants(&self, board_id: i64) -> super::Result<Vec<StoredGrant>> {
+        Ok(board_grants(&self.conn(), board_id)?)
+    }
+
+    /// Creates an empty channel. A private one is closed to everyone and
+    /// owned by its creator, in the same transaction (Z7). Fails if the
+    /// channel or any channel under it exists, and for a private one if a
+    /// grant already reaches it. The caller checked `create` for a public
+    /// one.
+    pub(crate) fn create_channel(
+        &self,
+        board: &super::BoardRef,
+        by: &super::Writer,
+        issuer: &IssuerSpec,
+        path: &str,
+        private: bool,
+    ) -> super::Result<ChannelMade> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let taken = channel_paths(&tx, board.id)?.iter().any(|existing| {
+            existing == path
+                || existing
+                    .strip_prefix(path)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        });
+        if taken {
+            return Err(super::StoreError::Grant(GrantFailure::ChannelExists));
+        }
+        let mut made = Vec::new();
+        if private {
+            let held: Vec<Grant> = board_grants(&tx, board.id)?
+                .into_iter()
+                .map(|stored| stored.grant)
+                .collect();
+            let planned = issuer
+                .check(|iss| {
+                    crate::grants::private_channel(
+                        &held,
+                        iss,
+                        path,
+                        now_ms(),
+                        (String::new(), String::new()),
+                    )
+                })
+                .map_err(refused)?;
+            let mut ids = Vec::new();
+            for grant in &planned {
+                ids.push(insert(
+                    &tx,
+                    board.id,
+                    &grant.pattern,
+                    &grant.grantee,
+                    grant.verbs,
+                    grant.expires_at,
+                    &by.actor.handle,
+                )?);
+            }
+            made = board_grants(&tx, board.id)?
+                .into_iter()
+                .filter(|stored| ids.contains(&stored.grant.id))
+                .collect();
+        }
+        let now = crate::time::now_rfc3339();
+        tx.execute(
+            "INSERT INTO channels (board_id, path, created_at, thread_count, last_activity_at)
+             VALUES (?1, ?2, ?3, 0, ?3)",
+            params![board.id, path, now],
+        )?;
+        tx.commit()?;
+        Ok(ChannelMade { grants: made })
+    }
 }

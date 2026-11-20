@@ -87,6 +87,7 @@
 
 pub mod auth;
 pub mod build;
+pub mod grants;
 pub mod tasks;
 pub mod web;
 
@@ -146,7 +147,10 @@ pub const CURSOR_START: &str = "start";
 /// Level 2 is milestone M3: tasks (see [`tasks`]), the `task.*` event
 /// types, [`EventsQuery::label`], [`ThreadList::cursor`], [`Thread::cursor`]
 /// and [`Thread::trust`], and [`Message::task`].
-pub const API_LEVEL: u32 = 2;
+///
+/// Level 3 is milestone M4: grants, `explain` and channel creation (see
+/// [`grants`]), and access decided per channel on network boards.
+pub const API_LEVEL: u32 = 3;
 /// Response header, on every response: the server's version, as
 /// [`build::VERSION`].
 pub const VERSION_HEADER: &str = "x-openboard-version";
@@ -235,6 +239,15 @@ pub mod codes {
     pub const TASK_STATE: &str = "task_state";
     /// Only the task's creator may do this. `403`.
     pub const NOT_TASK_CREATOR: &str = "not_task_creator";
+    /// A grant, its pattern or its verbs are not valid, or a grant change
+    /// is not one the caller has the authority for (M4).
+    pub const INVALID_GRANT: &str = "invalid_grant";
+    /// The caller holds no grant with `grant.manage` that reaches the
+    /// pattern, or not every verb it tried to give (M4).
+    pub const NO_AUTHORITY: &str = "no_authority";
+    /// The channel, or a channel under it, exists, or a grant already
+    /// reaches it, so it cannot be created as asked.
+    pub const CHANNEL_EXISTS: &str = "channel_exists";
     /// The claim has ended: its lease ran out, it was released or settled,
     /// or the task was claimed again since. `409`. Nothing changed.
     pub const CLAIM_LOST: &str = "claim_lost";

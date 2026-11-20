@@ -69,6 +69,7 @@ use crate::store::{
 use crate::Mode;
 
 mod access;
+mod grants_routes;
 mod tasks;
 
 /// Longest idempotency key, in bytes.
@@ -260,7 +261,19 @@ pub(crate) fn router(parts: Parts) -> (Router, Maintenance) {
             "/v1/boards/{board}/messages/{message_id}/reactions/{emoji}",
             put(add_reaction).delete(remove_reaction),
         )
-        .route("/v1/boards/{board}/channels", get(list_channels))
+        .route(
+            "/v1/boards/{board}/channels",
+            get(list_channels).post(grants_routes::create_channel),
+        )
+        .route(
+            "/v1/boards/{board}/grants",
+            get(grants_routes::list_grants).post(grants_routes::add_grant),
+        )
+        .route(
+            "/v1/boards/{board}/grants/{grant_id}",
+            axum::routing::delete(grants_routes::remove_grant),
+        )
+        .route("/v1/boards/{board}/explain", get(grants_routes::explain))
         .route("/v1/boards/{board}/threads", get(list_threads))
         .route("/v1/boards/{board}/threads/{thread_id}", get(get_thread))
         .route("/v1/boards/{board}/events", get(get_events))
@@ -394,7 +407,8 @@ impl AppError {
             codes::FORBIDDEN
             | codes::INVITE_INVALID
             | codes::CSRF_FAILED
-            | codes::NOT_TASK_CREATOR => StatusCode::FORBIDDEN,
+            | codes::NOT_TASK_CREATOR
+            | codes::NO_AUTHORITY => StatusCode::FORBIDDEN,
             codes::UNAUTHENTICATED => StatusCode::UNAUTHORIZED,
             codes::RATE_LIMITED => StatusCode::TOO_MANY_REQUESTS,
             codes::IDEMPOTENCY_CONFLICT
@@ -409,7 +423,8 @@ impl AppError {
             | codes::TASK_FINISHED
             | codes::TASK_STATE
             | codes::CLAIM_LOST
-            | codes::CLAIM_NOT_HELD => StatusCode::CONFLICT,
+            | codes::CLAIM_NOT_HELD
+            | codes::CHANNEL_EXISTS => StatusCode::CONFLICT,
             codes::MESSAGE_TOO_LARGE => StatusCode::PAYLOAD_TOO_LARGE,
             codes::INTERNAL => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::BAD_REQUEST,
@@ -574,6 +589,7 @@ impl From<StoreError> for AppError {
             )
             .next("use one of the reactions the message already has, or remove one first"),
             StoreError::Task(error) => tasks::task_error(error),
+            StoreError::Grant(error) => grants_routes::grant_error(error),
             other => AppError::internal(&other),
         }
     }

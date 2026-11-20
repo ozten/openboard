@@ -50,10 +50,32 @@ impl Authority {
             .collect()
     }
 
+    /// The ceilings that apply on `board`, owned.
+    pub(crate) fn ceilings_for(&self, board: &str) -> Vec<Ceiling> {
+        self.ceilings_on(board).into_iter().cloned().collect()
+    }
+
+    /// The grants of `board`. A board that does not exist yet is judged by
+    /// the grants it would start with if this caller created it: `all` for
+    /// its creator. Creating it is a separate check ([`Action::CreateBoard`]).
+    fn grants_of(&self, board: &str) -> std::borrow::Cow<'_, [grants::Grant]> {
+        if self.snapshot.has_board(board) {
+            std::borrow::Cow::Borrowed(self.snapshot.grants(board))
+        } else {
+            std::borrow::Cow::Owned(vec![grants::Grant {
+                id: String::new(),
+                pattern: grants::Pattern::Board,
+                grantee: grants::Grantee::Principal(self.subject.id.clone()),
+                verbs: Verbs::all(),
+                expires_at: None,
+            }])
+        }
+    }
+
     /// The caller's access to one channel of `board`.
     pub(crate) fn access(&self, board: &str, channel: &str) -> grants::Access {
         grants::effective(
-            self.snapshot.grants(board),
+            &self.grants_of(board),
             &self.subject,
             &self.ceilings_on(board),
             channel,
@@ -69,7 +91,7 @@ impl Authority {
                     && !self.derived
             }
             (Action::Read, None) => grants::holds_somewhere(
-                self.snapshot.grants(board),
+                &self.grants_of(board),
                 &self.subject,
                 &self.ceilings_on(board),
                 Verb::Read,

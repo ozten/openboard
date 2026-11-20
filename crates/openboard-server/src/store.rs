@@ -299,6 +299,8 @@ pub(crate) enum StoreError {
     TooManyReactions,
     /// A task write was refused.
     Task(TaskError),
+    /// A grant change or a channel creation was refused.
+    Grant(grants::GrantFailure),
     /// Another server holds the lock on the data directory.
     DataDirInUse,
     Sqlite(rusqlite::Error),
@@ -317,6 +319,7 @@ impl fmt::Display for StoreError {
             StoreError::TooManyLabels => f.write_str("too many labels"),
             StoreError::TooManyReactions => f.write_str("too many reactions"),
             StoreError::Task(error) => write!(f, "task: {error:?}"),
+            StoreError::Grant(error) => write!(f, "grant: {error:?}"),
             StoreError::DataDirInUse => f.write_str("the data directory is in use"),
             StoreError::Sqlite(error) => write!(f, "sqlite: {error}"),
             StoreError::Other(detail) => f.write_str(detail),
