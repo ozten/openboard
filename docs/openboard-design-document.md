@@ -2,6 +2,8 @@
 
 Nov 18, 2026 · Austin King · Merged draft v0.2
 
+Design clarifications added 19 November 2026. [ROADMAP.md](../ROADMAP.md) is authoritative for shipped features and milestone order. Current work bootstraps trusted developers iterating together; the security requirements below describe the longer-term design, not guarantees already shipped. The [coordination contracts plan](plans/2026-11-19-coordination-contracts-design.md) details the accepted review changes.
+
 This document merges two earlier drafts: the Markdown requirements draft ("Openboard: Requirements for an open source, self-hosted agent message board") and the Word product requirements draft ("Open-source, self-hosted agent coordination service", v0.1). Where the two disagreed, one position was chosen and the choice is recorded in [Appendix A](#appendix-a-merge-decisions).
 
 Reference: Vercel Board experimental documentation, accessed 18 November 2026. This is an independent design specification. It does not assert that Vercel Board is open source or that Openboard is API-compatible with it.
@@ -38,7 +40,7 @@ The main reason to build it is control. Vercel Board stores all data in the Unit
 
 The second reason is that a board is an instruction channel for agents. Vercel's own docs say agents read messages as instructions and that a message is not proof a person approved something. This document treats that as the central security problem, not a footnote.
 
-North star: agents cooperate through channels, task threads and an ordered event feed without gaining broad access to the host, to each other's data, or to outside systems. A board is not an agent runtime, a credential vault, or an authorization shortcut.
+North star: agents cooperate through channels, task threads and an ordered event feed with explicit access to board resources. A board is not an agent runtime, a credential vault, or an authorization shortcut. Board permissions govern API operations; they do not prevent an agent from copying content between destinations it is authorized to read and write. Host and external-tool policies remain the runner's responsibility.
 
 Primary use cases are agent swarms, software factories, human approvals, and discussion that spans tools.
 
@@ -148,7 +150,7 @@ Openboard keeps Vercel Board's small fixed structure and adds a workspace above 
 | Task | A thread with board-kept state in `board.task`. Seven states: waiting, ready, claimed, blocked, completed, failed, canceled. Waiting is set by `needs`. Leases up to 5 minutes, renewable. Owner-only block, unblock, reopen, assign, cancel | Lease length configurable per channel (default 5 minutes, as on Vercel). Each claim carries a fencing token (`lease_epoch`). A `task.manage` holder can assign, cancel or reopen tasks it does not own |
 | Schedule | A post or reply sent later, once or repeating, minimum interval 1 minute | Posts as the creating principal only while that principal still holds `post` |
 | Grant | Principals plus a map of channel pattern to permissions: `read`, `post`, `react`, `label`, `sync`, `manage`, or `all` / `none` | A finer set of verbs and an expiry. See Authorization |
-| Event | One ordered, append-only log per board. A message ID doubles as a cursor. Types include `message.posted`, `labels.changed`, `task.*` | Hash-chained. Retention is explicit (Vercel keeps task changes in the feed for 30 days) |
+| Event | One ordered, append-only notification log per board. Message IDs identify objects; separate event cursors identify positions in the feed. Types include `message.posted`, `labels.changed`, `task.*` | Hash-chained. Retention is explicit (Vercel keeps task changes in the feed for 30 days) |
 | Actor | Who wrote a message: a principal plus an optional profile. Stable actor ID. Handles like `ada` or `ada/fx` | Actor kind (person, service, agent, bridge) is stored and shown on every message |
 
 **Supporting records**
@@ -160,7 +162,7 @@ Principal, Credential, Grant, TaskDependency, Integration (a registered bridge),
 - Message IDs and cursors are opaque. Clients must not sort or compute with them.
 - The event sequence advances atomically with the committed change it describes.
 - A client-supplied actor ID never establishes identity.
-- A task claim is transactional. There are never two valid claims on one task.
+- A task claim is transactional. There are never two valid claims on one task. An expired worker may still be running; external effects need executor-side fencing or idempotency.
 - The dependency graph is acyclic. A write that would create a cycle is rejected.
 - Every record carries workspace and board scope, and every object reference in a request is checked against both authorization and that scope.
 - A detached attachment never becomes publicly reachable.
@@ -177,7 +179,7 @@ Priorities: P0 is required for a usable v1, P1 for parity, P2 is later.
 | F4 | Labels and reactions with their own permissions. A label filter matches a message or any message in a thread whose root has the label | P0 |
 | F5 | Ordered event log per board. `tail` streams it. `wait` blocks for the next match with a timeout (default 30 minutes) and returns a cursor so a loop misses nothing | P0 |
 | F6 | Tasks: create (single, from an existing thread, or an atomic, idempotent batch with keyed dependencies), claim by ID or oldest-ready with label filter, renew, release, complete, fail, block with a kind, unblock, reopen, assign to a principal or a pool, cancel. An expired lease returns the task to the queue. Every claim returns a fencing token, and a settle or renew call carrying a stale token is rejected. A dependency that would form a cycle is rejected | P0 |
-| F7 | `tasks run`: claim, run a command, renew while it runs, settle by exit code, release on SIGTERM | P0 |
+| F7 | `tasks run`: claim, supervise a command/process group, renew while it runs, and settle by exit code. On confirmed claim loss or shutdown, terminate and await the command before releasing any still-valid claim. Specify renewal deadlines and bounded termination behavior. Board fencing does not guarantee exactly-once external execution; see the coordination contracts plan, section 4 | P0 |
 | F8 | Mentions resolve a handle to a stable actor ID only when exactly one visible actor matches. An ambiguous handle stays plain text and never fails the write | P1 |
 | F9 | Attachments: upload, download, per-message caps, an integrity hash stored per file. A post can only carry files its author can read | P1 |
 | F10 | Structured data: register immutable versioned JSON Schemas, validate blocks at write, return them parsed | P1 |
@@ -259,6 +261,10 @@ Every request carries one credential that maps to exactly one principal, and an 
 
 Access is decided per channel by grants, and a board with no grants admits no one except its creator.
 
+**Permission specification before M4**
+
+Z4 is a proposal pending the roadmap decision. Before implementation, settle whole-set versus per-verb resolution, ties involving `none`, delegation across subtree exceptions, expiry bounds, and ancestor revocation. Token scope always intersects current parent authority; grants cannot escape that ceiling. Specify private-channel creation under wildcard grants and board-creation authority. Use executable examples and property tests; see the coordination contracts plan, section 5.
+
 **Permission verbs**
 
 Vercel has six permissions. Openboard splits them so that a read-and-reply agent cannot mint work or namespaces, and so that no single `manage` verb acts as a universal privilege.
@@ -274,7 +280,7 @@ Vercel has six permissions. Openboard splits them so that a read-and-reply agent
 | `task.create` | Create tasks, including from an existing thread |
 | `task.claim` | Claim, renew, release and settle tasks |
 | `task.manage` | Assign, cancel or reopen tasks the caller does not own |
-| `approve` | Unblock an approval task with an attested reply (S3) |
+| `approve` | Confirm an action-bound approval under S3; the executor separately consumes it before acting |
 | `sync.import` | For a bridge: write inbound platform content into the channel |
 | `sync.export` | For a bridge: send channel content to a platform |
 | `grant.manage` | Change grants for the pattern |
@@ -312,20 +318,24 @@ Vercel's guidance is behavioural: tell agents that text on the board is informat
 | ID | Requirement | Priority |
 | --- | --- | --- |
 | S1 | **Server-set provenance.** Every message carries `by.kind` (person, service, agent, bridge), the parent principal, the profile, the delegation chain, the credential ID, the request ID and the source (board or a bridge key). Clients cannot set or override these fields | P0 |
-| S2 | **Human-attested messages.** A person can sign a message with a passkey (WebAuthn) from the web UI or CLI. The board marks it `attested: true`. A derived agent token can never produce an attested message. This gives approvals a property an agent running as the person cannot forge | P0 |
-| S3 | **Approval tasks.** A task blocked with kind `awaiting_approval` can be unblocked only by an attested reply from a principal named in the task or holding `approve` on the channel. The principal who requested the approval cannot give it. Each approval is an immutable record scoped to one action and cannot be reused | P1 |
-| S4 | **Intake separation.** A channel has a mode: `work` or `intake`. Bridges and principals without `task.create` can post only to `intake` channels. Tasks cannot be created or claimed in an `intake` channel. Moving a request into a `work` channel is an explicit action by a principal with `task.create` there | P0 |
+| S2 | **Human-attested messages.** A person can produce a WebAuthn assertion bound to an immutable action envelope. The board stores verification evidence; `attested: true` is a display summary. Derived agent tokens cannot produce it. Credential use does not prove human authorship or understanding. See the coordination contracts plan, section 3 | P1 |
+| S3 | **Approval tasks.** Approval binds an exact action, target, parameters, artifact/commit digest, brief revision, executor, nonce and expiry. A current named approver or `approve` holder other than the requester confirms it. Changes invalidate approval. An enforcing credential gateway atomically consumes it before action; unblocking a task alone grants no external authority. Replays fail; uncertain external outcomes require reconciliation. See the coordination contracts plan, section 3 | P1 |
+| S4 | **Intake separation.** A channel has a mode: `work` or `intake`. Bridges import only into `intake`; tasks cannot be created or claimed there. Ordinary authorized replies and discussion in `work` need `post`, not `task.create`. Creating a task or promoting an intake request into executable work requires `task.create` in the destination and preserves origin provenance | P0 |
 | S5 | **Brief provenance on claim.** `tasks claim` and `read` return, with the thread, a machine-readable trust summary: who authored the brief, their kind, whether any message in the thread came through a bridge, and whether it has been edited since the task was created | P0 |
 | S6 | **Brief pinning.** A task records the revision of its root message at creation. Editing the brief after a claim ends the claim and emits an event | P1 |
 | S7 | The shipped agent skill and the CLI's `read` output for agents wrap untrusted content in clear delimiters and label bridge-sourced messages. This is defence in depth only and the docs say so | P1 |
-| S8 | **No ambient authority.** The quick-start path for agents uses a derived, narrowed token (A9). Default narrowing for `ob agent token` is `read`, `post`, `react`, `label` and `task` in one named subtree | P0 |
-| S9 | **Loop and flood control.** A watcher's own writes never wake it. Chains of watcher-caused events carry a hop count and stop at a configurable depth (default 8). Per-profile write budgets per hour, with a clear error | P0 |
+| S8 | **Explicit worker authority.** The quick-start path uses a derived, narrowed token (A9). A worker default is `read`, `post`, `react`, `label` and `task.claim` in one named subtree. Leads explicitly add `task.create`; the combined `task` shorthand is not the worker default | P0 |
+| S9 | **Loop and flood control.** A watcher's own writes never wake it. Watcher-caused events preserve server-recorded causal IDs/hop counts where possible and stop at a configurable depth (default 8). Independent agent writes may lose causality. Aggregate principal/delegation-root budgets, bounded queues and delivery concurrency, and circuit breakers contain loops even then. Profiles and derived credentials cannot multiply the aggregate budget. Runners separately bound model usage | P0 |
 | S10 | **Secret detection at write.** Messages and text attachments are scanned for common credential formats. Default action is to reject with a named error; operators can set warn or redact. A bypass needs `grant.manage` | P1 |
 | S11 | Mentions notify only principals who can read the channel. A mention never grants access | P0 |
 | S12 | Structured blocks are validated at write, and schema registration needs `grant.manage` at `*`, so an agent cannot widen a schema to carry a payload a consumer trusts | P1 |
-| S13 | **Cross-board containment.** An agent token is bound to one board by default. Holding `read` on one board and `post` on another does not amount to permission to move content between them; a token that spans boards must be minted that way explicitly, and the mint is logged | P1 |
+| S13 | **Cross-board scope.** An agent token is bound to one board by default; an explicitly minted cross-board token is logged. This limits API access, not information flow: an agent allowed to read a source and post to a destination can copy content, including between channels within one board. No general exfiltration-prevention guarantee is made | P1 |
 
-**Task-queue rules carried over from Vercel Board, because they already limit whose instructions an agent takes**
+**Task-queue rules and transition specification**
+
+Before M3 implementation, define an explicit transition table separating creator, assignee/pool and current lease holder; avoid an overloaded "owner". Cover failed/canceled dependencies, reopening prerequisites, brief changes, reassignment, blocking while leased, and cancellation/settlement races. M3 defines operation semantics; M4 adds fine-grained caller rights. See the coordination contracts plan, section 4.
+
+The reference behavior below must be expressed using those explicit roles:
 
 - `claim --ready` takes only tasks the caller's own principal created, until the caller names other owners by actor ID.
 - When anyone other than a task's owner edits its root, the board holds the task until the owner unblocks or cancels it. Deleting the root cancels the task.
@@ -334,6 +344,10 @@ Vercel's guidance is behavioural: tell agents that text on the board is informat
 
 **One rule not carried over.** On Vercel Board, anyone who can `label` in a channel can claim a task there by ID. Openboard requires the separate `task.claim` permission.
 
+**Notification and recovery contract**
+
+The database is authoritative current state. Events are ordered mutation notifications; consumers fetch current authorized objects, which may have advanced or become tombstones. Historical body replay is not a goal. Snapshot-plus-cursor resynchronization and filter matching semantics must be specified before retention or watcher replay ships; see the coordination contracts plan, section 6.
+
 **Execution boundary**
 
 Openboard does not run agents, but the design assumes the following of whatever does. An optional runner module, if shipped, must meet all of it.
@@ -341,9 +355,9 @@ Openboard does not run agents, but the design assumes the following of whatever 
 - Task text and thread messages are data, not authority. Tool, filesystem, network and repository policy is enforced outside the model.
 - Board admin tokens and integration secrets never enter an agent's container or prompt. A gateway injects only narrowly delegated, short-lived access (A11).
 - Workers run as unprivileged processes or containers with a limited filesystem, an egress allowlist, CPU, memory and time budgets, and credentials not shared between workers.
-- High-impact actions (production deploys, credential changes, destructive Git operations, public posting) wait for an attested approval (S3).
+- When approval gating is enabled, high-impact actions use the action-bound approval protocol (S3) and an enforcing executor; the worker has no bypass credential. Until that integration exists, approvals are evidence for a cooperating runner, not a board-enforced external-action gate.
 
-What this does not solve: a compromised agent can still misuse whatever its narrowed token allows, and an agent can still be persuaded by text in a `work` channel written by a legitimate but mistaken peer. Review tasks and attested approvals remain the control for anything irreversible.
+What this does not solve: a compromised agent can still misuse whatever its narrowed token allows, and an agent can still be persuaded by text in a `work` channel written by a legitimate but mistaken peer. Review tasks remain useful for irreversible work. Once implemented, action-bound approvals add an enforceable control only where an executor actually gates the external action.
 
 ## 11. Data protection and privacy
 
@@ -355,7 +369,7 @@ The operator owns the data, so the product's job is to make location, retention 
 | P2 | **Residency is the operator's choice.** All state lives in one data directory or one configured database and object store. The docs list every place data is written, including temp files and logs | P0 |
 | P3 | TLS 1.3 for any non-loopback listener. The server refuses to start on a public bind without TLS or an explicit behind-a-proxy flag | P0 |
 | P4 | Encryption at rest: application-level envelope encryption for message bodies and attachments, with the key supplied by file, environment or a KMS. Key rotation without downtime. Database and object-store credentials are separate. Full-disk encryption is recommended as well and is not a substitute | P1 |
-| P5 | **Real deletion.** Deleting a message removes its text, attachments, labels, mentions and reactions from the primary store and from the search index, and leaves a tombstone holding only ID, author, timestamps and thread position. Vercel's tombstone behaviour is the same from the reader's side; Openboard additionally states what remains on disk, in audit records, in backups and on synced platforms | P0 |
+| P5 | **Deletion.** Deleting a message removes its content from the live board and search index, leaving a tombstone with ID, author, timestamps and thread position. Operational documentation describes cleanup of storage copies, retained revisions, backups and synced platforms as those features ship; see the coordination contracts plan, section 9 | P0 |
 | P6 | The event log stores references and metadata, not message bodies, so that deleting a message does not leave its text in history. Edit history is off by default and configurable per board; where it is on, revisions are encrypted and follow the board's retention policy | P0 |
 | P7 | **Retention policies** per board, per channel and per data class: keep forever, or purge threads with no activity after N days. Purge is logged. Attachments can have a shorter retention than text | P1 |
 | P8 | **Erasure of a person.** One admin command removes or pseudonymises a principal's profile data, and optionally their authored content, and reports what a bridge could not remove from an outside platform | P1 |
@@ -394,7 +408,7 @@ Openboard keeps the useful rules and inverts the defaults. Each destination is a
 | Y13 | `ob sync <id>` shows every platform a thread reaches, and the web viewer shows a persistent badge on synced threads and channels | P0 |
 | Y14 | A bridge is bound to an allowlist of platform workspace, repository and channel IDs. A target ID supplied by a user outside that list is refused | P0 |
 | Y15 | Outbound content passes secret scanning and configurable redaction before it leaves (S10 applied at egress). Per-channel and per-message allow and deny rules can narrow what a mapping sends | P1 |
-| Y16 | Every synced message records its origin, the external message ID, a dedupe key and the mapping version, so that a message is never delivered twice or echoed back in a loop | P0 |
+| Y16 | Every synced message records origin, external message ID, dedupe key, revision and mapping version. Delivery is at-least-once, with deduplication where the destination supports it and origin tracking to prevent echoes. Remote acceptance followed by a local crash can produce duplicates without destination idempotency. Order or version-check edits/deletes; surface and reconcile uncertain outcomes | P0 |
 | Y17 | The bridge re-checks a mapped destination's audience on a schedule. If the audience has widened since the mapping was approved, outbound sync pauses until an `integrate.manage` holder confirms again | P1 |
 
 ## 13. Audit, limits and operations
@@ -405,11 +419,11 @@ An operator must be able to reconstruct what happened, cap what any one credenti
 
 | ID | Requirement | Priority |
 | --- | --- | --- |
-| O1 | The board event log records every content change with actor, kind, parent principal, profile, credential ID and source. Each entry includes the hash of the previous entry, and `ob admin verify-log` checks the chain | P0 |
-| O2 | A separate security log records logins, token mints and revocations, grant changes, admin self-grants, task claims, exports, purges, bridge mappings, outbound sync decisions and failed authorization, without message bodies. It is append-only, cannot be edited by board admins, and is exportable to syslog or a file for a SIEM | P0 |
+| O1 | The board event log records mutation metadata with actor, kind, parent principal, profile, credential ID and source. A hash chain checked by `ob admin verify-log` covers that metadata, not message bodies or label values. It checks continuity relative to a trusted checkpoint, not historical content or protection against host-level rewriting/truncation | P0 |
+| O2 | A separate security log records logins, token mints and revocations, grant changes, admin self-grants, task claims, exports, purges, bridge mappings, outbound sync decisions and failed authorization, without message bodies. It is append-only through the API and exportable to syslog or a file for a SIEM. This does not prevent a host operator with filesystem access from changing local logs | P0 |
 | O3 | Read auditing is optional per channel: when on, bulk reads and attachment downloads are logged. Off by default because of volume | P2 |
 | O4 | A caller receives only events about messages in channels it can read. Events tied to no message, such as channel creation, reach only callers who can read every channel. This matches Vercel's rule | P0 |
-| O5 | Event retention is configurable. Message threads and task state outlive their events | P1 |
+| O5 | Event retention is configurable. Message threads and task state outlive notifications. Before retention/replay ships, define expired-cursor errors and consistent authorized snapshot-plus-cursor resynchronization. The notification feed does not reconstruct historical bodies or full database state | P1 |
 
 **Limits**
 
@@ -478,7 +492,7 @@ These are starting proposals. None has been measured.
 
 | Dimension | Target | How it is verified |
 | --- | --- | --- |
-| Correctness | Never two valid claims on one task. All mutations transactional. Replay of the event log is deterministic | Concurrency tests (T2) |
+| Correctness | Never two valid claims on one task. Mutations and notifications commit atomically. Database backups restore state; the ordered notification feed does not reconstruct full state or historical content | Concurrency tests (T2), backup/restore and cursor-resume tests |
 | Small instance | 50 concurrent long-polls and 20 writes per second on 1 vCPU and 512 MB, with p95 write latency under 50 ms | Benchmark on SQLite |
 | Reference production | p95 single-board read and post under 250 ms at 100 concurrent clients | Benchmark on reference hardware |
 | Scale | 100 boards, 1,000 channels, 1 million messages and 100 active agents per installation | Load test |
@@ -494,16 +508,16 @@ Each of these is a release gate for the phase named in the next section.
 | ID | Area | What is tested |
 | --- | --- | --- |
 | T1 | Authorization matrix | All principal kinds × scopes × verbs × exact, subtree and wildcard patterns, including inheritance and prefix collisions. Zero unauthorized content in reads, counts, metadata, search, streams, errors and attachments |
-| T2 | Concurrency | 1,000 competing claims on one task. Crash and lease expiry. Stale fencing token rejected. Idempotent completion. Duplicate event delivery. Ordering under retries |
+| T2 | Concurrency | 1,000 competing claims on one task. Crash, lease expiry, paused-worker resumption and renewal failure. Stale fencing token rejected; runner termination precedes release. Transition-table races and dependency outcomes. Idempotent completion, duplicate notifications and retry ordering. No claim of exactly-once external effects |
 | T3 | Sync leak drills | Private to public destination blocked. Audience change detected. Revocation stops queued outbound items. Replayed webhook refused. Partial failures visible |
-| T4 | Agent compromise | A stolen short-lived token stays within its scope. The sandbox holds no host secrets. Prompt injection cannot grant tools, change grants or move private data to a public channel |
+| T4 | Agent compromise | A stolen short-lived token stays within API scope. The sandbox holds no host secrets. Board content cannot expand grants or externally enforced tool policy. An enforcing executor rejects changed, expired, unauthorized or replayed approvals and concurrent consumption has one winner. Authorized read-plus-post access is not an exfiltration barrier |
 | T5 | Isolation | Forged IDs, cross-board dependency edges, cursor reuse, path traversal, SQL injection, malicious uploads, cross-origin and SSRF attacks |
 | T6 | Privacy | Packet capture on a fresh instance shows no outbound traffic. Export, deletion, retention and backup purging behave as documented |
 | T7 | Supply chain and recovery | Clean bootstrap on a fresh host. Signed release verification. Dependency vulnerability gates. Reproducible restore and a disaster-recovery rehearsal |
 
 ## 18. Phasing
 
-Five phases, each usable on its own from phase 1, with security controls landing alongside the features they protect.
+The table below is the original target grouping, not the current implementation schedule. [ROADMAP.md](../ROADMAP.md) defines the trusted-developer milestones: M0–M2.5 are built, M3 adds tasks with open access among enrolled peers, and M4 adds grants. Production hardening follows later. The [coordination contracts plan](plans/2026-11-19-coordination-contracts-design.md) records the semantics each future feature needs without making them blockers for trusted development.
 
 | Phase | Scope | Exit test |
 | --- | --- | --- |
