@@ -25,7 +25,7 @@ use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER};
 use reqwest::{Method, RequestBuilder, Response, Url};
 use serde::de::DeserializeOwned;
 
-use crate::compat::{self, Requirement, Seen, ServerInfo, TASKS};
+use crate::compat::{self, Requirement, Seen, ServerInfo, GRANTS, TASKS};
 use crate::error::{codes, Failure};
 use crate::logins::Secret;
 use crate::target::{bad_url, Target};
@@ -681,6 +681,80 @@ impl Client {
         self.json(Self::with_json(http, request)?)
             .await
             .map_err(|failure| self.needs(TASKS, failure))
+    }
+
+    /// `GET /grants`.
+    pub async fn grants(&self) -> Result<openboard_api::grants::GrantList, Failure> {
+        let http = self.request(
+            Method::GET,
+            self.endpoint(&["grants"]),
+            Some(REQUEST_TIMEOUT),
+        );
+        self.json(http)
+            .await
+            .map_err(|failure| self.needs(GRANTS, failure))
+    }
+
+    /// `POST /grants`.
+    pub async fn add_grant(
+        &self,
+        request: &openboard_api::grants::NewGrant,
+    ) -> Result<openboard_api::grants::GrantChanged, Failure> {
+        let http = self.request(
+            Method::POST,
+            self.endpoint(&["grants"]),
+            Some(REQUEST_TIMEOUT),
+        );
+        self.json(Self::with_json(http, request)?)
+            .await
+            .map_err(|failure| self.needs(GRANTS, failure))
+    }
+
+    /// `DELETE /grants/{id}`.
+    pub async fn remove_grant(
+        &self,
+        id: &str,
+    ) -> Result<openboard_api::grants::GrantChanged, Failure> {
+        let http = self.request(
+            Method::DELETE,
+            self.endpoint(&["grants", id]),
+            Some(REQUEST_TIMEOUT),
+        );
+        self.json(http)
+            .await
+            .map_err(|failure| self.needs(GRANTS, failure))
+    }
+
+    /// `GET /explain`.
+    pub async fn explain(
+        &self,
+        channel: &str,
+        for_: Option<&str>,
+    ) -> Result<openboard_api::grants::Explained, Failure> {
+        let mut url = self.endpoint(&["explain"]);
+        url.query_pairs_mut().append_pair("channel", channel);
+        if let Some(who) = for_ {
+            url.query_pairs_mut().append_pair("for", who);
+        }
+        let http = self.request(Method::GET, url, Some(REQUEST_TIMEOUT));
+        self.json(http)
+            .await
+            .map_err(|failure| self.needs(GRANTS, failure))
+    }
+
+    /// `POST /channels`.
+    pub async fn create_channel(
+        &self,
+        request: &openboard_api::grants::NewChannel,
+    ) -> Result<openboard_api::grants::ChannelCreated, Failure> {
+        let http = self.request(
+            Method::POST,
+            self.endpoint(&["channels"]),
+            Some(REQUEST_TIMEOUT),
+        );
+        self.json(Self::with_json(http, request)?)
+            .await
+            .map_err(|failure| self.needs(GRANTS, failure))
     }
 
     /// `POST /tasks/batch`.

@@ -592,8 +592,12 @@ async fn the_operator_invites_lists_and_revokes_people() {
     assert_eq!(listed.len(), 3);
     assert!(listed.iter().all(|c| c.kind == ActorKind::Person));
     assert!(listed.iter().all(|c| c.revoked_at.is_none()));
-    assert_eq!(listed[0].id, laptop.credential.id);
-    assert_eq!(listed[0].principal, "ada@example.com");
+    // Two sessions made in the same millisecond list in either order.
+    let first_listed = listed
+        .iter()
+        .find(|c| c.id == laptop.credential.id)
+        .unwrap();
+    assert_eq!(first_listed.principal, "ada@example.com");
     assert_eq!(
         operator::list_people(&data_dir).unwrap()[0].active_credentials,
         2

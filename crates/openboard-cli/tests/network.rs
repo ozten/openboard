@@ -3073,3 +3073,73 @@ fn a_wait_never_retries_a_refused_login_or_a_certificate_that_is_not_pinned() {
     let both: Value = out.json();
     assert_eq!(both["board"]["api_level"], openboard_api::API_LEVEL);
 }
+
+// ---------------------------------------------------------------------------
+// Grants (M4)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_lead_narrows_a_worker_to_a_subtree_from_the_cli() {
+    let board = NetBoard::start_with(|config| config.open = false);
+    let lead = board.enrol("lead");
+    let worker = board.enrol("worker");
+    run(openboard()
+        .args(["admin", "grant", "*", "lead", "all", "--data-dir"])
+        .arg(board.data_dir()))
+    .ok();
+
+    let granted: Value = run(lead.cli().args([
+        "--json",
+        "grant",
+        "build/",
+        "worker",
+        "read,post,react,label,task.claim",
+    ]))
+    .ok()
+    .json();
+    assert_eq!(granted["grant"]["pattern"], "build/");
+    assert_eq!(granted["grant"]["grantee"], "worker");
+
+    lead.post("build/api", "work here");
+    lead.post("docs", "not for workers");
+    worker.post("build/api", "on it");
+    run(worker.cli().args(["--json", "post", "docs", "sneaky"])).error(1, "forbidden");
+    let channels: Value = run(worker.cli().args(["--json", "channels"])).ok().json();
+    let paths: Vec<&str> = channels["channels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|channel| channel["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, ["build/api"]);
+
+    let explained = run(worker.cli().args(["explain", "build/api"])).ok();
+    assert!(
+        explained
+            .stdout
+            .starts_with("worker at build/api: read,post,react,label,task.claim"),
+        "{explained:?}"
+    );
+    assert!(explained.stdout.contains("decided by:"), "{explained:?}");
+    run(worker
+        .cli()
+        .args(["--json", "grant", "build/", "worker", "all"]))
+    .error(1, "no_authority");
+    run(worker
+        .cli()
+        .args(["--json", "explain", "docs", "--for", "lead"]))
+    .error(1, "no_authority");
+
+    // A private channel, and the grants the lead manages.
+    let made: Value = run(lead
+        .cli()
+        .args(["--json", "channels", "create", "plans", "--private"]))
+    .ok()
+    .json();
+    assert_eq!(made["private"], true);
+    let listed: Value = run(lead.cli().args(["--json", "grants"])).ok().json();
+    assert!(listed["grants"].as_array().unwrap().len() >= 3, "{listed}");
+    let id = granted["grant"]["id"].as_str().unwrap();
+    run(lead.cli().args(["ungrant", id])).ok();
+    run(worker.cli().args(["--json", "post", "build/api", "gone"])).error(1, "forbidden");
+}

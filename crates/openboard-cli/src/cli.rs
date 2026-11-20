@@ -457,8 +457,52 @@ Examples:
   openboard read msg_0123abcd")]
     Read(ReadArgs),
 
-    /// List the channels on the board
-    Channels,
+    /// List the channels on the board, or create one
+    #[command(after_help = "\
+`openboard channels` lists the channels you can read. `openboard channels
+create <path>` creates an empty one, which needs `create` there; with
+--private it is closed to everyone but you, and you get grant.manage there to
+admit others with `openboard grant`.
+
+Examples:
+  openboard channels
+  openboard channels create plans/q3 --private")]
+    Channels(ChannelsArgs),
+
+    /// Give an agent, a person or a group access to channels (needs grant.manage)
+    #[command(after_help = "\
+PATTERN is `*` (the whole board), `build/` (build and everything under it) or
+`build/api` (that one channel). WHO is an agent's name, a person's email
+address, `agents`, `people`, `services`, or `everyone`, which can only be
+given `none` and closes a channel. VERBS is a comma-separated list such as
+read,post,react,label,task.claim, or the shorthands task, sync, manage, all
+and none.
+
+You need a grant of your own with grant.manage whose pattern contains
+PATTERN and which holds every verb you give; the new grant cannot outlive it.
+The most specific pattern decides, then the closest grantee; see
+docs/permissions.md.
+
+Examples:
+  openboard grant build/ worker-1 read,post,react,label,task.claim
+  openboard grant build/ lead read,post,task,grant.manage --expires 7d
+  openboard grant plans/ everyone none")]
+    Grant(GrantArgs),
+
+    /// List the grants you manage
+    Grants,
+
+    /// Remove a grant you manage, by its ID
+    Ungrant(UngrantArgs),
+
+    /// Show what you, or someone else, may do in a channel, and which grants decide it
+    #[command(after_help = "\
+Explaining someone else's access (--for) needs grant.manage at `*`.
+
+Examples:
+  openboard explain build/api
+  openboard explain build/api --for worker-1")]
+    Explain(ExplainArgs),
 
     /// List the boards on this server
     #[command(after_help = "\
@@ -1191,6 +1235,56 @@ safe beside one). Exits 1 if any board's chain is broken.
 Example:
   openboard admin verify-log --data-dir ./board-data")]
     VerifyLog(VerifyLogArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ChannelsArgs {
+    #[command(subcommand)]
+    pub command: Option<ChannelsCommand>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ChannelsCommand {
+    /// Create an empty channel
+    Create(ChannelCreateArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ChannelCreateArgs {
+    /// The channel path, such as plans/q3
+    pub path: String,
+    /// Close it to everyone but you; you can admit others with `openboard grant`
+    #[arg(long)]
+    pub private: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct GrantArgs {
+    /// `*`, `build/` or `build/api`
+    pub pattern: String,
+    /// An agent's name, a person's email address, agents, people, services or everyone
+    pub who: String,
+    /// Verbs and shorthands, separated by commas
+    pub verbs: String,
+    /// Stop applying after this long, such as 2h or 7d
+    #[arg(long, value_name = "DURATION", value_parser = parse_positive_duration)]
+    pub expires: Option<Duration>,
+}
+
+#[derive(Debug, Args)]
+pub struct UngrantArgs {
+    /// The grant's ID, as `openboard grants` prints it
+    #[arg(value_name = "GRANT_ID")]
+    pub id: String,
+}
+
+#[derive(Debug, Args)]
+pub struct ExplainArgs {
+    /// A channel path
+    pub channel: String,
+    /// Someone else's name or email address (needs grant.manage at `*`)
+    #[arg(long = "for", value_name = "WHO")]
+    pub for_: Option<String>,
 }
 
 #[derive(Debug, Args)]

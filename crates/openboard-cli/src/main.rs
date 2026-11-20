@@ -24,6 +24,7 @@ mod cli;
 mod client;
 mod compat;
 mod error;
+mod grants;
 mod logins;
 mod reconnect;
 mod render;
@@ -523,10 +524,17 @@ async fn dispatch(
             Command::React(args) => react(&ctx, args, true).await,
             Command::Unreact(args) => react(&ctx, args, false).await,
             Command::Read(args) => read(&ctx, args).await,
-            Command::Channels => {
+            Command::Channels(cli::ChannelsArgs { command: None }) => {
                 let list = ctx.client.channels().await?;
                 ctx.print(&list, || render::channels(&list, global.board()))
             }
+            Command::Channels(cli::ChannelsArgs {
+                command: Some(cli::ChannelsCommand::Create(args)),
+            }) => grants::create_channel(&ctx, args).await,
+            Command::Grant(args) => grants::grant(&ctx, args).await,
+            Command::Grants => grants::list(&ctx).await,
+            Command::Ungrant(args) => grants::ungrant(&ctx, args).await,
+            Command::Explain(args) => grants::explain(&ctx, args).await,
             Command::Boards => {
                 let list = ctx.client.boards().await?;
                 ctx.print(&list, || render::boards(&list))
