@@ -117,6 +117,11 @@ fn config_dir_from(get: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
     set("HOME").map(|home| PathBuf::from(home).join(".config").join("openboard"))
 }
 
+/// The configuration directory, whether or not it exists.
+pub fn config_dir() -> Result<PathBuf, Failure> {
+    file_path().map(|path| path.parent().map(Path::to_path_buf).unwrap_or_default())
+}
+
 /// Where the login file is, whether or not it exists.
 pub fn file_path() -> Result<PathBuf, Failure> {
     config_dir_from(|name| std::env::var_os(name))
@@ -130,7 +135,7 @@ pub fn file_path() -> Result<PathBuf, Failure> {
         })
 }
 
-fn io_failure(what: &str, path: &Path, error: &std::io::Error) -> Failure {
+pub(crate) fn io_failure(what: &str, path: &Path, error: &std::io::Error) -> Failure {
     Failure::new(
         codes::LOGIN_FILE,
         format!("cannot {what} {}: {error}", path.display()),
@@ -313,7 +318,7 @@ impl Store {
 }
 
 /// New files are readable and writable by their owner only.
-fn private(options: &mut OpenOptions) {
+pub(crate) fn private(options: &mut OpenOptions) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -325,7 +330,7 @@ fn private(options: &mut OpenOptions) {
 
 /// Creates the configuration directory, private to its owner on Unix. An
 /// existing directory is left as it is; the file's own mode protects it.
-fn create_private_dir(dir: &Path) -> Result<(), Failure> {
+pub(crate) fn create_private_dir(dir: &Path) -> Result<(), Failure> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]

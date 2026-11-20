@@ -463,6 +463,7 @@ mod tests {
             reactions: Vec::new(),
             mentions: Vec::new(),
             html: None,
+            task: None,
         }
     }
 

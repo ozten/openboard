@@ -30,6 +30,7 @@ mod render;
 mod session;
 mod sse;
 mod target;
+mod tasks;
 mod tls;
 
 use cli::{AdminCommand, Cli, Command, Global, ReadArgs, ServeArgs, TailArgs, WaitArgs};
@@ -127,6 +128,13 @@ fn run(cli: Cli) -> Result<(), Failure> {
         Command::Join(args) => Some(session::invite_text(args.invite.as_deref())?),
         _ => None,
     };
+    let task_input = match &cli.command {
+        Command::Tasks(cli::TasksArgs {
+            command: Some(cli::TasksCommand::Create(args)),
+            ..
+        }) => tasks::create_input(args)?,
+        _ => tasks::CreateInput::None,
+    };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -136,7 +144,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 format!("cannot start the async runtime: {error}"),
             )
         })?;
-    runtime.block_on(dispatch(cli, text))
+    runtime.block_on(dispatch(cli, text, task_input))
 }
 
 /// The message text: the argument, or stdin for `-` or a missing argument
@@ -415,7 +423,11 @@ fn shell_quote(value: &str) -> String {
     }
 }
 
-async fn dispatch(cli: Cli, text: Option<String>) -> Result<(), Failure> {
+async fn dispatch(
+    cli: Cli,
+    text: Option<String>,
+    task_input: tasks::CreateInput,
+) -> Result<(), Failure> {
     let mut signals = listen_for_signals()?;
     let global = &cli.global;
     match &cli.command {
@@ -462,6 +474,13 @@ async fn dispatch(cli: Cli, text: Option<String>) -> Result<(), Failure> {
         target,
         resume: Mutex::new(None),
     };
+    if let Command::Tasks(cli::TasksArgs {
+        command: Some(cli::TasksCommand::Run(args)),
+        ..
+    }) = &cli.command
+    {
+        return tasks::run_command(&ctx, args, signals).await;
+    }
     let command = async {
         match &cli.command {
             Command::Post(args) => {
@@ -516,6 +535,7 @@ async fn dispatch(cli: Cli, text: Option<String>) -> Result<(), Failure> {
             Command::Tail(args) => tail(&ctx, args).await,
             Command::Whoami => session::whoami(&ctx).await,
             Command::Logout(_) => session::logout(&ctx).await,
+            Command::Tasks(args) => tasks::run(&ctx, args, task_input).await,
             Command::Serve(_)
             | Command::Admin(_)
             | Command::Invite(_)
@@ -966,7 +986,12 @@ async fn reader_actor(ctx: &Ctx<'_>) -> Option<String> {
 }
 
 async fn read(ctx: &Ctx<'_>, args: &ReadArgs) -> Result<(), Failure> {
-    if let Some(id) = &args.thread {
+    let positional_id = args
+        .channel
+        .as_deref()
+        .filter(|raw| tasks::is_message_id(raw.trim()));
+    if let Some(id) = args.thread.as_deref().or(positional_id) {
+        let id = id.trim();
         let (thread, me) = tokio::join!(ctx.client.thread(id), reader_actor(ctx));
         let thread = thread?;
         return ctx.print(&thread, || render::thread(&thread, me.as_deref()));
@@ -1024,7 +1049,8 @@ async fn wait(ctx: &Ctx<'_>, args: &WaitArgs) -> Result<(), Failure> {
     // follows from the other flags, which it repeats too.
     let type_flag = (!args.types.is_empty()).then(|| types.as_deref().unwrap_or(cli::ALL_TYPES));
     let flags = [
-        ("--channel", args.channel.as_deref()),
+        ("--channel", args.channel()),
+        ("--label", args.label.as_deref()),
         ("--thread", thread.as_deref()),
         ("--type", type_flag),
         ("--mentions-me", args.mentions_me.then_some("")),
@@ -1044,7 +1070,8 @@ async fn wait(ctx: &Ctx<'_>, args: &WaitArgs) -> Result<(), Failure> {
         // first long-poll and an interrupted wait can still say where to
         // resume.
         let query = EventsQuery {
-            channel: args.channel.clone(),
+            channel: args.channel().map(str::to_owned),
+            label: args.label.clone(),
             thread: thread.clone(),
             not_from_self,
             limit: Some(1),
@@ -1087,7 +1114,8 @@ async fn wait(ctx: &Ctx<'_>, args: &WaitArgs) -> Result<(), Failure> {
             .client
             .events(&EventsQuery {
                 after: after.clone(),
-                channel: args.channel.clone(),
+                channel: args.channel().map(str::to_owned),
+                label: args.label.clone(),
                 thread: thread.clone(),
                 not_from: None,
                 not_from_self,

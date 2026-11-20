@@ -106,6 +106,7 @@ fn openboard() -> Command {
         .env_remove("BOARD_URL")
         .env_remove("BOARD_NAME")
         .env_remove("BOARD_AS")
+        .env_remove("BOARD_PROFILE")
         .env_remove("BOARD_LOGIN")
         .env_remove("BOARD_TOKEN")
         .env_remove("BOARD_FINGERPRINT")
@@ -2000,5 +2001,307 @@ mod signals {
             "{stderr}"
         );
         assert_eq!(event.cursor, posted.cursor);
+    }
+}
+
+mod tasks {
+    use super::*;
+    use openboard_api::tasks::{Claim, CreateTaskResponse, TaskList, TaskResponse, TaskView};
+
+    /// A command on `board` as `profile`, with its own configuration
+    /// directory so kept claims stay inside the test.
+    fn cli(board: &Board, profile: &str) -> Command {
+        let mut command = board.cli(Some(profile));
+        command.env("OPENBOARD_CONFIG_DIR", board.dir.path().join("config"));
+        command
+    }
+
+    fn create(board: &Board, args: &[&str]) -> CreateTaskResponse {
+        run(cli(board, "lead")
+            .args(["--json", "tasks", "create"])
+            .args(args))
+        .ok()
+        .json()
+    }
+
+    fn view(board: &Board, id: &str) -> TaskView {
+        run(cli(board, "lead").args(["--json", "tasks", "show", id]))
+            .ok()
+            .json()
+    }
+
+    fn state(board: &Board, id: &str) -> String {
+        view(board, id).task.task.unwrap().state
+    }
+
+    #[test]
+    fn a_task_is_created_claimed_and_settled_by_id_alone() {
+        let board = Board::start();
+        let made = create(
+            &board,
+            &["build", "Fix the parser", "--label", "role=worker"],
+        );
+        let id = made.task.id.clone();
+        assert_eq!(made.task.task.as_ref().unwrap().state, "ready");
+
+        let human = run(cli(&board, "lead").args(["tasks", "build"])).ok();
+        assert!(human.stdout.contains(&id), "{human:?}");
+        assert!(human.stdout.contains("ready"), "{human:?}");
+
+        let claim: Claim = run(cli(&board, "worker-1").args([
+            "--json",
+            "tasks",
+            "claim",
+            "--ready",
+            "build",
+            "--label",
+            "role=worker",
+        ]))
+        .ok()
+        .json();
+        assert_eq!(claim.task.id, id);
+        assert_eq!(claim.epoch, 1);
+        assert_eq!(claim.trust.owner.handle, "local/lead");
+
+        // Another profile holds no claim, and its attempt changes nothing.
+        let out = run(cli(&board, "worker-2").args(["--json", "tasks", "complete", &id]));
+        failed(&out, 1, "claim_not_held");
+        // BOARD_PROFILE names the profile when BOARD_AS is not set.
+        let mut renew = cli(&board, "ignored");
+        renew
+            .env_remove("BOARD_AS")
+            .env("BOARD_PROFILE", "worker-1");
+        let renewed: Claim = run(renew.args(["--json", "tasks", "renew", &id, "--lease", "1m"]))
+            .ok()
+            .json();
+        assert_eq!(renewed.lease_secs, 60);
+
+        let done: TaskResponse =
+            run(cli(&board, "worker-1").args(["--json", "tasks", "complete", &id, "tests pass"]))
+                .ok()
+                .json();
+        let task = done.task.task.unwrap();
+        assert_eq!(task.state, "completed");
+        assert_eq!(task.result.as_deref(), Some("tests pass"));
+        // The kept claim is gone with the task's claim.
+        let out = run(cli(&board, "worker-1").args(["--json", "tasks", "release", &id]));
+        failed(&out, 1, "claim_not_held");
+
+        let open: TaskList = run(cli(&board, "lead").args(["--json", "tasks", "build"]))
+            .ok()
+            .json();
+        assert!(open.tasks.is_empty());
+        let all: TaskList =
+            run(cli(&board, "lead").args(["--json", "tasks", "build", "--state", "all"]))
+                .ok()
+                .json();
+        assert_eq!(all.tasks.len(), 1);
+
+        // `read <id>` shows the thread, with a cursor to wait from.
+        let thread: Thread = run(cli(&board, "lead").args(["--json", "read", &id]))
+            .ok()
+            .json();
+        assert_eq!(thread.root.id, id);
+        assert!(thread.cursor.is_some());
+
+        // Nothing ready: at once without --wait.
+        let out =
+            run(cli(&board, "worker-1").args(["--json", "tasks", "claim", "--ready", "build"]));
+        failed(&out, 1, "nothing_ready");
+    }
+
+    #[test]
+    fn owners_block_unblock_assign_and_cancel() {
+        let board = Board::start();
+        let id = create(&board, &["build", "Pick a database"]).task.id;
+        run(cli(&board, "worker-1").args(["tasks", "claim", &id])).ok();
+        let blocked: TaskResponse = run(cli(&board, "worker-1").args([
+            "--json",
+            "tasks",
+            "block",
+            &id,
+            "Which database?",
+            "--kind",
+            "needs_input",
+        ]))
+        .ok()
+        .json();
+        let task = blocked.task.task.unwrap();
+        assert_eq!(task.state, "blocked");
+        assert_eq!(task.block_kind.as_deref(), Some("needs_input"));
+
+        run(cli(&board, "lead").args(["tasks", "unblock", &id])).ok();
+        assert_eq!(state(&board, &id), "ready");
+        run(cli(&board, "lead").args(["tasks", "assign", &id, "worker-2"])).ok();
+        let task = view(&board, &id).task.task.unwrap();
+        assert_eq!(task.assignee.as_deref(), Some("local/worker-2"));
+        // An owner blocks a task nobody holds, without a claim.
+        run(cli(&board, "lead").args(["tasks", "block", &id, "hold on"])).ok();
+        assert_eq!(state(&board, &id), "blocked");
+        run(cli(&board, "lead").args(["tasks", "cancel", &id, "not needed"])).ok();
+        assert_eq!(state(&board, &id), "canceled");
+    }
+
+    #[test]
+    fn a_long_plan_is_created_in_order_and_once_per_key() {
+        let board = Board::start();
+        // 20 tasks, each needing the one before: two batches.
+        let plan: Vec<Value> = (0..20)
+            .rev()
+            .map(|n| {
+                let mut entry =
+                    serde_json::json!({"key": format!("t{n}"), "text": format!("step {n}")});
+                if n > 0 {
+                    entry["needs"] = serde_json::json!([{"key": format!("t{}", n - 1)}]);
+                }
+                entry
+            })
+            .collect();
+        let plan = serde_json::to_string(&plan).unwrap();
+        let path = board.dir.path().join("plan.json");
+        std::fs::write(&path, &plan).unwrap();
+        let path = path.to_str().unwrap();
+        let out: Value = run(cli(&board, "lead").args([
+            "--json", "tasks", "create", "build", "--file", path, "--key", "plan-1",
+        ]))
+        .ok()
+        .json();
+        let tasks = out["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 20);
+        assert_eq!(out["duplicate"], false);
+        // In plan order: the last entry is step 0, the only ready one.
+        let states: Vec<&str> = tasks
+            .iter()
+            .map(|t| t["task"]["state"].as_str().unwrap())
+            .collect();
+        assert_eq!(states[19], "ready");
+        assert!(states[..19].iter().all(|s| *s == "waiting"), "{states:?}");
+
+        let again: Value = run(cli(&board, "lead").args([
+            "--json", "tasks", "create", "build", "--file", path, "--key", "plan-1",
+        ]))
+        .ok()
+        .json();
+        assert_eq!(again["duplicate"], true);
+        let all: TaskList = run(cli(&board, "lead").args([
+            "--json", "tasks", "build", "--state", "all", "--limit", "100",
+        ]))
+        .ok()
+        .json();
+        assert_eq!(all.tasks.len(), 20);
+
+        // An unknown field is refused before anything is written.
+        std::fs::write(
+            board.dir.path().join("bad.json"),
+            r#"[{"text":"x","priority":1}]"#,
+        )
+        .unwrap();
+        let out = run(cli(&board, "lead").args([
+            "--json",
+            "tasks",
+            "create",
+            "build",
+            "--file",
+            board.dir.path().join("bad.json").to_str().unwrap(),
+        ]));
+        failed(&out, 2, "usage");
+    }
+
+    #[test]
+    fn tasks_run_settles_by_exit_code_and_leaves_a_self_settled_task() {
+        let board = Board::start();
+        let bin = env!("CARGO_BIN_EXE_openboard");
+
+        let ok = create(&board, &["build", "succeed"]).task.id;
+        let out = run(cli(&board, "worker-1")
+            .env("BIN", bin)
+            .args([
+                "tasks", "run", &ok, "--result", "all good", "--", "sh", "-c",
+            ])
+            .arg(r#"test "$BOARD_TASK" = "$1" && test -n "$BOARD_TASK_TOKEN""#)
+            .args(["sh", &ok]))
+        .ok();
+        assert!(out.stderr.contains("completed"), "{out:?}");
+        let task = view(&board, &ok).task.task.unwrap();
+        assert_eq!(task.state, "completed");
+        assert_eq!(task.result.as_deref(), Some("all good"));
+
+        let bad = create(&board, &["build", "fail"]).task.id;
+        let out =
+            run(cli(&board, "worker-1").args(["tasks", "run", &bad, "--", "sh", "-c", "exit 3"]));
+        assert_eq!(out.code, Some(3), "{out:?}");
+        let task = view(&board, &bad).task.task.unwrap();
+        assert_eq!(task.state, "failed");
+        assert!(task.reason.unwrap().contains("code 3"));
+
+        // The command blocks its own task: the run leaves it blocked.
+        let ask = create(&board, &["build", "ask"]).task.id;
+        run(cli(&board, "worker-1")
+            .env("BIN", bin)
+            .args(["tasks", "run", "--ready", "build", "--", "sh", "-c"])
+            .arg(r#""$BIN" tasks block "$BOARD_TASK" "Which one?" --kind needs_input"#))
+        .ok();
+        assert_eq!(state(&board, &ask), "blocked");
+
+        // Nothing ready.
+        let out = run(cli(&board, "worker-1")
+            .args(["--json", "tasks", "run", "--ready", "build", "--", "true"]));
+        failed(&out, 1, "nothing_ready");
+    }
+
+    #[test]
+    fn a_lead_waits_on_a_task_label_until_a_worker_finishes() {
+        let board = Board::start();
+        let id = create(&board, &["build", "work"]).task.id;
+        let list: TaskList = run(cli(&board, "lead").args(["--json", "tasks", "build"]))
+            .ok()
+            .json();
+        let waiter = cli(&board, "lead")
+            .args([
+                "--json",
+                "wait",
+                "build/",
+                "--label",
+                "board.task=completed|blocked|failed",
+                "--after",
+                &list.cursor,
+                "--timeout",
+                "30s",
+            ])
+            .spawn()
+            .unwrap();
+        run(cli(&board, "worker-1").args(["tasks", "claim", &id])).ok();
+        std::thread::sleep(Duration::from_millis(300));
+        run(cli(&board, "worker-1").args(["tasks", "complete", &id])).ok();
+        let out = finish(waiter, Duration::from_secs(30)).ok();
+        let woke: Value = out.json();
+        assert_eq!(woke["event"]["type"], "task.completed", "{out:?}");
+        assert_eq!(woke["message"]["id"], id.as_str());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sigterm_releases_the_task_a_run_holds() {
+        let board = Board::start();
+        let id = create(&board, &["build", "long"]).task.id;
+        let child = cli(&board, "worker-1")
+            .args(["tasks", "run", &id, "--", "sleep", "60"])
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while state(&board, &id) != "claimed" {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        let status = Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let out = finish(child, Duration::from_secs(30));
+        assert_eq!(out.code, Some(143), "{out:?}");
+        assert!(out.stderr.contains("released"), "{out:?}");
+        assert_eq!(state(&board, &id), "ready");
     }
 }

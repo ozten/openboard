@@ -103,6 +103,14 @@ pub(crate) fn validate_label_key(key: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// A label key in a filter: a label key, reserved or not.
+pub(crate) fn validate_label_filter_key(key: &str) -> Result<(), &'static str> {
+    match key.strip_prefix("board.") {
+        Some(rest) => validate_label_key(rest),
+        None => validate_label_key(key),
+    }
+}
+
 /// A label value is 1 to 256 bytes with no control characters.
 pub(crate) fn validate_label_value(value: &str) -> Result<(), &'static str> {
     if value.is_empty() || value.len() > MAX_LABEL_VALUE_LEN || value.chars().any(char::is_control)

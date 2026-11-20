@@ -67,6 +67,8 @@ use crate::store::{
 };
 use crate::Mode;
 
+mod tasks;
+
 /// Longest idempotency key, in bytes.
 const MAX_IDEMPOTENCY_KEY_LEN: usize = 255;
 /// How often the event stream sends a comment to keep the connection open.
@@ -158,7 +160,8 @@ pub(crate) struct Parts {
 }
 
 /// Upkeep a running server does beside answering requests: it trims the
-/// security log to its retention, and it empties the write-ahead log of
+/// security log to its retention, it ends task leases that have run out,
+/// and it empties the write-ahead log of
 /// removed content when the request that removed it could not, because
 /// another process was reading the database. It shares the store with the
 /// router and lets go of it when the server stops.
@@ -187,10 +190,22 @@ impl Maintenance {
                 if pruned.is_err() {
                     eprintln!("openboard-server: could not trim the security log");
                 }
-            } else if state.store.scrub_pending() {
-                // Each try gives up at once if the log is still in use, so
-                // it holds the store no longer than a small write does.
-                let _ = state.db(|state| Ok(state.store.scrub())).await;
+            } else {
+                // Leases that ran out return their tasks to the queue, and
+                // whoever waits on the board hears of it.
+                match state.db(|state| state.store.expire_leases()).await {
+                    Ok(appended) => {
+                        for (board_id, seq) in appended {
+                            state.hub.publish(board_id, seq);
+                        }
+                    }
+                    Err(_) => eprintln!("openboard-server: could not end expired task leases"),
+                }
+                if state.store.scrub_pending() {
+                    // Each try gives up at once if the log is still in use,
+                    // so it holds the store no longer than a small write does.
+                    let _ = state.db(|state| Ok(state.store.scrub())).await;
+                }
             }
         }
     }
@@ -248,6 +263,22 @@ pub(crate) fn router(parts: Parts) -> (Router, Maintenance) {
         .route("/v1/boards/{board}/threads/{thread_id}", get(get_thread))
         .route("/v1/boards/{board}/events", get(get_events))
         .route("/v1/boards/{board}/events/stream", get(stream_events))
+        .route(
+            "/v1/boards/{board}/tasks",
+            post(tasks::create_task).get(tasks::list_tasks),
+        )
+        .route(
+            "/v1/boards/{board}/tasks/batch",
+            post(tasks::create_tasks).layer(DefaultBodyLimit::max(
+                body_limit.saturating_mul(openboard_api::tasks::MAX_TASKS_PER_BATCH),
+            )),
+        )
+        .route("/v1/boards/{board}/tasks/claim", post(tasks::claim_ready))
+        .route("/v1/boards/{board}/tasks/{task_id}", get(tasks::get_task))
+        .route(
+            "/v1/boards/{board}/tasks/{task_id}/{action}",
+            post(tasks::task_action),
+        )
         .fallback(unknown_route)
         .method_not_allowed_fallback(wrong_method)
         .layer(DefaultBodyLimit::max(body_limit))
@@ -357,14 +388,26 @@ pub(crate) struct AppError {
 impl AppError {
     fn new(code: &'static str, message: impl Into<String>) -> Self {
         let status = match code {
-            codes::NOT_FOUND => StatusCode::NOT_FOUND,
-            codes::FORBIDDEN | codes::INVITE_INVALID | codes::CSRF_FAILED => StatusCode::FORBIDDEN,
+            codes::NOT_FOUND | codes::NOT_A_TASK => StatusCode::NOT_FOUND,
+            codes::FORBIDDEN
+            | codes::INVITE_INVALID
+            | codes::CSRF_FAILED
+            | codes::TASK_NOT_OWNED => StatusCode::FORBIDDEN,
             codes::UNAUTHENTICATED => StatusCode::UNAUTHORIZED,
             codes::RATE_LIMITED => StatusCode::TOO_MANY_REQUESTS,
             codes::IDEMPOTENCY_CONFLICT
             | codes::REVISION_CONFLICT
             | codes::LABEL_CONFLICT
-            | codes::MESSAGE_DELETED => StatusCode::CONFLICT,
+            | codes::MESSAGE_DELETED
+            | codes::TASK_EXISTS
+            | codes::TASK_CLAIMED
+            | codes::TASK_ASSIGNED
+            | codes::TASK_WAITING
+            | codes::TASK_BLOCKED
+            | codes::TASK_FINISHED
+            | codes::TASK_STATE
+            | codes::CLAIM_LOST
+            | codes::CLAIM_NOT_HELD => StatusCode::CONFLICT,
             codes::MESSAGE_TOO_LARGE => StatusCode::PAYLOAD_TOO_LARGE,
             codes::INTERNAL => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::BAD_REQUEST,
@@ -528,6 +571,7 @@ impl From<StoreError> for AppError {
                 ),
             )
             .next("use one of the reactions the message already has, or remove one first"),
+            StoreError::Task(error) => tasks::task_error(error),
             other => AppError::internal(&other),
         }
     }
@@ -1974,13 +2018,15 @@ fn check_labels_request(request: &LabelsRequest) -> ApiResult<()> {
     Ok(())
 }
 
-/// Parses [`ThreadsQuery::label`]: `key`, `key=value` or `key=a|b`.
+/// Parses [`ThreadsQuery::label`]: `key`, `key=value` or `key=a|b`. A
+/// filter may name a reserved key such as `board.task`, which no request
+/// can set.
 fn parse_label_filter(raw: &str) -> ApiResult<LabelFilter> {
     let (key, values) = match raw.split_once('=') {
         None => (raw, Vec::new()),
         Some((key, values)) => (key, values.split('|').map(str::to_owned).collect()),
     };
-    names::validate_label_key(key).map_err(invalid_label)?;
+    names::validate_label_filter_key(key).map_err(invalid_label)?;
     for value in &values {
         names::validate_label_value(value).map_err(invalid_label)?;
     }
@@ -2170,6 +2216,7 @@ async fn list_threads(
     Ok(Json(ThreadList {
         threads,
         next_cursor,
+        cursor: Some(event_cursor(&board.tag, page.head)),
     }))
 }
 
@@ -2270,6 +2317,10 @@ impl EventScan {
             None => None,
             Some(raw) => Some(parse_event_types(raw)?),
         };
+        let label = match &query.label {
+            None => None,
+            Some(raw) => Some(parse_label_filter(raw)?),
+        };
         // The caller's principal, and its declared profile if it has one.
         let mentions = (query.mentions_self == Some(true)).then(|| MentionedSelf {
             principal_id: caller.principal.id.clone(),
@@ -2316,6 +2367,7 @@ impl EventScan {
                 not_from_actor,
                 kinds,
                 mentions,
+                label,
             },
             limit,
             after,
@@ -2417,13 +2469,7 @@ impl EventScan {
 }
 
 /// Every event type this server writes.
-const EVENT_TYPES: [&str; 5] = [
-    event_types::MESSAGE_POSTED,
-    event_types::MESSAGE_EDITED,
-    event_types::MESSAGE_DELETED,
-    event_types::LABELS_CHANGED,
-    event_types::REACTIONS_CHANGED,
-];
+const EVENT_TYPES: [&str; 18] = event_types::ALL;
 
 /// Parses [`EventsQuery::types`]: event type names joined by commas.
 fn parse_event_types(raw: &str) -> ApiResult<Vec<&'static str>> {
@@ -2958,6 +3004,11 @@ mod tests {
                 values: vec!["open".into(), "in progress".into()]
             })
         );
+        // A filter may name the reserved keys the board writes.
+        assert_eq!(
+            filter("board.task=ready|claimed").unwrap().key,
+            "board.task"
+        );
         // Only the first `=` separates the key from the values.
         assert_eq!(filter("k=a=b").unwrap().values, ["a=b"]);
         for bad in [
@@ -2966,7 +3017,8 @@ mod tests {
             "Status",
             "status=",
             "status=a|",
-            "board.x",
+            "board.",
+            "board.board.x",
             "a b=c",
         ] {
             assert_eq!(filter(bad), None, "{bad:?}");
@@ -3172,6 +3224,7 @@ mod tests {
             reactions: Vec::new(),
             mentions: Vec::new(),
             html: None,
+            task: None,
         }
     }
 

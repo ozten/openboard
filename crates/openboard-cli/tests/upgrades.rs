@@ -122,6 +122,7 @@ fn openboard() -> Command {
         .env_remove("BOARD_URL")
         .env_remove("BOARD_NAME")
         .env_remove("BOARD_AS")
+        .env_remove("BOARD_PROFILE")
         .env_remove("BOARD_LOGIN")
         .env_remove("BOARD_TOKEN")
         .env_remove("BOARD_FINGERPRINT")
@@ -642,7 +643,7 @@ fn an_event_type_this_cli_does_not_know_goes_to_a_newer_board_with_a_warning() {
             "--json",
             "wait",
             "--type",
-            "task.claimed",
+            "grant.changed",
             "--timeout",
             "2s",
         ]));
@@ -650,12 +651,14 @@ fn an_event_type_this_cli_does_not_know_goes_to_a_newer_board_with_a_warning() {
     out.error(1, "timeout");
     assert!(
         out.stderr
-            .contains("warning: event type `task.claimed` is not one this openboard"),
+            .contains("warning: event type `grant.changed` is not one this openboard"),
         "{out:?}"
     );
     assert_eq!(out.stderr.matches("warning: event type").count(), 1);
     let heads = fake.heads.lock().unwrap().clone();
-    assert!(heads.iter().any(|head| head.contains("types=task.claimed")));
+    assert!(heads
+        .iter()
+        .any(|head| head.contains("types=grant.changed")));
 
     // Against a board of this version, the same name is a typo.
     let board = Board::start();
@@ -663,12 +666,12 @@ fn an_event_type_this_cli_does_not_know_goes_to_a_newer_board_with_a_warning() {
         "--json",
         "wait",
         "--type",
-        "task.claimed",
+        "grant.changed",
         "--timeout",
         "5s",
     ]));
     let error = out.error(2, "usage");
-    assert!(error.error.message.contains("`task.claimed`"), "{out:?}");
+    assert!(error.error.message.contains("`grant.changed`"), "{out:?}");
     assert!(
         error.error.next.unwrap().contains("labels.changed"),
         "{out:?}"

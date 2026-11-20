@@ -150,10 +150,16 @@ pub const REQUIREMENTS: &[Requirement] = &[
         what: "showing the board's commit and API level in `openboard version`",
         min_api_level: 1,
     },
+    Requirement {
+        what: "`openboard tasks`, `wait --label` and `read <message-id>`",
+        min_api_level: 2,
+    },
 ];
 
 /// The row for the board's own build information.
 pub const SERVER_BUILD_INFO: &Requirement = &REQUIREMENTS[0];
+/// The row for tasks and what came with them.
+pub const TASKS: &Requirement = &REQUIREMENTS[1];
 
 /// Whether `server` is too old for `requirement`.
 pub fn too_old(server: &ServerInfo, requirement: &Requirement) -> bool {

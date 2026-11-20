@@ -23,6 +23,7 @@
 //! | DELETE | `/v1/boards/{board}/messages/{message_id}/reactions/{emoji}` | | [`Message`] |
 //! | POST | `/v1/web/login` | [`web::LoginRequest`] | [`web::Session`], and sets the session cookie |
 //! | GET | `/v1/web/session` | | [`web::Session`] |
+//! | | `/v1/boards/{board}/tasks...` | | see [`tasks`] |
 //!
 //! The server also serves the web UI: `GET /` and `GET /join` return the
 //! page, and `GET /assets/{file}` its script and style sheet. Those routes
@@ -86,6 +87,7 @@
 
 pub mod auth;
 pub mod build;
+pub mod tasks;
 pub mod web;
 
 use std::collections::BTreeMap;
@@ -140,7 +142,11 @@ pub const CURSOR_START: &str = "start";
 /// is the surface of milestone M2 (messages, events, labels, reactions,
 /// mentions, the web UI) together with the version reporting itself: the
 /// two response headers and [`Health::commit`] and [`Health::api_level`].
-pub const API_LEVEL: u32 = 1;
+///
+/// Level 2 is milestone M3: tasks (see [`tasks`]), the `task.*` event
+/// types, [`EventsQuery::label`], [`ThreadList::cursor`], [`Thread::cursor`]
+/// and [`Thread::trust`], and [`Message::task`].
+pub const API_LEVEL: u32 = 2;
 /// Response header, on every response: the server's version, as
 /// [`build::VERSION`].
 pub const VERSION_HEADER: &str = "x-openboard-version";
@@ -210,6 +216,37 @@ pub mod codes {
     pub const CSRF_FAILED: &str = "csrf_failed";
     /// The server failed. The message never contains message bodies.
     pub const INTERNAL: &str = "internal";
+
+    /// The message named is not a task. `404`.
+    pub const NOT_A_TASK: &str = "not_a_task";
+    /// The thread is a task already. `409`.
+    pub const TASK_EXISTS: &str = "task_exists";
+    /// Someone else holds the task. `409`.
+    pub const TASK_CLAIMED: &str = "task_claimed";
+    /// The task is kept for someone else. `409`.
+    pub const TASK_ASSIGNED: &str = "task_assigned";
+    /// The task needs tasks that have not completed. `409`.
+    pub const TASK_WAITING: &str = "task_waiting";
+    /// The task is blocked. `409`.
+    pub const TASK_BLOCKED: &str = "task_blocked";
+    /// The task is completed, failed or canceled. `409`.
+    pub const TASK_FINISHED: &str = "task_finished";
+    /// The change needs a task in another state than the task is in. `409`.
+    pub const TASK_STATE: &str = "task_state";
+    /// Only the task's owner may do this. `403`.
+    pub const TASK_NOT_OWNED: &str = "task_not_owned";
+    /// The claim has ended: its lease ran out, it was released or settled,
+    /// or the task was claimed again since. `409`. Nothing changed.
+    pub const CLAIM_LOST: &str = "claim_lost";
+    /// The caller does not hold this claim, or the token is wrong. `409`.
+    pub const CLAIM_NOT_HELD: &str = "claim_not_held";
+    /// A prerequisite is not a task on this board, is the task itself, or
+    /// would make a cycle; or a batch key is missing or repeated. `400`.
+    pub const INVALID_NEEDS: &str = "invalid_needs";
+    /// The assignee names nobody on this board. `400`.
+    pub const INVALID_ASSIGNEE: &str = "invalid_assignee";
+    /// A batch holds more than [`crate::tasks::MAX_TASKS_PER_BATCH`] tasks. `400`.
+    pub const BATCH_TOO_LARGE: &str = "batch_too_large";
 }
 
 /// The kind of principal behind a write. Set by the server, never the client.
@@ -279,6 +316,9 @@ pub struct Message {
     /// asked for it with `html=true`; see [`ReadOptions`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub html: Option<String>,
+    /// Set on the root of a task: its board-kept state. See [`tasks`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<tasks::Task>,
 }
 
 /// One reaction name on a message, with everyone who gave it.
@@ -527,6 +567,11 @@ pub struct ThreadList {
     /// [`ThreadsQuery`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+    /// The board's event position when the listing was read. Pass it as
+    /// [`EventsQuery::after`] to see only what happens next. Absent from a
+    /// board older than API level 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
 }
 
 /// A full thread: the root and its replies, oldest first.
@@ -534,6 +579,13 @@ pub struct ThreadList {
 pub struct Thread {
     pub root: Message,
     pub replies: Vec<Message>,
+    /// The board's event position when the thread was read, as in
+    /// [`ThreadList::cursor`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    /// Set when the root is a task: where the brief came from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust: Option<tasks::Trust>,
 }
 
 /// Event type names used in [`Event::kind`].
@@ -551,6 +603,61 @@ pub mod event_types {
     ///
     /// [`Event::by`]: crate::Event::by
     pub const REACTIONS_CHANGED: &str = "reactions.changed";
+
+    /// A thread became a task. [`Event::message_id`] is the task's ID, as in
+    /// every `task.*` event.
+    ///
+    /// [`Event::message_id`]: crate::Event::message_id
+    pub const TASK_CREATED: &str = "task.created";
+    /// A waiting task became ready because what it needed completed, or its
+    /// needs changed.
+    pub const TASK_READY: &str = "task.ready";
+    /// A task was claimed.
+    pub const TASK_CLAIMED: &str = "task.claimed";
+    /// A claim was given back, or ended because the brief was edited.
+    pub const TASK_RELEASED: &str = "task.released";
+    /// A lease ran out and the task is ready again. [`Event::by`] is the
+    /// holder whose lease it was.
+    ///
+    /// [`Event::by`]: crate::Event::by
+    pub const TASK_EXPIRED: &str = "task.expired";
+    pub const TASK_COMPLETED: &str = "task.completed";
+    pub const TASK_FAILED: &str = "task.failed";
+    pub const TASK_BLOCKED: &str = "task.blocked";
+    pub const TASK_UNBLOCKED: &str = "task.unblocked";
+    pub const TASK_REOPENED: &str = "task.reopened";
+    /// The task was kept for someone, or returned to the pool.
+    pub const TASK_ASSIGNED: &str = "task.assigned";
+    /// The task's prerequisites changed.
+    pub const TASK_NEEDS_CHANGED: &str = "task.needs_changed";
+    pub const TASK_CANCELED: &str = "task.canceled";
+
+    /// Every event type, in the order they were introduced.
+    pub const ALL: [&str; 18] = [
+        MESSAGE_POSTED,
+        MESSAGE_EDITED,
+        MESSAGE_DELETED,
+        LABELS_CHANGED,
+        REACTIONS_CHANGED,
+        TASK_CREATED,
+        TASK_READY,
+        TASK_CLAIMED,
+        TASK_RELEASED,
+        TASK_EXPIRED,
+        TASK_COMPLETED,
+        TASK_FAILED,
+        TASK_BLOCKED,
+        TASK_UNBLOCKED,
+        TASK_REOPENED,
+        TASK_ASSIGNED,
+        TASK_NEEDS_CHANGED,
+        TASK_CANCELED,
+    ];
+
+    /// The `task.*` types.
+    pub fn is_task(kind: &str) -> bool {
+        kind.starts_with("task.")
+    }
 }
 
 /// One entry in a board's ordered, append-only, hash-chained event log.
@@ -630,6 +737,14 @@ pub struct EventsQuery {
     /// longer matches.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mentions_self: Option<bool>,
+    /// Only events in a thread where the root or any reply carries this
+    /// label now: `key`, `key=value` or `key=a|b`. Reserved keys such as
+    /// `board.task` can be filtered on, so
+    /// `label=board.task=completed|failed` with `types=task.completed,task.failed`
+    /// wakes on settled tasks. Decided when the event is delivered, from the
+    /// labels as they are then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

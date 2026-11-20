@@ -30,12 +30,19 @@ use crate::time::{now_ms, now_rfc3339, rfc3339_from_ms};
 use crate::tls::{CERT_FILE_NAME, KEY_FILE_NAME};
 use crate::Mode;
 
+mod tasks;
+
+pub(crate) use tasks::{
+    Act, AssigneeSpec, BatchEntry, Brief, ClaimOut, ClaimProof, Need, NewTask, OwnerSel, TaskError,
+    TaskQuery,
+};
+
 /// File name of the board database inside the data directory.
 pub const DB_FILE_NAME: &str = "openboard.db";
 /// File name of the lock a running server holds on the data directory.
 pub const LOCK_FILE_NAME: &str = "openboard.lock";
 
-pub(crate) const SCHEMA_VERSION: i64 = 3;
+pub(crate) const SCHEMA_VERSION: i64 = 4;
 /// The oldest schema that has the identity tables the operator functions
 /// use. A database between this and [`SCHEMA_VERSION`] can be read and
 /// written by them before a newer server has migrated it.
@@ -213,6 +220,52 @@ CREATE TABLE mentions (
 ) WITHOUT ROWID;
 ";
 
+/// From `user_version` 3 to 4: tasks, their prerequisites, and the
+/// idempotency keys of task creation. The event log gains the `task.*`
+/// types and no new columns, so events keep hash encoding 2.
+const MIGRATE_V3_TO_V4: &str = "
+CREATE TABLE tasks (
+    id                 TEXT PRIMARY KEY REFERENCES messages(id),
+    board_id           INTEGER NOT NULL REFERENCES boards(id),
+    channel            TEXT NOT NULL,
+    state              TEXT NOT NULL,
+    owner_actor        TEXT NOT NULL REFERENCES actors(id),
+    owner_principal    TEXT NOT NULL,
+    assignee_principal TEXT,
+    assignee_profile   TEXT,
+    assignee_handle    TEXT,
+    epoch              INTEGER NOT NULL DEFAULT 0,
+    lease_token        TEXT,
+    holder_actor       TEXT REFERENCES actors(id),
+    lease_until_ms     INTEGER,
+    lease_ms           INTEGER,
+    block_kind         TEXT,
+    reason             TEXT,
+    result             TEXT,
+    changed_actor      TEXT NOT NULL REFERENCES actors(id),
+    changed_at         TEXT NOT NULL,
+    brief_revision     INTEGER NOT NULL,
+    created_seq        INTEGER NOT NULL
+);
+CREATE INDEX tasks_by_state ON tasks(board_id, state, created_seq);
+CREATE INDEX tasks_by_created ON tasks(board_id, created_seq);
+CREATE INDEX tasks_by_lease ON tasks(state, lease_until_ms);
+CREATE TABLE task_needs (
+    task_id  TEXT NOT NULL REFERENCES tasks(id),
+    needs_id TEXT NOT NULL REFERENCES tasks(id),
+    PRIMARY KEY (task_id, needs_id)
+) WITHOUT ROWID;
+CREATE INDEX task_needs_by_need ON task_needs(needs_id);
+CREATE TABLE task_keys (
+    board_id    INTEGER NOT NULL REFERENCES boards(id),
+    actor_id    TEXT NOT NULL,
+    key         TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    task_ids    TEXT NOT NULL,
+    PRIMARY KEY (board_id, actor_id, key)
+) WITHOUT ROWID;
+";
+
 /// The detail of the logout entry written for a session that a new sign-in
 /// of the same person, from the same browser, took the place of.
 pub(crate) const SESSION_REPLACED: &str = "session, replaced by a new sign-in";
@@ -242,6 +295,8 @@ pub(crate) enum StoreError {
     TooManyLabels,
     /// The reaction would be one name more than a message holds.
     TooManyReactions,
+    /// A task write was refused.
+    Task(TaskError),
     /// Another server holds the lock on the data directory.
     DataDirInUse,
     Sqlite(rusqlite::Error),
@@ -259,6 +314,7 @@ impl fmt::Display for StoreError {
             StoreError::LabelConflict(_) => f.write_str("label conflict"),
             StoreError::TooManyLabels => f.write_str("too many labels"),
             StoreError::TooManyReactions => f.write_str("too many reactions"),
+            StoreError::Task(error) => write!(f, "task: {error:?}"),
             StoreError::DataDirInUse => f.write_str("the data directory is in use"),
             StoreError::Sqlite(error) => write!(f, "sqlite: {error}"),
             StoreError::Other(detail) => f.write_str(detail),
@@ -382,6 +438,8 @@ pub(crate) struct EventFilter {
     pub kinds: Option<Vec<&'static str>>,
     /// Only events about a message whose stored mentions name this caller.
     pub mentions: Option<MentionedSelf>,
+    /// Only events in a thread where some message carries this label now.
+    pub label: Option<LabelFilter>,
 }
 
 pub(crate) struct EventPage {
@@ -397,6 +455,8 @@ pub(crate) struct ThreadPage {
     /// Summaries, newest activity first, each with its activity position.
     pub threads: Vec<(i64, ThreadSummary)>,
     pub more: bool,
+    /// The board's event position when the page was read.
+    pub head: i64,
 }
 
 /// What a start does to the directory's recorded mode.
@@ -482,15 +542,22 @@ impl Store {
                 tx.execute_batch(SCHEMA_V1)?;
                 tx.execute_batch(MIGRATE_V1_TO_V2)?;
                 tx.execute_batch(MIGRATE_V2_TO_V3)?;
+                tx.execute_batch(MIGRATE_V3_TO_V4)?;
             }
             1 => {
                 // Milestone M0 knew only local mode.
                 tx.execute_batch(MIGRATE_V1_TO_V2)?;
                 identity::meta_set(&tx, identity::META_MODE, Mode::Local.as_str())?;
                 tx.execute_batch(MIGRATE_V2_TO_V3)?;
+                tx.execute_batch(MIGRATE_V3_TO_V4)?;
             }
             // Milestone M1.
-            2 => tx.execute_batch(MIGRATE_V2_TO_V3)?,
+            2 => {
+                tx.execute_batch(MIGRATE_V2_TO_V3)?;
+                tx.execute_batch(MIGRATE_V3_TO_V4)?;
+            }
+            // Milestones M2 and M2.5.
+            3 => tx.execute_batch(MIGRATE_V3_TO_V4)?,
             SCHEMA_VERSION => {}
             other => return Err(StoreError::Other(unsupported_schema(&tx, other))),
         }
@@ -915,75 +982,28 @@ impl Store {
             }
         }
 
-        // The message records the position its event is about to take.
-        let seq = head(&tx, board.id)? + 1;
-        let now = now_rfc3339();
-        let id = format!("msg_{}", random_hex(&tx, 12)?);
-        let is_root = post.thread_id.is_none();
-        let thread_id = post.thread_id.unwrap_or_else(|| id.clone());
         let by = Writer {
             actor: post.actor,
             principal_id: post.principal_id,
             credential_id: post.credential_id,
         };
-        let actor = &by.actor;
-
-        upsert_actor(&tx, &by)?;
-        tx.execute(
-            "INSERT INTO messages (id, board_id, channel, thread_id, actor_id, text, created_at, seq, credential_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                id,
-                board.id,
-                post.channel,
-                thread_id,
-                actor.id,
-                post.text,
-                now,
-                seq,
-                by.credential_id
-            ],
-        )?;
-        let mentions = resolve_mentions(&tx, &post.mentions)?;
-        write_mentions(&tx, &id, &mentions)?;
-        tx.execute(
-            "INSERT INTO channels (board_id, path, created_at, thread_count, last_activity_at)
-             VALUES (?1, ?2, ?3, ?4, ?3)
-             ON CONFLICT (board_id, path) DO UPDATE SET
-                 thread_count = thread_count + excluded.thread_count,
-                 last_activity_at = excluded.last_activity_at",
-            params![board.id, post.channel, now, i64::from(is_root)],
-        )?;
-        if is_root {
-            tx.execute(
-                "INSERT INTO threads (root_id, board_id, channel, last_seq, last_activity_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![id, board.id, post.channel, seq, now],
-            )?;
-        } else {
-            let updated = tx.execute(
-                "UPDATE threads SET reply_count = reply_count + 1, last_seq = ?1, last_activity_at = ?2
-                 WHERE root_id = ?3 AND board_id = ?4",
-                params![seq, now, thread_id, board.id],
-            )?;
-            if updated != 1 {
-                return Err(StoreError::ThreadMissing);
-            }
-        }
-
-        let appended = append_event(
+        let inserted = insert_message(
             &tx,
             board,
-            event_types::MESSAGE_POSTED,
-            (&post.channel, &thread_id, &id),
+            &post.channel,
+            post.thread_id.as_deref(),
             &by,
-            &now,
+            &post.text,
+            &post.mentions,
         )?;
-        if appended != seq {
-            return Err(StoreError::Other(
-                "the event log moved inside a write transaction".to_owned(),
-            ));
-        }
+        let (id, thread_id, seq, now, mentions) = (
+            inserted.id,
+            inserted.thread_id,
+            inserted.seq,
+            inserted.now,
+            inserted.mentions,
+        );
+        let actor = &by.actor;
         if let Some((key, fingerprint)) = &post.idempotency {
             tx.execute(
                 "INSERT INTO idempotency (board_id, actor_id, key, fingerprint, message_id)
@@ -1011,6 +1031,7 @@ impl Store {
                 reactions: Vec::new(),
                 mentions: mentions.into_iter().map(|(_, mention)| mention).collect(),
                 html: None,
+                task: None,
             },
             seq,
             duplicate: false,
@@ -1046,6 +1067,7 @@ impl Store {
         let resolved = resolve_mentions(&tx, mentions)?;
         write_mentions(&tx, message_id, &resolved)?;
         forget_fingerprint(&tx, message_id)?;
+        tasks::forget_task_fingerprint(&tx, board, message_id)?;
         upsert_actor(&tx, by)?;
         let seq = append_event(
             &tx,
@@ -1055,6 +1077,7 @@ impl Store {
             by,
             &now,
         )?;
+        let seq = tasks::on_brief_edited(&tx, board, message_id, by)?.unwrap_or(seq);
         let message = load_message(&tx, board, message_id)?;
         tx.commit()?;
         self.scrub_wal(&conn);
@@ -1105,6 +1128,7 @@ impl Store {
             by,
             &now,
         )?;
+        let seq = tasks::on_root_deleted(&tx, board, message_id, by)?.unwrap_or(seq);
         let message = load_message(&tx, board, message_id)?;
         tx.commit()?;
         self.scrub_wal(&conn);
@@ -1339,6 +1363,7 @@ impl Store {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let conn = &tx;
+        let head = head(conn, board.id)?;
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(params_from_iter(values), |row| {
             Ok((
@@ -1358,7 +1383,11 @@ impl Store {
             .map(|(_, summary)| &mut summary.root)
             .collect();
         fill_messages(conn, &mut roots)?;
-        Ok(ThreadPage { threads, more })
+        Ok(ThreadPage {
+            threads,
+            more,
+            head,
+        })
     }
 
     /// The thread rooted at `root_id`: the root and its replies, oldest first.
@@ -1379,9 +1408,13 @@ impl Store {
         }
         fill_messages(conn, &mut messages.iter_mut().collect::<Vec<_>>())?;
         let root = messages.remove(0);
+        let trust = self.trust_of(conn, board, root_id)?;
+        let head = head(conn, board.id)?;
         Ok(Some(Thread {
             root,
             replies: messages,
+            cursor: Some(event_cursor(&board.tag, head)),
+            trust,
         }))
     }
 
@@ -1441,6 +1474,19 @@ impl Store {
                 values.push(Value::Text(profile.clone()));
             }
             sql.push_str("))");
+        }
+        if let Some(label) = &filter.label {
+            sql.push_str(
+                " AND EXISTS (SELECT 1 FROM labels l WHERE l.thread_id = e.thread_id AND l.key = ?",
+            );
+            values.push(Value::Text(label.key.clone()));
+            if !label.values.is_empty() {
+                sql.push_str(" AND l.value IN (");
+                sql.push_str(&vec!["?"; label.values.len()].join(", "));
+                sql.push(')');
+                values.extend(label.values.iter().cloned().map(Value::Text));
+            }
+            sql.push(')');
         }
         sql.push_str(" ORDER BY e.seq LIMIT ?");
         values.push(Value::Integer(i64::from(limit)));
@@ -1836,6 +1882,7 @@ fn message_from_row(row: &Row<'_>, at: usize, board: &str) -> rusqlite::Result<M
         reactions: Vec::new(),
         mentions: Vec::new(),
         html: None,
+        task: None,
     })
 }
 
@@ -1919,6 +1966,9 @@ fn fill_messages(conn: &Connection, messages: &mut [&mut Message]) -> Result<()>
             profile: row.get(3)?,
         });
     }
+
+    count_fill_statement();
+    tasks::fill_tasks(conn, &ids, &at, messages)?;
     Ok(())
 }
 
@@ -1997,6 +2047,100 @@ fn upsert_actor(conn: &Connection, by: &Writer) -> Result<()> {
         ],
     )?;
     Ok(())
+}
+
+/// A message [`insert_message`] stored.
+pub(crate) struct Inserted {
+    pub id: String,
+    pub thread_id: String,
+    /// Position of its `message.posted` event.
+    pub seq: i64,
+    pub now: String,
+    pub mentions: Vec<(String, Mention)>,
+}
+
+/// Stores a new thread (`thread_id` is `None`) or a reply, with its
+/// mentions, the channel and thread bookkeeping and its `message.posted`
+/// event. The caller holds a write transaction.
+fn insert_message(
+    conn: &Connection,
+    board: &BoardRef,
+    channel: &str,
+    thread_id: Option<&str>,
+    by: &Writer,
+    text: &str,
+    mentions: &MentionInput,
+) -> Result<Inserted> {
+    // The message records the position its event is about to take.
+    let seq = head(conn, board.id)? + 1;
+    let now = now_rfc3339();
+    let id = format!("msg_{}", random_hex(conn, 12)?);
+    let is_root = thread_id.is_none();
+    let thread_id = thread_id.map_or_else(|| id.clone(), str::to_owned);
+    let actor = &by.actor;
+
+    upsert_actor(conn, by)?;
+    conn.execute(
+        "INSERT INTO messages (id, board_id, channel, thread_id, actor_id, text, created_at, seq, credential_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            id,
+            board.id,
+            channel,
+            thread_id,
+            actor.id,
+            text,
+            now,
+            seq,
+            by.credential_id
+        ],
+    )?;
+    let mentions = resolve_mentions(conn, mentions)?;
+    write_mentions(conn, &id, &mentions)?;
+    conn.execute(
+        "INSERT INTO channels (board_id, path, created_at, thread_count, last_activity_at)
+         VALUES (?1, ?2, ?3, ?4, ?3)
+         ON CONFLICT (board_id, path) DO UPDATE SET
+             thread_count = thread_count + excluded.thread_count,
+             last_activity_at = excluded.last_activity_at",
+        params![board.id, channel, now, i64::from(is_root)],
+    )?;
+    if is_root {
+        conn.execute(
+            "INSERT INTO threads (root_id, board_id, channel, last_seq, last_activity_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, board.id, channel, seq, now],
+        )?;
+    } else {
+        let updated = conn.execute(
+            "UPDATE threads SET reply_count = reply_count + 1, last_seq = ?1, last_activity_at = ?2
+             WHERE root_id = ?3 AND board_id = ?4",
+            params![seq, now, thread_id, board.id],
+        )?;
+        if updated != 1 {
+            return Err(StoreError::ThreadMissing);
+        }
+    }
+    let appended = append_event(
+        conn,
+        board,
+        event_types::MESSAGE_POSTED,
+        (channel, &thread_id, &id),
+        by,
+        &now,
+    )?;
+    if appended != seq {
+        return Err(StoreError::Other(
+            "the event log moved inside a write transaction".to_owned(),
+        ));
+    }
+    Ok(Inserted {
+        id,
+        thread_id,
+        seq,
+        now,
+        mentions,
+    })
 }
 
 /// Appends one event to the board's log, chained to the one before it, and
@@ -2392,7 +2536,7 @@ mod tests {
     }
 
     #[test]
-    fn a_read_loads_labels_reactions_and_mentions_in_three_statements() {
+    fn a_read_loads_labels_reactions_mentions_and_tasks_in_four_statements() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
         let board = store.ensure_board("general").unwrap();
@@ -2441,7 +2585,7 @@ mod tests {
         assert_eq!(thread.replies.len(), replies);
         assert_eq!(
             statements,
-            3,
+            4,
             "a thread of {} messages",
             thread.replies.len() + 1
         );
@@ -2498,7 +2642,7 @@ mod tests {
             fill_statements(|| store.threads(&board, &channel, None, None, 500));
         let page = page.unwrap();
         assert_eq!(page.threads.len(), 41);
-        assert_eq!(statements, 3, "a page of {} threads", page.threads.len());
+        assert_eq!(statements, 4, "a page of {} threads", page.threads.len());
         for (_, summary) in &page.threads[..40] {
             assert_eq!(summary.root.labels.len(), 1);
             assert_eq!(summary.root.mentions.len(), 1);

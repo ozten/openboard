@@ -124,6 +124,15 @@ pub enum Action {
     /// These files hold no board content, and the caller is not
     /// authenticated.
     Page,
+    /// Create a task, or make a thread a task (`task.create`).
+    CreateTask,
+    /// Claim, renew, release and settle tasks (`task.claim`). Who holds a
+    /// claim is a fixed rule the server applies on top.
+    ClaimTask,
+    /// Block, unblock, reopen, assign, change the needs of and cancel tasks
+    /// the caller does not own (`task.manage`). The owner of a task needs
+    /// no permission for these: ownership is a fixed rule.
+    ManageTasks,
 }
 
 /// The outcome of an authorization check.
@@ -175,8 +184,10 @@ impl Policy for LocalPolicy {
 }
 
 /// The network policy until milestone M4: every authenticated principal may
-/// do everything, and an unauthenticated caller may only check health,
-/// enrol, sign in and fetch the web UI's static files.
+/// do everything except manage tasks it does not own, and an
+/// unauthenticated caller may only check health, enrol, sign in and fetch
+/// the web UI's static files. Nobody holds [`Action::ManageTasks`] until
+/// grants exist to give it, so only a task's owner changes it.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NetworkPolicy;
 
@@ -195,7 +206,7 @@ impl Policy for NetworkPolicy {
             )
         } else {
             // The local principal does not exist on a network board.
-            principal.kind != ActorKind::Local
+            principal.kind != ActorKind::Local && action != Action::ManageTasks
         };
         if allowed {
             Decision::Allow
@@ -233,7 +244,7 @@ impl Authorizer {
 mod tests {
     use super::*;
 
-    const ACTIONS: [Action; 13] = [
+    const ACTIONS: [Action; 16] = [
         Action::Health,
         Action::Read,
         Action::Post,
@@ -247,6 +258,9 @@ mod tests {
         Action::Label,
         Action::React,
         Action::Page,
+        Action::CreateTask,
+        Action::ClaimTask,
+        Action::ManageTasks,
     ];
 
     #[test]
@@ -265,7 +279,12 @@ mod tests {
         for action in ACTIONS {
             for enrolled in [&agent, &person] {
                 let decision = authz.authorize(enrolled, action, Some("general"), Some("a"));
-                assert_eq!(decision, Decision::Allow, "{action:?}");
+                let expected = if action == Action::ManageTasks {
+                    Decision::Deny
+                } else {
+                    Decision::Allow
+                };
+                assert_eq!(decision, expected, "{action:?}");
             }
             let decision = authz.authorize(&Principal::local(), action, Some("general"), None);
             assert_eq!(decision, Decision::Deny, "{action:?}");

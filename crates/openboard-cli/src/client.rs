@@ -12,6 +12,10 @@ use std::time::Duration;
 use std::sync::Arc;
 
 use openboard_api::auth::{parse_fingerprint, JoinRequest, JoinResponse, WhoAmI};
+use openboard_api::tasks::{
+    ClaimReadyRequest, ClaimReadyResponse, CreateTaskRequest, CreateTaskResponse,
+    CreateTasksRequest, CreateTasksResponse, TaskActionRequest, TaskList, TaskView, TasksQuery,
+};
 use openboard_api::{
     codes as api_codes, BoardList, ChannelList, EditMessageRequest, ErrorBody, EventsQuery,
     EventsResponse, Health, LabelsRequest, Message, PostMessageRequest, PostMessageResponse,
@@ -21,7 +25,7 @@ use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER};
 use reqwest::{Method, RequestBuilder, Response, Url};
 use serde::de::DeserializeOwned;
 
-use crate::compat::{self, Requirement, Seen, ServerInfo};
+use crate::compat::{self, Requirement, Seen, ServerInfo, TASKS};
 use crate::error::{codes, Failure};
 use crate::logins::Secret;
 use crate::target::{bad_url, Target};
@@ -664,6 +668,100 @@ impl Client {
         .await
     }
 
+    /// `POST /tasks`.
+    pub async fn create_task(
+        &self,
+        request: &CreateTaskRequest,
+    ) -> Result<CreateTaskResponse, Failure> {
+        let http = self.request(
+            Method::POST,
+            self.endpoint(&["tasks"]),
+            Some(REQUEST_TIMEOUT),
+        );
+        self.json(Self::with_json(http, request)?)
+            .await
+            .map_err(|failure| self.needs(TASKS, failure))
+    }
+
+    /// `POST /tasks/batch`.
+    pub async fn create_tasks(
+        &self,
+        request: &CreateTasksRequest,
+    ) -> Result<CreateTasksResponse, Failure> {
+        let url = self.endpoint(&["tasks", "batch"]);
+        let http = self.request(Method::POST, url, Some(REQUEST_TIMEOUT));
+        self.json(Self::with_json(http, request)?)
+            .await
+            .map_err(|failure| self.needs(TASKS, failure))
+    }
+
+    /// `GET /tasks`.
+    pub async fn tasks(&self, query: &TasksQuery) -> Result<TaskList, Failure> {
+        let mut url = self.endpoint(&["tasks"]);
+        {
+            let mut pairs = url.query_pairs_mut();
+            for (name, value) in [
+                ("channel", &query.channel),
+                ("state", &query.state),
+                ("label", &query.label),
+                ("for", &query.assignee),
+                ("cursor", &query.cursor),
+            ] {
+                if let Some(value) = value {
+                    pairs.append_pair(name, value);
+                }
+            }
+            if let Some(limit) = query.limit {
+                pairs.append_pair("limit", &limit.to_string());
+            }
+        }
+        if url.query() == Some("") {
+            url.set_query(None);
+        }
+        self.json(self.request(Method::GET, url, Some(REQUEST_TIMEOUT)))
+            .await
+            .map_err(|failure| self.needs(TASKS, failure))
+    }
+
+    /// `GET /tasks/{id}`.
+    pub async fn task(&self, id: &str) -> Result<TaskView, Failure> {
+        self.json(self.request(
+            Method::GET,
+            self.endpoint(&["tasks", id]),
+            Some(REQUEST_TIMEOUT),
+        ))
+        .await
+        .map_err(|failure| self.needs(TASKS, failure))
+    }
+
+    /// `POST /tasks/claim`, held up to `request.wait` seconds.
+    pub async fn claim_ready(
+        &self,
+        request: &ClaimReadyRequest,
+    ) -> Result<ClaimReadyResponse, Failure> {
+        let hold = Duration::from_secs(request.wait.unwrap_or(0));
+        let url = self.endpoint(&["tasks", "claim"]);
+        let http = self.request(Method::POST, url, Some(hold + LONG_POLL_GRACE));
+        self.json(Self::with_json(http, request)?)
+            .await
+            .map_err(|failure| self.needs(TASKS, failure))
+    }
+
+    /// `POST /tasks/{id}/{action}`. A claim or a renewal answers with a
+    /// [`Claim`], everything else with a [`TaskResponse`].
+    pub async fn task_action<T: DeserializeOwned>(
+        &self,
+        id: &str,
+        action: &str,
+        request: &TaskActionRequest,
+    ) -> Result<T, Failure> {
+        let url = self.endpoint(&["tasks", id, action]);
+        let http = self.request(Method::POST, url, Some(REQUEST_TIMEOUT));
+        self.json(Self::with_json(http, request)?)
+            .await
+            .map_err(|failure| self.needs(TASKS, failure))
+    }
+
     fn events_url(&self, rest: &[&str], query: &EventsQuery) -> Url {
         let mut url = self.endpoint(rest);
         {
@@ -674,6 +772,7 @@ impl Client {
                 ("thread", &query.thread),
                 ("not_from", &query.not_from),
                 ("types", &query.types),
+                ("label", &query.label),
             ] {
                 if let Some(value) = value {
                     pairs.append_pair(name, value);

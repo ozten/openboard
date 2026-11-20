@@ -2022,7 +2022,7 @@ async fn an_m0_data_directory_migrates_verifies_and_accepts_new_events() {
     let task = tokio::spawn(server.run(async {
         let _ = stopped.await;
     }));
-    assert_eq!(version(&data_dir), 3);
+    assert_eq!(version(&data_dir), CURRENT_SCHEMA);
     assert_eq!(verified(&data_dir), 2);
     let http = Client::builder().no_proxy().build().unwrap();
     let thread: Thread = http
@@ -3291,7 +3291,7 @@ async fn an_m1_data_directory_migrates_verifies_and_takes_the_new_features() {
     let server = openboard_server::bind(config).await.unwrap();
     assert_eq!(server.mode(), Mode::Network);
     drop(server);
-    assert_eq!(version(&data_dir), 3);
+    assert_eq!(version(&data_dir), CURRENT_SCHEMA);
     assert_eq!(verified(&data_dir), 1);
 
     let board = Net::start_in(dir, |_| {}).await;
@@ -3381,13 +3381,16 @@ async fn an_m1_data_directory_migrates_verifies_and_takes_the_new_features() {
     let board = Net::start_in(dir, |_| {}).await;
     assert_eq!(board.status(&alice).await, StatusCode::OK);
     let dir = board.stop().await;
-    assert_eq!(version(&data_dir_of(&dir)), 3);
+    assert_eq!(version(&data_dir_of(&dir)), CURRENT_SCHEMA);
     assert_eq!(verified(&data_dir_of(&dir)), 6);
 }
 
 // ---------------------------------------------------------------------------
 // Upgrades: backups before migrations, and refusing newer databases
 // ---------------------------------------------------------------------------
+
+/// The schema version this build writes.
+const CURRENT_SCHEMA: i64 = 4;
 
 fn schema_of(path: &Path) -> i64 {
     rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -3412,11 +3415,13 @@ fn check_backup(data_dir: &Path, before: i64, events: u64) -> PathBuf {
     assert_eq!(backups.len(), 1, "{backups:?}");
     let backup = &backups[0];
     assert!(
-        backup.file_name.starts_with("openboard.db.pre-v3-"),
+        backup
+            .file_name
+            .starts_with(&format!("openboard.db.pre-v{CURRENT_SCHEMA}-")),
         "{backup:?}"
     );
     assert!(backup.file_name.ends_with('Z'), "{backup:?}");
-    assert_eq!(backup.before_schema_version, Some(3));
+    assert_eq!(backup.before_schema_version, Some(CURRENT_SCHEMA));
     assert!(backup.size_bytes > 0);
     #[cfg(unix)]
     {
@@ -3458,11 +3463,14 @@ async fn a_version_2_directory_is_backed_up_before_it_is_migrated() {
     assert_eq!(check.schema_version, 2);
     assert_eq!(
         check.action,
-        operator::UpgradeAction::Migrate { from: 2, to: 3 }
+        operator::UpgradeAction::Migrate {
+            from: 2,
+            to: CURRENT_SCHEMA
+        }
     );
     assert_eq!(
         check.backup_name.as_deref(),
-        Some("openboard.db.pre-v3-<UTC time>")
+        Some(format!("openboard.db.pre-v{CURRENT_SCHEMA}-<UTC time>").as_str())
     );
     assert_eq!(check.backup_dir, data_dir);
     assert!(check.database_bytes > 0);
@@ -3472,7 +3480,7 @@ async fn a_version_2_directory_is_backed_up_before_it_is_migrated() {
     assert_eq!(schema_of(&data_dir.join(DB_FILE_NAME)), 2);
 
     start_once(&data_dir).await.unwrap();
-    assert_eq!(schema_of(&data_dir.join(DB_FILE_NAME)), 3);
+    assert_eq!(schema_of(&data_dir.join(DB_FILE_NAME)), CURRENT_SCHEMA);
     let backup = check_backup(&data_dir, 2, 1);
     // The backup holds the board as it was.
     let text: String = rusqlite::Connection::open(&backup)
@@ -3523,10 +3531,13 @@ async fn a_version_1_directory_is_backed_up_before_it_is_migrated() {
     let check = operator::upgrade_check(&data_dir).unwrap();
     assert_eq!(
         check.action,
-        operator::UpgradeAction::Migrate { from: 1, to: 3 }
+        operator::UpgradeAction::Migrate {
+            from: 1,
+            to: CURRENT_SCHEMA
+        }
     );
     start_once(&data_dir).await.unwrap();
-    assert_eq!(schema_of(&data_dir.join(DB_FILE_NAME)), 3);
+    assert_eq!(schema_of(&data_dir.join(DB_FILE_NAME)), CURRENT_SCHEMA);
     assert_eq!(verified(&data_dir), 2);
     let backup = check_backup(&data_dir, 1, 2);
     roll_back(&data_dir, &backup);
@@ -3576,7 +3587,7 @@ async fn a_read_only_data_directory_refuses_to_migrate_and_is_left_alone() {
     std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     for needle in [
         "schema version 2",
-        "migrated to version 3",
+        &format!("migrated to version {CURRENT_SCHEMA}"),
         "backup",
         "Nothing was changed",
         "upgrade-check",

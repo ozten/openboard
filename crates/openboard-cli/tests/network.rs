@@ -173,6 +173,7 @@ fn openboard() -> Command {
         "BOARD_URL",
         "BOARD_NAME",
         "BOARD_AS",
+        "BOARD_PROFILE",
         "BOARD_LOGIN",
         "BOARD_TOKEN",
         "BOARD_FINGERPRINT",
@@ -2840,6 +2841,8 @@ fn inviting_an_email_address_prints_a_sign_in_link_for_a_person() {
         .map(|summary| Thread {
             root: summary.root,
             replies: Vec::new(),
+            cursor: None,
+            trust: None,
         })
         .next()
         .unwrap();

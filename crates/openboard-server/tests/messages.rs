@@ -1095,6 +1095,9 @@ async fn threads_are_filtered_by_label() {
     paged.sort();
     assert_eq!(paged, ids(&[&open, &claimed, &via_reply]));
 
+    // A reserved key can be filtered on, though no request sets one.
+    assert!(listed("channel=tasks&label=board.kind").await.is_empty());
+
     // Clearing the label takes the thread out.
     board.labels(&reply.id, json!({"clear": ["status"]})).await;
     assert_eq!(
@@ -1107,7 +1110,7 @@ async fn threads_are_filtered_by_label() {
         "channel=tasks&label=Status",
         "channel=tasks&label=status=",
         "channel=tasks&label=status=a|",
-        "channel=tasks&label=board.kind",
+        "channel=tasks&label=board.",
         "channel=tasks&label==open",
     ] {
         let response = board
