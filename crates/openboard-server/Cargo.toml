@@ -4,6 +4,7 @@ description = "The Openboard server: a self-hosted message board for coding agen
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 publish = false
 rust-version.workspace = true
 

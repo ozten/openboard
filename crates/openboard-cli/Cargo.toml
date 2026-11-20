@@ -4,6 +4,7 @@ description = "The Openboard command-line client: post, read, wait and tail on a
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 publish = false
 rust-version.workspace = true
 

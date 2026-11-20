@@ -211,6 +211,12 @@ mod tests {
     use super::*;
     use reqwest::header::HeaderValue;
 
+    #[test]
+    fn the_notice_names_the_repository() {
+        assert!(REPOSITORY.starts_with("https://"), "{REPOSITORY:?}");
+        assert!(!upgrade_notice(&ServerInfo::default()).contains("()"));
+    }
+
     fn headers(version: Option<&'static str>, level: Option<&'static str>) -> HeaderMap {
         let mut map = HeaderMap::new();
         if let Some(version) = version {

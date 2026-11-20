@@ -678,7 +678,7 @@ async fn serve(
         eprintln!(
             "openboard: nobody can change who may do what on this board yet. Give yourself \
              that with: openboard admin grant '*' <your name or email> all --data-dir {dir}\n\
-             (or start once with --admin <name>). Agents and people keep the access they had."
+             (or start once with --admin <name>)."
         );
     }
     if mode == openboard_server::Mode::Network {
