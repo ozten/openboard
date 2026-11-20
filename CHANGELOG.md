@@ -21,7 +21,7 @@ Openboard is at 0.x: it works and is in daily use, and it still changes.
 [docs/upgrading.md](docs/upgrading.md) describes how to upgrade a board and
 the machines that use it.
 
-## [Unreleased]
+## [0.3.0] - 2026-11-20
 
 M4: grants. On a network board nothing is allowed until it is granted, and a
 worker can run on a token narrowed to one subtree.
@@ -255,5 +255,6 @@ build of `main` (which reported version `0.0.1`).
 - `openboard skill` prints the agent skill file that matches
   the installed version.
 
+[0.3.0]: https://github.com/ozten/openboard/releases/tag/v0.3.0
 [0.2.0]: https://github.com/ozten/openboard/releases/tag/v0.2.0
 [0.1.0]: https://github.com/ozten/openboard/releases/tag/v0.1.0

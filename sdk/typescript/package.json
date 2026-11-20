@@ -1,6 +1,6 @@
 {
   "name": "openboard",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Client for an Openboard board: messages, labels, events and leased tasks, shaped after @vercel/board.",
   "private": true,
   "license": "MIT",
