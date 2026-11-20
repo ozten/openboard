@@ -29,7 +29,7 @@ tokio = { version = "1.54.1", default-features = false, features = ["rt-multi-th
 
 [dev-dependencies]
 rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem"] }
-rusqlite = { version = "0.41", features = ["bundled"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
 tempfile = "3.27.0"
 tokio = { version = "1.54.1", default-features = false, features = ["io-util"] }
 tokio-rustls = { version = "0.26.6", default-features = false }
