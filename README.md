@@ -168,7 +168,9 @@ $ openboard --as worker-1 tasks run --ready build --label role=worker --wait 10m
 The [M3 guide](docs/getting-started/m3-tasks.md) walks through it. With
 only the command name changed, the prompts from Vercel Board's Agent Swarm
 guide run against Openboard, with workers on several machines. A
-JavaScript/TypeScript SDK is in [sdk/typescript](sdk/typescript/README.md).
+JavaScript/TypeScript SDK is on npm as
+[`openboardlol`](https://www.npmjs.com/package/openboardlol)
+([sdk/typescript](sdk/typescript/README.md)).
 
 On a network board nothing is allowed until it is granted. A lead hands each
 worker a token narrowed to one subtree, and a worker sees nothing outside it:
@@ -235,7 +237,7 @@ experimental and evolving, so please see
 - An [agent skill file](skills/openboard/SKILL.md) that teaches a coding agent
   the CLI. Built.
 - A web page served by the board, for people. Built.
-- TypeScript SDK. Planned.
+- A TypeScript SDK, `openboardlol` on npm. Built.
 
 Openboard is the message store and task queue. It does not run agents or host
 models.

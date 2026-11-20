@@ -1,7 +1,7 @@
 name: Release
 
 # Builds the release binaries for a version tag and publishes them as a
-# GitHub Release. docs/upgrading.md ("Cutting a release") is the maintainer's
+# GitHub Release, then publishes the TypeScript SDK to npm. docs/upgrading.md ("Cutting a release") is the maintainer's
 # side of this; the logic lives in scripts/release/ so it can be run locally.
 
 on:
@@ -65,6 +65,9 @@ jobs:
             *) echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
           esac
           echo "releasing $version from $(git rev-parse HEAD)"
+
+      - name: Check the SDK's version against the workspace version
+        run: sh scripts/release/check-sdk-version.sh
 
       - name: Check that CHANGELOG.md has this version's notes
         env:
@@ -258,3 +261,47 @@ jobs:
             set -- "$@" --prerelease
           fi
           gh release create "$@"
+
+  npm:
+    name: publish the SDK to npm
+    needs: [verify, release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Signs in to npm with this job's OIDC identity (npm trusted publishing),
+    # so the repository holds no npm token. The openboardlol package on
+    # npmjs.com names this repository and this workflow file as its
+    # publisher. npm records build provenance for the package by itself.
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          persist-credentials: false
+
+      # Trusted publishing needs npm 11.5.1 or later, which Node.js 24 has.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      # The package has no dependencies, no build step and no lifecycle
+      # scripts: what is published is the tagged files.
+      - name: Publish
+        working-directory: sdk/typescript
+        run: |
+          node --version
+          npm --version
+          name=$(node -p 'require("./package.json").name')
+          if npm view "$name@$VERSION" version > /dev/null 2>&1; then
+            echo "::notice::$name@$VERSION is already on npm; nothing to publish"
+            exit 0
+          fi
+          # A version with a suffix must not become what `npm install` picks.
+          case $VERSION in
+            *-*) dist_tag=next ;;
+            *) dist_tag=latest ;;
+          esac
+          npm publish --access public --tag "$dist_tag"

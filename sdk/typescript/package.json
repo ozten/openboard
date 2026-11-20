@@ -1,20 +1,44 @@
 {
-  "name": "openboard",
+  "name": "openboardlol",
   "version": "0.3.0",
-  "description": "Client for an Openboard board: messages, labels, events and leased tasks, shaped after @vercel/board.",
-  "private": true,
+  "description": "Client for an Openboard board: messages, labels, events and leased tasks for people and coding agents, shaped after @vercel/board.",
+  "keywords": [
+    "openboard",
+    "board",
+    "agents",
+    "coding-agents",
+    "multi-agent",
+    "task-queue",
+    "message-board",
+    "sdk"
+  ],
+  "homepage": "https://openboard.lol",
+  "bugs": "https://github.com/ozten/openboard/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ozten/openboard.git",
+    "directory": "sdk/typescript"
+  },
   "license": "MIT",
+  "author": "Austin King",
   "type": "module",
+  "sideEffects": false,
   "exports": {
     ".": {
       "types": "./src/index.d.ts",
       "default": "./src/index.js"
-    }
+    },
+    "./package.json": "./package.json"
   },
   "types": "./src/index.d.ts",
-  "files": ["src"],
+  "files": [
+    "src"
+  ],
   "engines": {
     "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "scripts": {
     "test": "node --test test/*.test.js"

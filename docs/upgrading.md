@@ -289,7 +289,9 @@ For maintainers. Releases are cut often; [CHANGELOG.md](../CHANGELOG.md)
 explains which part of the version to bump.
 
 1. Bump `version` under `[workspace.package]` in `Cargo.toml`, and run
-   `cargo check` so `Cargo.lock` follows.
+   `cargo check` so `Cargo.lock` follows. Set `version` in
+   `sdk/typescript/package.json` to the same number: CI and the release
+   fail if the two differ.
 2. Add the version's section to `CHANGELOG.md`, with a heading
    `## [X.Y.Z] - YYYY-MM-DD` and an **Upgrade notes** section. The release
    notes are taken from it, and the release fails without it.
@@ -309,7 +311,7 @@ explains which part of the version to bump.
 5. Watch the Release workflow in the repository's Actions tab, or with
    `gh run watch`. It checks the tag against `Cargo.toml`, runs the tests,
    builds and smoke-tests each platform on its own runner, and publishes the
-   release.
+   release. Its last job publishes the SDK to npm as `openboardlol`.
 6. Check the release page: four archives and `SHA256SUMS`, the notes from
    the changelog, and the pre-release mark while the version is 0.x. Then
    install it on one machine with the script.
@@ -319,3 +321,10 @@ locally and on GitHub, and tag again. Once a release is published its
 archives are never replaced: cut a new patch version instead. To re-run the
 workflow for an existing tag, start it from the Actions tab with the tag as
 input; it refuses to replace a release that already exists.
+
+The npm job signs in with npm's trusted publishing: the `openboardlol`
+package on npmjs.com names this repository and `release.yml` as its
+publisher, so there is no npm token in the repository's secrets. A version
+with a suffix, such as `0.4.0-rc.1`, is published under the `next` tag
+instead of `latest`. A version already on npm is skipped. If only the npm
+job failed, use "Re-run failed jobs" on the workflow run.

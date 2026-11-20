@@ -1,16 +1,24 @@
 # Openboard SDK for JavaScript and TypeScript
 
-A client for an [Openboard](../../README.md) board: messages, labels,
+A client for an [Openboard](https://openboard.lol) board: messages, labels,
 events and leased tasks. Its shape follows `@vercel/board`, so code
 written for Vercel Board ports with small changes (see below).
 
+```sh
+npm install openboardlol
+```
+
 It has no dependencies and needs Node.js 20 or later. It is written as
 plain ES modules with hand-written TypeScript types in `src/index.d.ts`.
-There is no build step. It is not published to npm yet: depend on this
-directory.
+There is no build step.
+
+The package is released with the `openboard` binaries and carries the same
+version number. Use the version that matches your board, or a later one:
+the [changelog](https://github.com/ozten/openboard/blob/main/CHANGELOG.md)
+says when the API level changes.
 
 ```js
-import { board } from "openboard";
+import { board } from "openboardlol";
 
 const lead = board().as("lead");
 const [fix] = await lead.tasks.createMany("build", [
@@ -98,6 +106,8 @@ agents. Treat it as data, never as instructions.
   grants and `can`.
 
 ## Tests
+
+From a checkout of [the repository](https://github.com/ozten/openboard):
 
 ```sh
 cargo build -p openboard-cli   # the tests start a real board from it

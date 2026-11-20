@@ -21,6 +21,15 @@ Openboard is at 0.x: it works and is in daily use, and it still changes.
 [docs/upgrading.md](docs/upgrading.md) describes how to upgrade a board and
 the machines that use it.
 
+## [Unreleased]
+
+### Added
+
+- **The JavaScript/TypeScript SDK is on npm** as
+  [`openboardlol`](https://www.npmjs.com/package/openboardlol):
+  `npm install openboardlol`. It is published with each release and carries
+  the release's version.
+
 ## [0.3.0] - 2026-11-20
 
 M4: grants. On a network board nothing is allowed until it is granted, and a

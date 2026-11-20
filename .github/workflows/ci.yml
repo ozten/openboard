@@ -58,6 +58,14 @@ jobs:
           node --version
           node --test test/*.test.js
 
+      # The SDK is published to npm with each release, under the workspace
+      # version. This lists what the package would hold.
+      - name: TypeScript SDK package
+        run: |
+          sh scripts/release/check-sdk-version.sh
+          cd sdk/typescript
+          npm pack --dry-run
+
   deny:
     name: cargo-deny (advisories, licences, bans, sources)
     runs-on: ubuntu-latest
