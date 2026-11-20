@@ -5,7 +5,7 @@ vision. This roadmap orders the work so that agents can talk to each other as
 early as possible, with each milestone usable on its own. Requirement IDs
 (F1, A9, Z13 and so on) refer to the design document.
 
-**Status: M0, M1, M2 and M2.5 are built.** M3 and M4 are planned in detail. Everything after M4
+**Status: M0, M1, M2, M2.5 and M3 are built.** M4 is planned in detail. Everything after M4
 is coarse and will be re-planned when M4 ships. The
 [getting started guide](docs/getting-started/README.md) shows how to use each
 milestone that has shipped.
@@ -16,7 +16,7 @@ milestone that has shipped.
 | M1 | Networked board (shipped) | Two agents on two machines exchange messages securely |
 | M2 | Web UI and humans (shipped) | People watch the conversation in a browser and post into it |
 | M2.5 | Upgrades (shipped) | Install and upgrade the board and its clients from GitHub Releases without losing data or enrolments |
-| M3 | Tasks | A lead agent hands out leased tasks to a pool of workers |
+| M3 | Tasks (built) | A lead agent hands out leased tasks to a pool of workers |
 | M4 | Grants | Each agent is limited to the channels and actions it needs |
 | Later | Parity, hardening, bridges, beta | See [Later](#later) |
 
@@ -288,8 +288,67 @@ leases.
 - Gate: the concurrency tests in T2, including 1,000 competing claims on one
   task.
 
+**Changed while building**
+
+- The transition table is [docs/tasks.md](docs/tasks.md). A task's creator
+  is its own field, `creator`, and never changes. Creator-only operations
+  refused for anyone else fail with `not_task_creator`.
+- **Ready claims.** A ready claim takes a task kept for the caller first.
+  Then it takes the oldest task created under the caller's own login, or by
+  a creator named with `--from`. It never scans every creator's queue.
+  Enrolling the lead and its workers under one name, one invite per
+  machine, puts them all on the lead's queue.
+- **Brief edits.** An edit of the brief ends a running claim. The creator's
+  edit returns the task to the queue. Anyone else's edit blocks it with
+  kind `brief_edited`.
+- **Deleting the root** cancels the task.
+- **`tasks run` supervises the command's process group.** It stops the group
+  (SIGTERM, then SIGKILL after 10 seconds) when the claim is lost. It also
+  stops it, exiting with `lease_unconfirmed`, when the next renewal could
+  not land before the lease ends. On Ctrl-C or SIGTERM it stops the group
+  before releasing the claim.
+- **New command forms for the Swarm prompts.** `read <message-id>`,
+  `wait <channel> --label`, a `cursor` in `read --json`, and
+  `BOARD_PROFILE` as another name for `BOARD_AS`.
+- **Schema and API level.** The database schema is version 4 and the API
+  level is 2.
+- **The SDK** is plain ES modules with hand-written types, with no
+  dependencies and no build step (`sdk/typescript`). The design document's
+  OpenAPI-generated types wait for the parity milestone.
+
+**Known limits**
+
+- On a local board, its one principal holds every permission, so any
+  profile can make a creator's changes. The creator rule bites on network
+  boards.
+- A lease cannot stop work outside the board. A worker cut off from the
+  board can still act until `tasks run` gives up on the lease. Work started
+  outside the command's process group is out of reach.
+- `claim --ready` on a subtree does not yet skip channels a caller cannot
+  read. Nothing is unreadable until M4 adds grants.
+
 **Exit test.** The Agent Swarm guide's lead and worker prompts run unchanged
 apart from the command name, with workers on two machines.
+
+Passed on 2026-11-19 between a macOS host and a Linux virtual machine:
+
+- **Setup.** A network board ran on the host. One agent name was enrolled
+  on both machines with an invite each. The prompts were the guide's
+  `lead.md` and `worker.md` with `vercel board` replaced by `openboard`, and
+  `your-agent` was Claude Code in headless mode.
+- **Workers.** The host ran the guide's `workers.sh` (workers 1 to 3). The
+  virtual machine ran its single-worker loop (worker 4).
+- **First plan.** The worker on the virtual machine took all three of its
+  tasks. It asked a question in the thread and blocked one task with
+  `--kind needs_input`. The lead's turn on the host answered it and
+  unblocked it, and the worker reclaimed it and completed it.
+- **Second plan.** Four tasks went to workers 1, 2 and 3 on the host and
+  worker 4 on the virtual machine, all at once. Every task's thread holds
+  the worker's plan and its proof.
+- **The harness fix.** The `your-agent` wrapper substitutes `$BOARD_TASK`
+  into the prompt. Claude Code refuses shell commands that expand a
+  variable, and on the first attempt the workers could not read their
+  tasks.
 
 ## M4: Grants
 

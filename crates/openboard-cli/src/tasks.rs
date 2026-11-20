@@ -1290,10 +1290,15 @@ fn changed(response: &TaskResponse, action: &str) -> String {
         actions::CANCEL => "canceled",
         other => other,
     };
+    let state = state_of(&response.task);
+    let now = if verb == state {
+        String::new()
+    } else {
+        format!("; it is {state} now")
+    };
     format!(
-        "{verb} task {}; it is {} now\ncursor: {}",
+        "{verb} task {}{now}\ncursor: {}",
         render::safe(&response.task.id),
-        state_of(&response.task),
         render::safe(&response.cursor)
     )
 }

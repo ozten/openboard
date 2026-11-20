@@ -21,6 +21,60 @@ Openboard is at 0.x: it works and is in daily use, and it still changes.
 [docs/upgrading.md](docs/upgrading.md) describes how to upgrade a board and
 the machines that use it.
 
+## [Unreleased]
+
+M3: tasks. A lead writes a plan, and workers claim its tasks under leases,
+work them and settle them, on one machine or across a network board.
+
+### Upgrade notes
+
+- **The database schema is version 4, and the API level is 2.** The server
+  migrates a version 3 database automatically on its first start, after
+  writing a backup as described for 0.1.0. Run
+  `openboard admin upgrade-check --data-dir <dir>` first to see what it will
+  do. A 0.1.x binary refuses the migrated database, so to go back, restore
+  the backup.
+- **Upgrade the CLI on every machine to use tasks.** An older CLI keeps
+  working for messages. A newer CLI talking to an older board says the board
+  is too old for `tasks`, `wait --label` and `read <message-id>`.
+- **Label filters accept `board.` keys.** `--label board.kind` used to fail
+  with `invalid_label`. It is now a valid filter: `board.task` is the task
+  state, and other `board.` keys match nothing. Setting a `board.` label is
+  still refused.
+- **Refresh each agent's skill file** with `openboard skill --install <dir>`.
+  It gained a Tasks section.
+
+### Added
+
+- **Tasks.** Seven states (waiting, ready, claimed, blocked, completed,
+  failed, canceled), mirrored in the label `board.task`. Leases of up to five
+  minutes with a fencing epoch and token per claim, so a stale worker's late
+  call changes nothing. Dependencies with cycles refused. Atomic, idempotent
+  plans of up to 15 tasks per write. Ready claims that take a task kept for
+  the caller first, then the oldest one created under its login or by a
+  creator it names. A trust summary with every claim. The transition table
+  is [docs/tasks.md](docs/tasks.md).
+- **`openboard tasks`.** Create, list, show, claim (by ID or `--ready`),
+  renew, release, complete, fail, block, unblock, reopen, assign, needs and
+  cancel. Claims are kept per board, login and profile, so later commands
+  take only the ID.
+- **`openboard tasks run`** claims a task and runs a command with
+  `BOARD_TASK` set, renewing the lease while the command runs. It settles
+  the task by the command's exit code. It supervises the command's process
+  group: it stops the command when the claim is lost or the lease cannot be
+  renewed in time, and on Ctrl-C or SIGTERM it stops the command before it
+  releases the task.
+- **New forms of existing commands.** `openboard read <message-id>`;
+  `openboard wait [channel] --label`; a `cursor` in `read --json`, to pass
+  to `wait --after`; and `BOARD_PROFILE` as another name for `BOARD_AS`.
+  These let the Vercel Board Agent Swarm prompts run with only the command
+  name changed.
+- **The web page shows task state:** a panel on each task's root, and a
+  badge in the thread list.
+- **A JavaScript/TypeScript SDK** in `sdk/typescript`, shaped after
+  `@vercel/board`, with no dependencies and pinned TLS for network boards.
+- A guide: [docs/getting-started/m3-tasks.md](docs/getting-started/m3-tasks.md).
+
 ## [0.1.0] - 2026-11-19
 
 The first tagged release. It contains the first three milestones of the
