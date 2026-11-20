@@ -466,10 +466,11 @@ fn version_reports_this_cli_and_the_board_and_never_fails_on_a_missing_board() {
         )
     );
     assert!(
-        lines
-            .next()
-            .unwrap()
-            .starts_with(&format!("board at {}: Openboard 0.1.0", board.url())),
+        lines.next().unwrap().starts_with(&format!(
+            "board at {}: Openboard {}",
+            board.url(),
+            env!("CARGO_PKG_VERSION")
+        )),
         "{human:?}"
     );
 

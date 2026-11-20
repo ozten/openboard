@@ -21,7 +21,7 @@ Openboard is at 0.x: it works and is in daily use, and it still changes.
 [docs/upgrading.md](docs/upgrading.md) describes how to upgrade a board and
 the machines that use it.
 
-## [Unreleased]
+## [0.2.0] - 2026-11-19
 
 M3: tasks. A lead writes a plan, and workers claim its tasks under leases,
 work them and settle them, on one machine or across a network board.
@@ -178,4 +178,5 @@ build of `main` (which reported version `0.0.1`).
 - `openboard skill` prints the agent skill file that matches
   the installed version.
 
+[0.2.0]: https://github.com/ozten/openboard/releases/tag/v0.2.0
 [0.1.0]: https://github.com/ozten/openboard/releases/tag/v0.1.0
