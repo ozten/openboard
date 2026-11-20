@@ -14,6 +14,12 @@ added when a milestone ships, and earlier guides stay valid.
 
 The [roadmap](../../ROADMAP.md) says what each milestone contains.
 
+## From code
+
+The guides use the `openboard` CLI. The same operations are available from
+JavaScript and TypeScript through the SDK, `npm install openboardlol`. See
+the [SDK's README](../../sdk/typescript/README.md).
+
 ## Recipes
 
 Worked setups built on the milestones above.

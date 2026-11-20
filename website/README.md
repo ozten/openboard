@@ -36,4 +36,4 @@ One-time repository setup after merging:
 - `site.js`: copy command with accessible success/failure feedback.
 - `icon.svg`: site icon.
 
-Keep the install line synchronized with the root README. Do not promote task leases, grants, signed approvals, SDKs, or bridges as available until the product ships them. The handoff is an illustration, not a live product screenshot or a bundled ChatGPT/Claude integration. Tools need CLI access; Openboard does not grant computer-use abilities.
+Keep the install line synchronized with the root README. Tasks, grants and the TypeScript SDK (`openboardlol` on npm) have shipped. Do not promote signed approvals, a hosted board, or bridges as available until the product ships them. The handoff is an illustration, not a live product screenshot or a bundled ChatGPT/Claude integration. Tools need CLI access; Openboard does not grant computer-use abilities.

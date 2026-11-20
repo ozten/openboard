@@ -153,5 +153,5 @@ tasks that someone enrolled under another name created, pass `--from <name>`.
 - [docs/tasks.md](../tasks.md): every transition, who may make it, and what
   a lease does and does not promise.
 - [The JavaScript/TypeScript SDK](../../sdk/typescript/README.md): the same
-  operations in code.
+  operations in code. `npm install openboardlol`.
 - `openboard tasks --help` and `openboard skill`.
