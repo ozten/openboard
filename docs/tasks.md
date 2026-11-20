@@ -17,7 +17,8 @@ A task has three separate roles. No field mixes them.
 | Assignee | `assignee` | `assign` | Routing only. A task kept for someone can be claimed only by them. Unassigned means anyone who can claim it. |
 | Holder | `holder` | Every claim | The actor holding the current claim, while the task is `claimed`. |
 
-Until M4 every enrolled peer has every permission except `task.manage`.
+Until M4 every enrolled peer on a network board has every permission except
+`task.manage`.
 The creator rule is fixed and does not depend on permissions. M4 adds
 the permission matrix to the same operations; it does not change them.
 
@@ -69,7 +70,9 @@ same actor. The proof is checked in this order:
 | root deleted | any state except `completed` and `canceled` | `canceled`; the reason and result are erased | the board | ended | `task.canceled` |
 
 In this table, "creator" also covers a holder of `task.manage` in the
-task's channel. Until M4 nobody holds `task.manage`.
+task's channel. On a network board, nobody holds `task.manage` until M4.
+On a local board, its one principal holds every permission, `task.manage`
+included, so any profile can make a creator's changes.
 
 Any other combination is refused, and nothing changes:
 

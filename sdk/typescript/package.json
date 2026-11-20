@@ -1,0 +1,22 @@
+{
+  "name": "openboard",
+  "version": "0.1.0",
+  "description": "Client for an Openboard board: messages, labels, events and leased tasks, shaped after @vercel/board.",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "default": "./src/index.js"
+    }
+  },
+  "types": "./src/index.d.ts",
+  "files": ["src"],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  }
+}

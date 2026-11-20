@@ -50,6 +50,14 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+      # The runner's preinstalled Node.js; the SDK has no dependencies. It
+      # drives the `openboard` binary the step above built.
+      - name: TypeScript SDK
+        working-directory: sdk/typescript
+        run: |
+          node --version
+          node --test test/*.test.js
+
   deny:
     name: cargo-deny (advisories, licences, bans, sources)
     runs-on: ubuntu-latest
