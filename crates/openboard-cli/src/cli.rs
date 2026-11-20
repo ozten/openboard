@@ -317,6 +317,10 @@ Examples:
     /// List the stored logins (never their tokens)
     Logins,
 
+    /// Mint, list and revoke derived tokens for agents you start
+    #[command(subcommand)]
+    Agent(AgentCommand),
+
     /// Start a thread in a channel
     #[command(after_help = "\
 The text comes from the argument, or from stdin when the argument is `-` or
@@ -1235,6 +1239,54 @@ safe beside one). Exits 1 if any board's chain is broken.
 Example:
   openboard admin verify-log --data-dir ./board-data")]
     VerifyLog(VerifyLogArgs),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AgentCommand {
+    /// Mint a token derived from yours, narrowed to a scope on one board
+    #[command(after_help = "\
+The token works on the board given by --board (default general) only. Its
+access is your grants intersected with the --can entries, at every request,
+so it can never do more than you, nor more than its scope. It cannot change
+grants or create boards or private channels. It expires after --ttl (default
+8h), and never after your own token; revoking yours ends it too.
+
+With --as the token is bound to that profile: whatever runs with it writes as
+that profile.
+
+Without --json it prints shell lines that hand the token to an agent:
+  eval \"$(openboard agent token --can 'build/=read,post,react,label,task.claim')\"
+
+A worker's usual scope is read,post,react,label,task.claim in one subtree; a
+lead also gets task.create.
+
+Examples:
+  openboard agent token --as fx --can 'build/=read,post,label,task.claim' --ttl 2h
+  openboard agent token --can 'build/=read,post,task' --can 'docs/=read'")]
+    Token(AgentTokenArgs),
+
+    /// List the derived tokens you can revoke (never their secrets)
+    Tokens,
+
+    /// Revoke a derived token by its credential ID, and every token made from it
+    Revoke(AgentRevokeArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct AgentTokenArgs {
+    /// A `pattern=verbs` entry, such as build/=read,post; repeat for more
+    #[arg(long = "can", value_name = "PATTERN=VERBS", required = true)]
+    pub can: Vec<String>,
+    /// How long the token lasts, such as 2h or 7d [default: 8h]
+    #[arg(long, value_name = "DURATION", value_parser = parse_positive_duration)]
+    pub ttl: Option<Duration>,
+}
+
+#[derive(Debug, Args)]
+pub struct AgentRevokeArgs {
+    /// The token's credential ID, as `openboard agent tokens` prints it
+    #[arg(value_name = "CREDENTIAL_ID")]
+    pub id: String,
 }
 
 #[derive(Debug, Args)]

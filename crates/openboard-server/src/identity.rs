@@ -72,6 +72,8 @@ pub mod log_kinds {
     pub const WEB_LOGIN_SUCCEEDED: &str = "web.login.succeeded";
     pub const WEB_LOGIN_FAILED: &str = "web.login.failed";
     pub const CREDENTIAL_REVOKED: &str = "credential.revoked";
+    /// A derived token was minted. The detail holds its board and scope.
+    pub const TOKEN_DERIVED: &str = "token.derived";
     pub const LOGOUT: &str = "logout";
     pub const AUTH_FAILED: &str = "auth.failed";
     /// A client address or a credential ran into a rate limit. Written once
@@ -317,9 +319,22 @@ pub(crate) struct Credential {
     pub expires_ms: i64,
     pub revoked_ms: Option<i64>,
     pub last_used_ms: Option<i64>,
+    /// The credential this one was derived from (A9).
+    pub parent_id: Option<String>,
+    /// The profile a derived token is bound to.
+    pub profile: Option<String>,
+    /// The scopes of this credential and every credential above it, as
+    /// (board, `pattern=verbs` entries separated by spaces). Filled in by
+    /// [`authenticate`]; empty from the other lookups.
+    pub scopes: Vec<(String, String)>,
 }
 
 impl Credential {
+    /// Made with `openboard agent token` from another credential.
+    pub(crate) fn derived(&self) -> bool {
+        self.parent_id.is_some()
+    }
+
     pub(crate) fn principal(&self) -> Principal {
         Principal {
             id: self.principal_id.clone(),
@@ -337,6 +352,8 @@ impl Credential {
             expires_at: rfc3339_from_ms(self.expires_ms),
             revoked_at: self.revoked_ms.map(rfc3339_from_ms),
             last_used_at: self.last_used_ms.map(rfc3339_from_ms),
+            parent: self.parent_id.clone(),
+            profile: self.profile.clone(),
         }
     }
 
@@ -351,8 +368,9 @@ pub(crate) fn find_credential_by_hash(
     conn: &Connection,
     token_hash: &str,
 ) -> rusqlite::Result<Option<Credential>> {
+    let columns = credential_columns(conn)?;
     conn.query_row(
-        &format!("SELECT {CREDENTIAL_COLUMNS} FROM {CREDENTIAL_FROM} WHERE c.token_hash = ?1"),
+        &format!("SELECT {columns} FROM {CREDENTIAL_FROM} WHERE c.token_hash = ?1"),
         [token_hash],
         credential_from_row,
     )
@@ -360,7 +378,27 @@ pub(crate) fn find_credential_by_hash(
 }
 
 const CREDENTIAL_COLUMNS: &str = "c.id, c.principal_id, p.handle, p.kind, c.created_ms, \
-                                  c.expires_ms, c.revoked_ms, c.last_used_ms";
+                                  c.expires_ms, c.revoked_ms, c.last_used_ms, c.parent_id, \
+                                  c.profile";
+
+/// The same columns from a database older than schema 5, which the offline
+/// operator tools read without migrating: no credential is derived there.
+const CREDENTIAL_COLUMNS_V4: &str = "c.id, c.principal_id, p.handle, p.kind, c.created_ms, \
+                                     c.expires_ms, c.revoked_ms, c.last_used_ms, NULL, NULL";
+
+/// The credential columns this database has.
+fn credential_columns(conn: &Connection) -> rusqlite::Result<&'static str> {
+    let derived: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('credentials') WHERE name = 'parent_id')",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(if derived {
+        CREDENTIAL_COLUMNS
+    } else {
+        CREDENTIAL_COLUMNS_V4
+    })
+}
 const CREDENTIAL_FROM: &str = "credentials c JOIN principals p ON p.id = c.principal_id";
 
 fn credential_from_row(row: &Row<'_>) -> rusqlite::Result<Credential> {
@@ -373,7 +411,44 @@ fn credential_from_row(row: &Row<'_>) -> rusqlite::Result<Credential> {
         expires_ms: row.get(5)?,
         revoked_ms: row.get(6)?,
         last_used_ms: row.get(7)?,
+        parent_id: row.get(8)?,
+        profile: row.get(9)?,
+        scopes: Vec::new(),
     })
+}
+
+/// The deepest a chain of derived tokens goes.
+pub(crate) const MAX_TOKEN_DEPTH: i64 = 8;
+
+/// A credential and every credential above it, nearest first.
+struct Link {
+    revoked_ms: Option<i64>,
+    expires_ms: i64,
+    board: Option<String>,
+    scope: Option<String>,
+}
+
+fn chain(conn: &Connection, credential_id: &str) -> rusqlite::Result<Vec<Link>> {
+    conn.prepare_cached(
+        "WITH RECURSIVE chain(id, parent_id, revoked_ms, expires_ms, board, scope, depth) AS (
+             SELECT id, parent_id, revoked_ms, expires_ms, board, scope, 0
+               FROM credentials WHERE id = ?1
+             UNION ALL
+             SELECT c.id, c.parent_id, c.revoked_ms, c.expires_ms, c.board, c.scope,
+                    chain.depth + 1
+               FROM credentials c JOIN chain ON c.id = chain.parent_id
+              WHERE chain.depth < ?2)
+         SELECT revoked_ms, expires_ms, board, scope FROM chain ORDER BY depth",
+    )?
+    .query_map(params![credential_id, MAX_TOKEN_DEPTH + 1], |row| {
+        Ok(Link {
+            revoked_ms: row.get(0)?,
+            expires_ms: row.get(1)?,
+            board: row.get(2)?,
+            scope: row.get(3)?,
+        })
+    })?
+    .collect()
 }
 
 /// What a presented token resolved to.
@@ -404,12 +479,23 @@ pub(crate) fn authenticate(
     let Some(credential) = found else {
         return Ok(AuthOutcome::Unknown);
     };
-    if credential.revoked_ms.is_some() {
+    let mut credential = credential;
+    let links = if credential.derived() {
+        chain(conn, &credential.id)?
+    } else {
+        Vec::new()
+    };
+    // A derived token is only as alive as every token above it.
+    if credential.revoked_ms.is_some() || links.iter().any(|link| link.revoked_ms.is_some()) {
         return Ok(AuthOutcome::Revoked(credential));
     }
-    if now_ms >= credential.expires_ms {
+    if now_ms >= credential.expires_ms || links.iter().any(|link| now_ms >= link.expires_ms) {
         return Ok(AuthOutcome::Expired(credential));
     }
+    credential.scopes = links
+        .into_iter()
+        .filter_map(|link| Some((link.board?, link.scope?)))
+        .collect();
     let stale = credential
         .last_used_ms
         .is_none_or(|last| now_ms.saturating_sub(last) >= last_used_interval_ms);
@@ -429,20 +515,121 @@ pub(crate) fn credential_usable(
     credential_id: &str,
     now_ms: i64,
 ) -> rusqlite::Result<bool> {
-    conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM credentials
-                        WHERE id = ?1 AND revoked_ms IS NULL AND expires_ms > ?2)",
-        params![credential_id, now_ms],
-        |row| row.get(0),
+    let links = chain(conn, credential_id)?;
+    Ok(!links.is_empty()
+        && links
+            .iter()
+            .all(|link| link.revoked_ms.is_none() && now_ms < link.expires_ms))
+}
+
+/// The derived tokens `caller` may see and revoke, live ones only: every
+/// token derived from it, and, for a credential that is not itself derived,
+/// every derived token of its principal. With each one's board and scope.
+pub(crate) fn derived_tokens(
+    conn: &Connection,
+    caller: &Credential,
+    now_ms: i64,
+) -> rusqlite::Result<Vec<(Credential, String, String)>> {
+    let sql = format!(
+        "WITH RECURSIVE below(id, depth) AS (
+             SELECT id, 0 FROM credentials WHERE parent_id = ?1
+             UNION ALL
+             SELECT c.id, below.depth + 1 FROM credentials c JOIN below ON c.parent_id = below.id
+              WHERE below.depth < ?4)
+         SELECT {CREDENTIAL_COLUMNS}, c.board, c.scope FROM {CREDENTIAL_FROM}
+          WHERE c.parent_id IS NOT NULL AND c.revoked_ms IS NULL AND c.expires_ms > ?3
+            AND (c.id IN (SELECT id FROM below) OR (?5 AND c.principal_id = ?2))
+          ORDER BY c.created_ms, c.id"
+    );
+    let rows: Vec<(Credential, String, String)> = conn
+        .prepare(&sql)?
+        .query_map(
+            params![
+                caller.id,
+                caller.principal_id,
+                now_ms,
+                MAX_TOKEN_DEPTH + 1,
+                !caller.derived()
+            ],
+            |row| {
+                Ok((
+                    credential_from_row(row)?,
+                    row.get::<_, Option<String>>(10)?.unwrap_or_default(),
+                    row.get::<_, Option<String>>(11)?.unwrap_or_default(),
+                ))
+            },
+        )?
+        .collect::<rusqlite::Result<_>>()?;
+    // Live means every token above is live too.
+    let mut live = Vec::new();
+    for row in rows {
+        if credential_usable(conn, &row.0.id, now_ms)? {
+            live.push(row);
+        }
+    }
+    Ok(live)
+}
+
+/// What a derived token is limited to.
+pub(crate) struct Derivation<'a> {
+    pub board: &'a str,
+    /// `pattern=verbs` entries, already validated.
+    pub scope: &'a [String],
+    pub ttl_ms: i64,
+    pub profile: Option<&'a str>,
+}
+
+/// Mints a token derived from `parent` (A9): the same principal, its own
+/// credential ID, the scope given, and an expiry no later than the
+/// parent's. `None` when the chain would be deeper than
+/// [`MAX_TOKEN_DEPTH`]. The caller runs this inside a write transaction.
+pub(crate) fn derive(
+    conn: &Connection,
+    parent: &Credential,
+    derivation: &Derivation<'_>,
+    now_ms: i64,
+) -> Result<Option<(String, Credential)>, String> {
+    let sql = |error: rusqlite::Error| error.to_string();
+    let depth = chain(conn, &parent.id).map_err(sql)?.len() as i64;
+    if depth >= MAX_TOKEN_DEPTH {
+        return Ok(None);
+    }
+    // Always a bearer token, even from a person's browser session: it is
+    // for handing to an agent.
+    let token = format!("{TOKEN_PREFIX}{}", random_hex(SECRET_BYTES)?);
+    let credential_id = format!("crd_{}", random_hex(8)?);
+    conn.execute(
+        "INSERT INTO credentials (id, principal_id, token_hash, created_ms, expires_ms,
+                                  parent_id, board, scope, profile)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            credential_id,
+            parent.principal_id,
+            sha256_hex(&token),
+            now_ms,
+            now_ms
+                .saturating_add(derivation.ttl_ms)
+                .min(parent.expires_ms),
+            parent.id,
+            derivation.board,
+            derivation.scope.join(" "),
+            derivation.profile.or(parent.profile.as_deref()),
+        ],
     )
+    .map_err(sql)?;
+    let credential = find_credential(conn, &credential_id)
+        .map_err(sql)?
+        .ok_or_else(|| "the new credential vanished".to_owned())?;
+    Ok(Some((token, credential)))
 }
 
 pub(crate) fn find_credential(
     conn: &Connection,
     credential_id: &str,
 ) -> rusqlite::Result<Option<Credential>> {
+    let columns = credential_columns(conn)?;
     conn.query_row(
-        &format!("SELECT {CREDENTIAL_COLUMNS} FROM {CREDENTIAL_FROM} WHERE c.id = ?1"),
+        &format!("SELECT {columns} FROM {CREDENTIAL_FROM} WHERE c.id = ?1"),
         [credential_id],
         credential_from_row,
     )
@@ -450,8 +637,9 @@ pub(crate) fn find_credential(
 }
 
 pub(crate) fn list_credentials(conn: &Connection) -> rusqlite::Result<Vec<Credential>> {
+    let columns = credential_columns(conn)?;
     conn.prepare(&format!(
-        "SELECT {CREDENTIAL_COLUMNS} FROM {CREDENTIAL_FROM} ORDER BY c.created_ms, c.id"
+        "SELECT {columns} FROM {CREDENTIAL_FROM} ORDER BY c.created_ms, c.id"
     ))?
     .query_map([], credential_from_row)?
     .collect()

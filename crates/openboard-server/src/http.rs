@@ -32,7 +32,7 @@ use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode}
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, patch, post, put};
+use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use openboard_api::auth::{JoinRequest, JoinResponse, WhoAmI};
 use openboard_api::web::{session_cookie_name, LoginRequest, Session, CSRF_HEADER};
@@ -71,6 +71,7 @@ use crate::Mode;
 mod access;
 mod grants_routes;
 mod tasks;
+mod tokens_routes;
 
 /// Longest idempotency key, in bytes.
 const MAX_IDEMPOTENCY_KEY_LEN: usize = 255;
@@ -244,6 +245,11 @@ pub(crate) fn router(parts: Parts) -> (Router, Maintenance) {
         .route(SESSION_PATH, get(web_session))
         .route("/v1/whoami", get(whoami))
         .route("/v1/logout", post(logout))
+        .route(
+            openboard_api::tokens::TOKENS_PATH,
+            get(tokens_routes::list).post(tokens_routes::mint),
+        )
+        .route("/v1/tokens/{token_id}", delete(tokens_routes::revoke))
         .route(pages::INDEX_PATH, get(page))
         .route(pages::JOIN_PATH, get(page))
         .route("/assets/{file}", get(asset))
@@ -1211,7 +1217,34 @@ impl AppState {
                 id: caller.principal.id.clone(),
                 kind: caller.principal.kind,
             };
-            caller.authority = Some(Arc::new(access::Authority::new(snapshot, subject)));
+            let mut authority = access::Authority::new(snapshot, subject);
+            if let Some(credential) = &identity.credential {
+                authority.derived = credential.derived();
+                for (board, scope) in &credential.scopes {
+                    let entries = scope
+                        .split_whitespace()
+                        .map(|entry| grants::Ceiling::parse_entry(entry, names::validate_channel))
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|error| AppError::internal(&error))?;
+                    authority
+                        .ceilings
+                        .push((board.clone(), grants::Ceiling { entries }));
+                }
+                // A token bound to a profile writes as it.
+                if let Some(bound) = &credential.profile {
+                    match &caller.profile {
+                        Some(declared) if declared != bound => {
+                            return Err(AppError::new(
+                                codes::INVALID_PROFILE,
+                                format!("this token is bound to the profile {bound}"),
+                            )
+                            .next(format!("drop the {PROFILE_HEADER} header or send {bound}")));
+                        }
+                        _ => caller.profile = Some(bound.clone()),
+                    }
+                }
+            }
+            caller.authority = Some(Arc::new(authority));
         }
         Ok(caller)
     }

@@ -857,6 +857,81 @@ impl Store {
         Ok(redeemed)
     }
 
+    /// Mints a token derived from `parent`, logged in the same transaction.
+    /// `None` when the chain of derived tokens is already as deep as allowed.
+    pub(crate) fn derive_token(
+        &self,
+        parent: &Credential,
+        derivation: &identity::Derivation<'_>,
+        client: Option<IpAddr>,
+    ) -> Result<Option<(String, Credential)>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let minted =
+            identity::derive(&tx, parent, derivation, now_ms()).map_err(StoreError::Other)?;
+        if let Some((_, credential)) = &minted {
+            let detail = format!(
+                "from {} on {}: {}",
+                parent.id,
+                derivation.board,
+                derivation.scope.join(" ")
+            );
+            identity::log(
+                &tx,
+                &LogEntry {
+                    kind: log_kinds::TOKEN_DERIVED,
+                    principal: Some(&credential.handle),
+                    credential_id: Some(&credential.id),
+                    client,
+                    detail: Some(&detail),
+                },
+            )?;
+        }
+        tx.commit()?;
+        Ok(minted)
+    }
+
+    /// The live derived tokens `caller` may revoke, with board and scope.
+    pub(crate) fn derived_tokens(
+        &self,
+        caller: &Credential,
+    ) -> Result<Vec<(Credential, String, String)>> {
+        Ok(identity::derived_tokens(&self.conn(), caller, now_ms())?)
+    }
+
+    /// Revokes a derived token `caller` may revoke (see
+    /// [`Store::derived_tokens`]), which ends every token below it too.
+    /// `None` when there is no such token for this caller.
+    pub(crate) fn revoke_token(
+        &self,
+        caller: &Credential,
+        id: &str,
+        client: Option<IpAddr>,
+    ) -> Result<Option<(Credential, String, String)>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = now_ms();
+        let Some(found) = identity::derived_tokens(&tx, caller, now)?
+            .into_iter()
+            .find(|(credential, _, _)| credential.id == id)
+        else {
+            return Ok(None);
+        };
+        identity::revoke_credential(&tx, id, now)?;
+        identity::log(
+            &tx,
+            &LogEntry {
+                kind: log_kinds::CREDENTIAL_REVOKED,
+                principal: Some(&found.0.handle),
+                credential_id: Some(id),
+                client,
+                detail: Some(&format!("derived token, by {}", caller.id)),
+            },
+        )?;
+        tx.commit()?;
+        Ok(Some(found))
+    }
+
     /// Revokes the caller's own credential: a token, or a browser session,
     /// for which `detail` says so in the security log.
     pub(crate) fn logout(

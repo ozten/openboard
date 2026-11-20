@@ -683,6 +683,39 @@ impl Client {
             .map_err(|failure| self.needs(TASKS, failure))
     }
 
+    /// `POST /v1/tokens`.
+    pub async fn mint_token(
+        &self,
+        request: &openboard_api::tokens::NewToken,
+    ) -> Result<openboard_api::tokens::TokenMinted, Failure> {
+        let url = self.root(&["tokens"]);
+        let http = self.request(Method::POST, url, Some(REQUEST_TIMEOUT));
+        self.json(Self::with_json(http, request)?)
+            .await
+            .map_err(|failure| self.needs(GRANTS, failure))
+    }
+
+    /// `GET /v1/tokens`.
+    pub async fn tokens(&self) -> Result<openboard_api::tokens::TokenList, Failure> {
+        let url = self.root(&["tokens"]);
+        let http = self.request(Method::GET, url, Some(REQUEST_TIMEOUT));
+        self.json(http)
+            .await
+            .map_err(|failure| self.needs(GRANTS, failure))
+    }
+
+    /// `DELETE /v1/tokens/{id}`.
+    pub async fn revoke_token(
+        &self,
+        id: &str,
+    ) -> Result<openboard_api::tokens::TokenInfo, Failure> {
+        let url = self.root(&["tokens", id]);
+        let http = self.request(Method::DELETE, url, Some(REQUEST_TIMEOUT));
+        self.json(http)
+            .await
+            .map_err(|failure| self.needs(GRANTS, failure))
+    }
+
     /// `GET /grants`.
     pub async fn grants(&self) -> Result<openboard_api::grants::GrantList, Failure> {
         let http = self.request(

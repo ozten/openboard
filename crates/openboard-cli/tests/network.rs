@@ -3143,3 +3143,68 @@ fn a_lead_narrows_a_worker_to_a_subtree_from_the_cli() {
     run(lead.cli().args(["ungrant", id])).ok();
     run(worker.cli().args(["--json", "post", "build/api", "gone"])).error(1, "forbidden");
 }
+
+#[test]
+fn a_lead_starts_a_worker_with_a_derived_token_in_its_environment() {
+    let board = NetBoard::start_with(|config| config.open = false);
+    let lead = board.enrol("lead");
+    run(openboard()
+        .args(["admin", "grant", "*", "lead", "all", "--data-dir"])
+        .arg(board.data_dir()))
+    .ok();
+    lead.post("build/api", "work here");
+    lead.post("docs", "not for workers");
+
+    // The shell lines carry everything a worker needs.
+    let lines = run(lead.cli().args([
+        "agent",
+        "token",
+        "--as",
+        "fx",
+        "--can",
+        "build/=read,post,react,label,task.claim",
+        "--ttl",
+        "2h",
+    ]))
+    .ok()
+    .stdout;
+    let mut env: Vec<(String, String)> = Vec::new();
+    for line in lines.lines() {
+        if let Some(rest) = line.strip_prefix("export ") {
+            let (name, value) = rest.split_once('=').unwrap();
+            env.push((name.to_owned(), value.trim_matches('\'').to_owned()));
+        }
+    }
+    let names: Vec<&str> = env.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "BOARD_URL",
+            "BOARD_FINGERPRINT",
+            "BOARD_TOKEN",
+            "BOARD_NAME",
+            "BOARD_AS"
+        ]
+    );
+    let worker = || {
+        let mut command = openboard();
+        command.envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        command
+    };
+    let posted: Value = run(worker().args(["--json", "post", "build/api", "on it"]))
+        .ok()
+        .json();
+    assert_eq!(posted["message"]["by"]["profile"], "fx");
+    run(worker().args(["--json", "post", "docs", "sneaky"])).error(1, "forbidden");
+    run(worker().args(["--json", "grant", "build/", "lead", "read"])).error(1, "no_authority");
+
+    let listed: Value = run(lead.cli().args(["--json", "agent", "tokens"]))
+        .ok()
+        .json();
+    let id = listed["tokens"][0]["credential"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    run(lead.cli().args(["agent", "revoke", &id])).ok();
+    run(worker().args(["--json", "post", "build/api", "gone"])).error(1, "unauthenticated");
+}

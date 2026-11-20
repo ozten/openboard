@@ -654,3 +654,187 @@ async fn an_open_board_admits_everyone_and_its_creators_own_their_boards() {
     )
     .await;
 }
+
+// ---------------------------------------------------------------------------
+// Derived tokens (A9, A10)
+// ---------------------------------------------------------------------------
+
+impl Board {
+    async fn mint(&self, token: &str, body: Value) -> Response {
+        self.post_json(token, "/v1/tokens", body)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    async fn minted(&self, token: &str, can: &[&str]) -> openboard_api::tokens::TokenMinted {
+        let response = self
+            .mint(token, json!({ "board": "general", "can": can }))
+            .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        response.json().await.unwrap()
+    }
+}
+
+#[tokio::test]
+async fn a_derived_token_only_narrows_and_dies_with_its_parent() {
+    let board = Board::closed().await;
+    let lead = board.enrol("lead").await;
+    board.grant("*", "lead", "all");
+    board.posted(&lead, "docs", "not for the worker").await;
+    board.posted(&lead, "build/api", "work here").await;
+
+    let worker = board
+        .minted(&lead, &["build/=read,post,react,label,task.claim"])
+        .await;
+    assert_eq!(worker.info.can, ["build/=read,post,react,label,task.claim"]);
+    assert!(worker.info.credential.parent.is_some());
+    let token = worker.token.clone();
+
+    board.posted(&token, "build/api", "within scope").await;
+    error_of(
+        board.post(&token, "docs", "outside").await,
+        StatusCode::FORBIDDEN,
+        codes::FORBIDDEN,
+    )
+    .await;
+    assert_eq!(board.channels_seen(&token).await, ["build/api"]);
+    // It holds what the lead holds there, no more: no task.create.
+    let created = board
+        .post_json(
+            &token,
+            "/v1/boards/general/tasks",
+            json!({ "channel": "build/api", "text": "a task" }),
+        )
+        .send()
+        .await
+        .unwrap();
+    error_of(created, StatusCode::FORBIDDEN, codes::FORBIDDEN).await;
+    // A derived token cannot change grants, even with grant.manage in scope.
+    let wide = board.minted(&lead, &["*=all"]).await;
+    error_of(
+        board.add_grant(&wide.token, "build/", "lead", "read").await,
+        StatusCode::FORBIDDEN,
+        codes::NO_AUTHORITY,
+    )
+    .await;
+    // Nor create a board or a private channel.
+    let other = board
+        .post_json(
+            &wide.token,
+            "/v1/boards/general/channels",
+            json!({ "path": "secret", "private": true }),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(other.status(), StatusCode::FORBIDDEN);
+    // A token for general is nothing on another board.
+    operator::grant(&board.data_dir(), "other", "*", "lead", "all", None).unwrap();
+    let elsewhere = board
+        .get(&wide.token, "/v1/boards/other/threads?channel=notes")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(elsewhere.status(), StatusCode::FORBIDDEN);
+
+    // Minting from a derived token: the child is still within the parent.
+    let grandchild = board.minted(&token, &["*=read,post"]).await;
+    error_of(
+        board.post(&grandchild.token, "docs", "still outside").await,
+        StatusCode::FORBIDDEN,
+        codes::FORBIDDEN,
+    )
+    .await;
+    board
+        .posted(&grandchild.token, "build/api", "inside both")
+        .await;
+
+    // The lead lists and revokes; everything below goes with it.
+    let listed: openboard_api::tokens::TokenList = board
+        .get(&lead, "/v1/tokens")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed.tokens.len(), 3);
+    let mine: openboard_api::tokens::TokenList = board
+        .get(&token, "/v1/tokens")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        mine.tokens.len(),
+        1,
+        "a derived token sees only its own children"
+    );
+    let revoked = board
+        .http
+        .delete(board.at(&format!("/v1/tokens/{}", worker.info.credential.id)))
+        .bearer_auth(&lead)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(revoked.status(), StatusCode::OK);
+    for dead in [&token, &grandchild.token] {
+        let response = board.get(dead, "/v1/whoami").send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+    board.posted(&lead, "docs", "the parent lives on").await;
+    board
+        .posted(&wide.token, "docs", "and its other child")
+        .await;
+}
+
+#[tokio::test]
+async fn a_derived_token_cannot_outlive_its_parent_and_binds_its_profile() {
+    let board = Board::closed().await;
+    let lead = board.enrol("lead").await;
+    board.grant("*", "lead", "all");
+    let short = board
+        .mint(
+            &lead,
+            json!({ "board": "general", "can": ["*=all"], "ttl_secs": 60 }),
+        )
+        .await;
+    let short: openboard_api::tokens::TokenMinted = short.json().await.unwrap();
+    let child = board
+        .mint(
+            &short.token,
+            json!({ "board": "general", "can": ["*=all"], "ttl_secs": 86_400, "profile": "fx" }),
+        )
+        .await;
+    assert_eq!(child.status(), StatusCode::CREATED);
+    let child: openboard_api::tokens::TokenMinted = child.json().await.unwrap();
+    assert!(child.info.credential.expires_at <= short.info.credential.expires_at);
+    assert_eq!(child.info.credential.profile.as_deref(), Some("fx"));
+
+    let posted = board.posted(&child.token, "notes", "as fx").await;
+    assert_eq!(posted.message.by.profile.as_deref(), Some("fx"));
+    let other = board
+        .post_json(
+            &child.token,
+            "/v1/boards/general/messages",
+            json!({ "channel": "notes", "text": "as ops" }),
+        )
+        .header(openboard_api::PROFILE_HEADER, "ops")
+        .send()
+        .await
+        .unwrap();
+    error_of(other, StatusCode::BAD_REQUEST, codes::INVALID_PROFILE).await;
+
+    for bad in [
+        json!({ "board": "general", "can": [] }),
+        json!({ "board": "general", "can": ["build/"] }),
+        json!({ "board": "general", "can": ["build/=fly"] }),
+        json!({ "board": "general", "can": ["*=read"], "ttl_secs": 0 }),
+    ] {
+        let response = board.mint(&lead, bad.clone()).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{bad}");
+    }
+}

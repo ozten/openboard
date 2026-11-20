@@ -28,6 +28,11 @@ CREATE TABLE grants (
     removed_ms  INTEGER
 );
 CREATE INDEX grants_by_board ON grants(board_id) WHERE removed_ms IS NULL;
+ALTER TABLE credentials ADD COLUMN parent_id TEXT REFERENCES credentials(id);
+ALTER TABLE credentials ADD COLUMN board TEXT;
+ALTER TABLE credentials ADD COLUMN scope TEXT;
+ALTER TABLE credentials ADD COLUMN profile TEXT;
+CREATE INDEX credentials_by_parent ON credentials(parent_id) WHERE parent_id IS NOT NULL;
 ";
 
 /// The `meta` key of the instance's access mode.

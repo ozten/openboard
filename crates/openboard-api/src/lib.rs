@@ -89,6 +89,7 @@ pub mod auth;
 pub mod build;
 pub mod grants;
 pub mod tasks;
+pub mod tokens;
 pub mod web;
 
 use std::collections::BTreeMap;
@@ -245,6 +246,9 @@ pub mod codes {
     /// The caller holds no grant with `grant.manage` that reaches the
     /// pattern, or not every verb it tried to give (M4).
     pub const NO_AUTHORITY: &str = "no_authority";
+    /// A derived token cannot do this (A10): change grants, create private
+    /// channels or boards, or mint a token deeper than the limit.
+    pub const DERIVED_TOKEN: &str = "derived_token";
     /// The channel, or a channel under it, exists, or a grant already
     /// reaches it, so it cannot be created as asked.
     pub const CHANNEL_EXISTS: &str = "channel_exists";

@@ -133,3 +133,100 @@ pub async fn create_channel(ctx: &Ctx<'_>, args: &ChannelCreateArgs) -> Result<(
         }
     })
 }
+
+/// `openboard agent token`, `tokens` and `revoke`.
+pub async fn agent(ctx: &Ctx<'_>, command: &crate::cli::AgentCommand) -> Result<(), Failure> {
+    use crate::cli::AgentCommand;
+    use openboard_api::tokens::{NewToken, TokenInfo};
+
+    fn describe(info: &TokenInfo) -> String {
+        let credential = &info.credential;
+        let mut line = format!(
+            "{}  {}  {}  until {}",
+            render::safe(&credential.id),
+            render::safe(&info.board),
+            render::safe(&info.can.join(" ")),
+            render::safe(&credential.expires_at)
+        );
+        if let Some(profile) = &credential.profile {
+            line.push_str(&format!("  as {}", render::safe(profile)));
+        }
+        line
+    }
+
+    match command {
+        AgentCommand::Token(args) => {
+            if !ctx.target.is_network() {
+                return Err(Failure::usage(
+                    "a local board has no tokens: every agent on it can already do everything",
+                )
+                .next("derived tokens are for network boards"));
+            }
+            let board = ctx.global.board().to_owned();
+            let minted = ctx
+                .client
+                .mint_token(&NewToken {
+                    board: board.clone(),
+                    can: args.can.clone(),
+                    ttl_secs: args.ttl.map(|ttl| ttl.as_secs().max(1)),
+                    profile: ctx.global.profile.clone().filter(|p| !p.is_empty()),
+                })
+                .await?;
+            #[derive(serde::Serialize)]
+            struct Out<'a> {
+                #[serde(flatten)]
+                minted: &'a openboard_api::tokens::TokenMinted,
+                url: &'a str,
+                fingerprint: Option<&'a str>,
+            }
+            let out = Out {
+                minted: &minted,
+                url: &ctx.target.url,
+                fingerprint: ctx.target.fingerprint.as_deref(),
+            };
+            ctx.print(&out, || {
+                let mut lines = vec![
+                    format!("# derived token {}", describe(&minted.info)),
+                    format!("export BOARD_URL={}", crate::shell_quote(&ctx.target.url)),
+                    format!(
+                        "export BOARD_FINGERPRINT={}",
+                        crate::shell_quote(ctx.target.fingerprint.as_deref().unwrap_or_default())
+                    ),
+                    format!("export BOARD_TOKEN={}", crate::shell_quote(&minted.token)),
+                    format!("export BOARD_NAME={}", crate::shell_quote(&board)),
+                ];
+                match &minted.info.credential.profile {
+                    Some(profile) => {
+                        lines.push(format!("export BOARD_AS={}", crate::shell_quote(profile)))
+                    }
+                    None => lines.push("unset BOARD_AS".to_owned()),
+                }
+                lines.push("unset BOARD_LOGIN".to_owned());
+                lines.join("\n")
+            })
+        }
+        AgentCommand::Tokens => {
+            let list = ctx.client.tokens().await?;
+            ctx.print(&list, || {
+                if list.tokens.is_empty() {
+                    "no live derived tokens".to_owned()
+                } else {
+                    list.tokens
+                        .iter()
+                        .map(describe)
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                }
+            })
+        }
+        AgentCommand::Revoke(args) => {
+            let revoked = ctx.client.revoke_token(&args.id).await?;
+            ctx.print(&revoked, || {
+                format!(
+                    "revoked {} and every token made from it",
+                    render::safe(&revoked.credential.id)
+                )
+            })
+        }
+    }
+}

@@ -543,6 +543,7 @@ async fn dispatch(
             Command::Tail(args) => tail(&ctx, args).await,
             Command::Whoami => session::whoami(&ctx).await,
             Command::Logout(_) => session::logout(&ctx).await,
+            Command::Agent(command) => grants::agent(&ctx, command).await,
             Command::Tasks(args) => tasks::run(&ctx, args, task_input).await,
             Command::Serve(_)
             | Command::Admin(_)

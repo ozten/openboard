@@ -188,6 +188,12 @@ pub struct CredentialInfo {
     pub revoked_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_used_at: Option<String>,
+    /// The credential this one was derived from, for a derived token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// The profile a derived token is bound to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
 /// Response of `GET /v1/whoami`.
