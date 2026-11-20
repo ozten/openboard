@@ -356,7 +356,9 @@ fn a_tail_survives_a_restart_of_the_board() {
     let board = Board::start();
     let mut tail = board
         .cli(None)
-        .args(["--json", "tail", "--channel", "work"])
+        // From the start: a post that lands before the tail has fixed its
+        // starting cursor is still seen.
+        .args(["--json", "tail", "--channel", "work", "--from-start"])
         .spawn()
         .unwrap();
     let stdout = tail.stdout.take().unwrap();

@@ -1,5 +1,5 @@
 //! End-to-end tests of tasks on a local board: the state machine, claims
-//! and fencing, leases, dependencies, batches, ready claims, ownership,
+//! and fencing, leases, dependencies, batches, ready claims, creatorship,
 //! the events and labels that mirror task state, and the concurrency gate
 //! (T2): many competing claims on one task. A real server on port 0,
 //! exercised over HTTP.
@@ -179,7 +179,7 @@ async fn a_task_moves_from_ready_through_claimed_to_completed() {
     assert_eq!(task.labels[TASK_LABEL], "ready");
     assert_eq!(task.labels["role"], "worker");
     let info = task.task.as_ref().unwrap();
-    assert_eq!(info.owner.handle, "local/lead");
+    assert_eq!(info.creator.handle, "local/lead");
     assert_eq!(info.epoch, 0);
     assert!(info.holder.is_none());
 
@@ -203,7 +203,7 @@ async fn a_task_moves_from_ready_through_claimed_to_completed() {
     );
     // The trust summary says who wrote the brief.
     assert_eq!(claim.trust.brief_by.handle, "local/lead");
-    assert_eq!(claim.trust.owner.handle, "local/lead");
+    assert_eq!(claim.trust.creator.handle, "local/lead");
     assert!(!claim.trust.brief_edited);
     assert!(!claim.trust.bridged);
 
@@ -393,6 +393,43 @@ async fn an_expired_lease_returns_the_task_to_the_queue() {
     expect_error(late, StatusCode::CONFLICT, codes::CLAIM_LOST).await;
     let next = board.claim("worker-2", &task.id).await;
     assert_eq!(next.epoch, 2);
+
+    // The paused worker resumes after the task went to another: every call
+    // it makes with its old claim is refused, and the new claim stands.
+    for action in ["renew", "release", "complete", "fail", "block"] {
+        let resumed = board
+            .act(
+                "worker-1",
+                &task.id,
+                action,
+                json!({"epoch": claim.epoch, "token": claim.token, "reason": "late"}),
+            )
+            .await;
+        expect_error(resumed, StatusCode::CONFLICT, codes::CLAIM_LOST).await;
+    }
+    let shown = board.show(&task.id).await.task;
+    assert_eq!(state(&shown), "claimed");
+    assert_eq!(
+        shown.task.as_ref().unwrap().holder.as_ref().unwrap().handle,
+        "local/worker-2"
+    );
+
+    // Canceled under a running worker: the worker's next call learns the
+    // claim is gone, and its completion does not land.
+    let canceled = board
+        .act("lead", &task.id, "cancel", json!({"reason": "not needed"}))
+        .await;
+    assert_eq!(canceled.status(), StatusCode::OK);
+    let late = board
+        .act(
+            "worker-2",
+            &task.id,
+            "complete",
+            json!({"epoch": next.epoch, "token": next.token}),
+        )
+        .await;
+    expect_error(late, StatusCode::CONFLICT, codes::CLAIM_LOST).await;
+    assert_eq!(state(&board.show(&task.id).await.task), "canceled");
     board.stop().await;
 }
 
@@ -620,7 +657,7 @@ async fn a_ready_claim_takes_the_oldest_task_kept_for_the_caller_first() {
 }
 
 #[tokio::test]
-async fn blocking_waits_for_the_owner_and_editing_the_brief_ends_a_claim() {
+async fn blocking_waits_for_the_creator_and_editing_the_brief_ends_a_claim() {
     let board = Board::start().await;
     let task = board
         .task("lead", json!({"channel": "build", "text": "decide"}))
@@ -664,7 +701,7 @@ async fn blocking_waits_for_the_owner_and_editing_the_brief_ends_a_claim() {
     let again = board.act("lead", &task.id, "unblock", json!({})).await;
     expect_error(again, StatusCode::CONFLICT, codes::TASK_STATE).await;
 
-    // The owner edits the brief while it is claimed: the claim ends.
+    // The creator edits the brief while it is claimed: the claim ends.
     let claim = board.claim("worker-1", &task.id).await;
     let edited = board
         .send(
@@ -730,7 +767,7 @@ async fn a_thread_becomes_a_task_and_retries_create_it_once() {
     assert_eq!(made.task.id, root.message.id);
     let view = board.show(&root.message.id).await;
     assert_eq!(view.trust.brief_by.handle, "local/ada");
-    assert_eq!(view.trust.owner.handle, "local/lead");
+    assert_eq!(view.trust.creator.handle, "local/lead");
     let twice = board
         .post(
             "/tasks",
@@ -740,7 +777,7 @@ async fn a_thread_becomes_a_task_and_retries_create_it_once() {
         .await;
     expect_error(twice, StatusCode::CONFLICT, codes::TASK_EXISTS).await;
 
-    // Someone other than the owner edits the brief: the task is held.
+    // Someone other than the creator edits the brief: the task is held.
     let edited = board
         .send(
             Method::PATCH,
@@ -876,7 +913,7 @@ impl Policy for NoManage {
 }
 
 #[tokio::test]
-async fn only_the_owner_changes_a_task() {
+async fn only_the_creator_changes_a_task() {
     let board = Board::start_with(Some(Arc::new(NoManage))).await;
     let task = board
         .task("lead", json!({"channel": "build", "text": "mine"}))
@@ -888,9 +925,9 @@ async fn only_the_owner_changes_a_task() {
         ("needs", json!({"needs": []})),
     ] {
         let refused = board.act("worker-1", &task.id, action, body).await;
-        expect_error(refused, StatusCode::FORBIDDEN, codes::TASK_NOT_OWNED).await;
+        expect_error(refused, StatusCode::FORBIDDEN, codes::NOT_TASK_CREATOR).await;
     }
-    // Without a profile, the principal owns what its profiles created.
+    // Without a profile, the principal counts as the creator of what its profiles created.
     let assigned = board
         .post(
             &format!("/tasks/{}/assign", task.id),

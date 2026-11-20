@@ -392,7 +392,7 @@ impl AppError {
             codes::FORBIDDEN
             | codes::INVITE_INVALID
             | codes::CSRF_FAILED
-            | codes::TASK_NOT_OWNED => StatusCode::FORBIDDEN,
+            | codes::NOT_TASK_CREATOR => StatusCode::FORBIDDEN,
             codes::UNAUTHENTICATED => StatusCode::UNAUTHORIZED,
             codes::RATE_LIMITED => StatusCode::TOO_MANY_REQUESTS,
             codes::IDEMPOTENCY_CONFLICT

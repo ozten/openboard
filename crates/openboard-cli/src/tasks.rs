@@ -286,7 +286,7 @@ pub async fn run(ctx: &Ctx<'_>, args: &TasksArgs, input: CreateInput) -> Result<
         }
         Some(TasksCommand::Block(a)) => {
             let task = id(&a.id)?;
-            // A worker blocks the task it holds; an owner blocks one nobody
+            // A worker blocks the task it holds; a creator blocks one nobody
             // holds, without a claim.
             match ctx.held(&task) {
                 Ok(_) => {
@@ -678,7 +678,9 @@ async fn claim_ready(
                         render::safe(&channel)
                     ),
                 )
-                .next("add --wait 10m to wait for one; tasks owned by others need --from <owner>"),
+                .next(
+                    "add --wait 10m to wait for one; tasks created by others need --from <creator>",
+                ),
                 Some(_) => Failure::new(
                     codes::TIMEOUT,
                     format!(
@@ -776,6 +778,11 @@ pub async fn run_command(
         }
         None => claim_ready(ctx, &args.ready, args.lease, Some(&mut signals)).await?,
     };
+    // A ready claim can be granted at any point of its long-poll, but the
+    // answer follows the grant at once; a second covers the trip back.
+    let started_claim = tokio::time::Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .unwrap_or_else(tokio::time::Instant::now);
     ctx.keep_claim(&claim)?;
     let task = claim.task.id.clone();
     let holder = claim
@@ -804,6 +811,9 @@ pub async fn run_command(
         .env("BOARD_URL", &ctx.target.url)
         .env("BOARD_NAME", ctx.global.board())
         .kill_on_drop(true);
+    // Its own process group, so that stopping it stops what it started.
+    #[cfg(unix)]
+    command.process_group(0);
     if let Some(principal) = &ctx.target.principal {
         command.env("BOARD_LOGIN", principal);
     }
@@ -818,7 +828,7 @@ pub async fn run_command(
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            release(ctx, &task, &claim).await;
+            release(ctx, &task, claim.epoch, &claim.token).await;
             let exit = if error.kind() == std::io::ErrorKind::NotFound {
                 127
             } else {
@@ -832,11 +842,16 @@ pub async fn run_command(
             .exit(exit));
         }
     };
+    let child_group = Group(child.id());
 
     let mut epoch_token = (claim.epoch, claim.token.clone());
     let lease = Duration::from_secs(claim.lease_secs.max(3));
     let every = lease / 3;
+    let retry = Duration::from_secs(5).min(every);
     let mut renew_at = tokio::time::Instant::now() + every;
+    // The latest the lease can run to: measured from when the claim or the
+    // last renewal was asked for, which is no later than the board's own.
+    let mut valid_until = started_claim + lease;
     let mut self_settled = false;
     let status = loop {
         tokio::select! {
@@ -848,10 +863,22 @@ pub async fn run_command(
                     lease_secs: Some(claim.lease_secs),
                     ..TaskActionRequest::default()
                 };
-                match ctx.client.task_action::<Claim>(&task, actions::RENEW, &request).await {
+                let asked = tokio::time::Instant::now();
+                // A renewal that cannot finish before the lease ends is as
+                // good as a failed one.
+                let renewal = tokio::time::timeout_at(
+                    valid_until,
+                    ctx.client.task_action::<Claim>(&task, actions::RENEW, &request),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    Err(Failure::new(codes::REQUEST_TIMEOUT, "the renewal got no answer before the lease ended"))
+                });
+                match renewal {
                     Ok(renewed) => {
                         epoch_token = (renewed.epoch, renewed.token.clone());
                         let _ = ctx.keep_claim(&renewed);
+                        valid_until = asked + Duration::from_secs(renewed.lease_secs.max(1));
                         renew_at = tokio::time::Instant::now() + every;
                     }
                     Err(failure) if lost(&failure) => {
@@ -863,33 +890,57 @@ pub async fn run_command(
                             stop_child(&mut child).await;
                             ctx.forget_claim(&task);
                             return Err(failure.next(
-                                "the claim ended while the command ran, so the command was stopped; \
-                                 another worker may hold the task now",
+                                "the claim ended while the command ran (the lease ran out, or the \
+                                 task was canceled, blocked or claimed again), so the command was \
+                                 stopped",
                             ));
                         }
                     }
                     Err(failure) => {
+                        let now = tokio::time::Instant::now();
+                        if now + retry >= valid_until {
+                            // Work past the lease could clash with the next
+                            // worker's: stop before it ends.
+                            stop_child(&mut child).await;
+                            ctx.forget_claim(&task);
+                            return Err(Failure::new(
+                                "lease_unconfirmed",
+                                format!(
+                                    "could not renew the lease of task {} before it ended: {}",
+                                    render::safe(&task),
+                                    render::safe(&failure.message)
+                                ),
+                            )
+                            .next(
+                                "the command was stopped; the task becomes ready again when \
+                                 the lease ends on the board, unless it was settled meanwhile",
+                            ));
+                        }
                         eprintln!(
                             "openboard: could not renew the lease of task {} ({}); trying again",
                             render::safe(&task),
                             render::safe(&failure.message)
                         );
-                        renew_at = tokio::time::Instant::now() + Duration::from_secs(5).min(every);
+                        renew_at = now + retry;
                     }
                 }
             }
             sig = signalled(&mut signals) => {
+                // The command stops before the claim is given back, so no
+                // other worker starts while it still runs.
                 stop_child(&mut child).await;
                 if !self_settled {
-                    release(ctx, &task, &claim).await;
+                    release(ctx, &task, epoch_token.0, &epoch_token.1).await;
                 }
                 return Err(crate::interrupted(sig).next(format!(
-                    "task {} was released for another worker",
+                    "the command was stopped and task {} released for another worker",
                     safe_id(&task)
                 )));
             }
         }
     };
+    // Whatever the command left running in its group stops with it.
+    stop_group(&child_group).await;
 
     let status = status.map_err(|error| {
         Failure::new(
@@ -948,10 +999,10 @@ async fn settled_by(ctx: &Ctx<'_>, task: &str, epoch: u64, holder: &str) -> bool
     }
 }
 
-async fn release(ctx: &Ctx<'_>, task: &str, claim: &Claim) {
+async fn release(ctx: &Ctx<'_>, task: &str, epoch: u64, token: &str) {
     let request = TaskActionRequest {
-        epoch: Some(claim.epoch),
-        token: Some(claim.token.clone()),
+        epoch: Some(epoch),
+        token: Some(token.to_owned()),
         ..TaskActionRequest::default()
     };
     if let Err(failure) = ctx
@@ -970,19 +1021,57 @@ async fn release(ctx: &Ctx<'_>, task: &str, claim: &Claim) {
     ctx.forget_claim(task);
 }
 
-/// Asks the command to stop, then makes it.
-async fn stop_child(child: &mut tokio::process::Child) {
+/// How long a stopped command has to exit before it is killed.
+const STOP_GRACE: Duration = Duration::from_secs(10);
+
+/// The process group of the command, which is its own process ID.
+#[derive(Clone, Copy)]
+struct Group(Option<u32>);
+
+/// Sends `signal` to every process in `group`. Whether any was there.
+#[cfg(unix)]
+fn signal_group(group: u32, signal: &str) -> bool {
+    std::process::Command::new("kill")
+        .args([signal, "--", &format!("-{group}")])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Stops whatever is left in `group`: SIGTERM, then SIGKILL after the
+/// grace period.
+async fn stop_group(group: &Group) {
     #[cfg(unix)]
-    if let Some(pid) = child.id() {
-        let _ = std::process::Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .status();
-        if tokio::time::timeout(Duration::from_secs(10), child.wait())
-            .await
-            .is_ok()
-        {
+    if let Some(group) = group.0 {
+        if !signal_group(group, "-TERM") {
             return;
         }
+        let deadline = tokio::time::Instant::now() + STOP_GRACE;
+        while tokio::time::Instant::now() < deadline {
+            if !signal_group(group, "-0") {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        signal_group(group, "-KILL");
+    }
+    #[cfg(not(unix))]
+    let _ = group;
+}
+
+/// Stops the command and everything in its process group, and waits for
+/// the command to exit: SIGTERM first, SIGKILL after the grace period.
+async fn stop_child(child: &mut tokio::process::Child) {
+    let group = Group(child.id());
+    #[cfg(unix)]
+    if let Some(id) = group.0 {
+        signal_group(id, "-TERM");
+        if tokio::time::timeout(STOP_GRACE, child.wait()).await.is_ok() {
+            stop_group(&group).await;
+            return;
+        }
+        signal_group(id, "-KILL");
     }
     let _ = child.start_kill();
     let _ = child.wait().await;
@@ -1065,7 +1154,7 @@ fn task_line(root: &Message, replies: u64) -> String {
         render::safe(&root.channel)
     );
     if let Some(task) = &root.task {
-        line.push_str(&format!("  by {}", render::safe(&task.owner.handle)));
+        line.push_str(&format!("  by {}", render::safe(&task.creator.handle)));
         if let Some(assignee) = &task.assignee {
             line.push_str(&format!("  for {}", render::safe(assignee)));
         }
@@ -1100,7 +1189,7 @@ fn task_facts(message: &Message) -> Vec<String> {
         return vec!["not a task".to_owned()];
     };
     let mut facts = vec![format!("state: {} (epoch {})", task.state, task.epoch)];
-    facts.push(format!("owner: {}", render::safe(&task.owner.handle)));
+    facts.push(format!("creator: {}", render::safe(&task.creator.handle)));
     if let Some(assignee) = &task.assignee {
         facts.push(format!("kept for: {}", render::safe(assignee)));
     }
@@ -1142,7 +1231,7 @@ fn trust_line(trust: &openboard_api::tasks::Trust) -> String {
         "brief by {} ({:?}), made a task by {}",
         render::safe(&trust.brief_by.handle),
         trust.brief_by.kind,
-        render::safe(&trust.owner.handle)
+        render::safe(&trust.creator.handle)
     )
     .to_lowercase();
     if trust.brief_edited {

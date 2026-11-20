@@ -14,7 +14,7 @@
 //! - `completed`: done, with an optional result.
 //! - `failed`: a worker gave up on it, with a reason. Reopening makes it
 //!   ready again.
-//! - `canceled`: its owner called it off, with a reason.
+//! - `canceled`: its creator called it off, with a reason.
 //!
 //! # Routes
 //!
@@ -49,22 +49,22 @@
 //! is not the holder, or with the wrong token, fails with
 //! [`codes::CLAIM_NOT_HELD`]. There are never two valid claims on one task.
 //!
-//! # Owners
+//! # Creators
 //!
-//! The actor that creates a task owns it: the principal under the profile
-//! it declared. Calling without a profile, a principal owns the tasks any of
-//! its profiles created. Only the owner, or a holder of the task-manage
+//! The actor that creates a task is its creator, which never changes: the principal under the profile
+//! it declared. Calling without a profile, a principal counts as the creator of the tasks any of
+//! its profiles created. Only the creator, or a holder of the task-manage
 //! permission, can block an unclaimed task, unblock, reopen, assign, change
-//! `needs` and cancel; others get [`codes::TASK_NOT_OWNED`].
+//! `needs` and cancel; others get [`codes::NOT_TASK_CREATOR`].
 //!
 //! A ready claim takes only tasks that are assigned to the caller, or that
-//! are unassigned and owned by the caller's principal, unless the caller
-//! names other owners in [`ClaimReadyRequest::from`]. A claim by ID takes
+//! are unassigned and created under the caller's principal, unless the caller
+//! names other creators in [`ClaimReadyRequest::from`]. A claim by ID takes
 //! any ready task that is not assigned to someone else.
 //!
 //! [`codes::CLAIM_LOST`]: crate::codes::CLAIM_LOST
 //! [`codes::CLAIM_NOT_HELD`]: crate::codes::CLAIM_NOT_HELD
-//! [`codes::TASK_NOT_OWNED`]: crate::codes::TASK_NOT_OWNED
+//! [`codes::NOT_TASK_CREATOR`]: crate::codes::NOT_TASK_CREATOR
 
 use std::collections::BTreeMap;
 
@@ -84,7 +84,7 @@ pub const MIN_LEASE_SECS: u64 = 5;
 pub const MAX_TASKS_PER_BATCH: usize = 15;
 /// Most prerequisites one task has.
 pub const MAX_NEEDS_PER_TASK: usize = 32;
-/// Most owners a ready claim names in [`ClaimReadyRequest::from`].
+/// Most creators a ready claim names in [`ClaimReadyRequest::from`].
 pub const MAX_CLAIM_FROM: usize = 32;
 /// Most label conditions on a ready claim.
 pub const MAX_CLAIM_LABELS: usize = 8;
@@ -123,7 +123,7 @@ pub struct Task {
     /// One of [`states`].
     pub state: String,
     /// The actor that created the task.
-    pub owner: Actor,
+    pub creator: Actor,
     /// Who the task is kept for: a handle, `name` or `name/profile`. Only
     /// that principal, under that profile when one is named, can claim it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -166,7 +166,7 @@ pub struct Trust {
     /// Who wrote the brief, the task's root message.
     pub brief_by: Actor,
     /// Who made it a task. Usually the same actor.
-    pub owner: Actor,
+    pub creator: Actor,
     /// True when the brief was edited after it became a task.
     pub brief_edited: bool,
     /// True when any message in the thread came through a bridge. Always
@@ -343,7 +343,7 @@ pub struct ClaimReadyRequest {
     /// `key=value` or `key=a|b`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
-    /// Owners to take tasks from besides the caller's principal: actor IDs,
+    /// Creators to take tasks from besides the caller's principal: actor IDs,
     /// handles of principals (`name`) or of one profile (`name/profile`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub from: Vec<String>,

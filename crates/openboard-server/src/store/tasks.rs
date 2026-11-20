@@ -42,7 +42,7 @@ pub(crate) enum TaskError {
     Finished,
     /// The action needs another state. Holds the state the task is in.
     State(String),
-    NotOwned,
+    NotCreator,
     ClaimLost,
     ClaimNotHeld,
     /// Holds what is wrong, without any message text.
@@ -69,7 +69,7 @@ pub(crate) struct Assignee {
 /// How an assignee was written, before it is resolved against the board.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AssigneeSpec {
-    /// A profile of the owner's principal: `worker-1`.
+    /// A profile of the creator's principal: `worker-1`.
     Profile(String),
     /// A principal by handle, with an optional profile: `@name`,
     /// `@name/profile`, or `name/profile`.
@@ -79,9 +79,9 @@ pub(crate) enum AssigneeSpec {
     },
 }
 
-/// One owner a ready claim may take tasks from.
+/// One creator a ready claim may take tasks from.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum OwnerSel {
+pub(crate) enum CreatorSel {
     Actor(String),
     /// A principal by handle, or one profile of it.
     Handle {
@@ -214,8 +214,8 @@ struct Row {
     id: String,
     channel: String,
     state: String,
-    owner_actor: String,
-    owner_principal: String,
+    creator_actor: String,
+    creator_principal: String,
     assignee_principal: Option<String>,
     assignee_profile: Option<String>,
     epoch: u64,
@@ -224,7 +224,8 @@ struct Row {
     lease_ms: Option<i64>,
 }
 
-const ROW_COLUMNS: &str = "id, channel, state, owner_actor, owner_principal, assignee_principal, \
+const ROW_COLUMNS: &str =
+    "id, channel, state, creator_actor, creator_principal, assignee_principal, \
                            assignee_profile, epoch, lease_token, holder_actor, lease_ms";
 
 fn row(conn: &Connection, board: &BoardRef, id: &str) -> Result<Option<Row>> {
@@ -237,8 +238,8 @@ fn row(conn: &Connection, board: &BoardRef, id: &str) -> Result<Option<Row>> {
                     id: r.get(0)?,
                     channel: r.get(1)?,
                     state: r.get(2)?,
-                    owner_actor: r.get(3)?,
-                    owner_principal: r.get(4)?,
+                    creator_actor: r.get(3)?,
+                    creator_principal: r.get(4)?,
                     assignee_principal: r.get(5)?,
                     assignee_profile: r.get(6)?,
                     epoch: r.get::<_, i64>(7)?.max(0) as u64,
@@ -266,11 +267,11 @@ fn task_of(conn: &Connection, board: &BoardRef, message_id: &str) -> Result<Row>
     row(conn, board, &root)?.ok_or(TaskError::NotATask.into())
 }
 
-/// Whether `by` owns the task: the same actor, or the same principal
+/// Whether `by` is the task's creator: the same actor, or the same principal
 /// calling without a profile.
-fn owns(task: &Row, by: &Writer) -> bool {
-    by.actor.id == task.owner_actor
-        || (by.actor.profile.is_none() && by.principal_id == task.owner_principal)
+fn is_creator(task: &Row, by: &Writer) -> bool {
+    by.actor.id == task.creator_actor
+        || (by.actor.profile.is_none() && by.principal_id == task.creator_principal)
 }
 
 fn may_claim_assigned(task: &Row, by: &Writer) -> bool {
@@ -443,18 +444,18 @@ fn expire_due(conn: &Connection, board: &BoardRef, now: i64) -> Result<Option<i6
 }
 
 fn trust(conn: &Connection, board: &BoardRef, id: &str) -> Result<Trust> {
-    let (brief_by, owner, edited) = conn.query_row(
+    let (brief_by, creator, edited) = conn.query_row(
         "SELECT a.id, a.kind, a.handle, a.profile, o.id, o.kind, o.handle, o.profile,
                 m.revision > t.brief_revision
          FROM tasks t JOIN messages m ON m.id = t.id
-         JOIN actors a ON a.id = m.actor_id JOIN actors o ON o.id = t.owner_actor
+         JOIN actors a ON a.id = m.actor_id JOIN actors o ON o.id = t.creator_actor
          WHERE t.board_id = ?1 AND t.id = ?2",
         params![board.id, id],
         |r| Ok((actor_from_row(r, 0)?, actor_from_row(r, 4)?, r.get(8)?)),
     )?;
     Ok(Trust {
         brief_by,
-        owner,
+        creator,
         brief_edited: edited,
         bridged: false,
     })
@@ -540,14 +541,14 @@ fn principal_handle(conn: &Connection, principal_id: &str, local: bool) -> Resul
 fn resolve_assignee(
     conn: &Connection,
     spec: &AssigneeSpec,
-    owner_principal: &str,
+    creator_principal: &str,
     local: bool,
 ) -> Result<Assignee> {
     match spec {
         AssigneeSpec::Profile(profile) => {
-            let name = principal_handle(conn, owner_principal, local)?;
+            let name = principal_handle(conn, creator_principal, local)?;
             Ok(Assignee {
-                principal_id: owner_principal.to_owned(),
+                principal_id: creator_principal.to_owned(),
                 profile: Some(profile.clone()),
                 handle: format!("{name}/{profile}"),
             })
@@ -670,7 +671,7 @@ fn insert_task(
     upsert_actor(conn, by)?;
     let created_seq = head(conn, board.id)? + 1;
     conn.execute(
-        "INSERT INTO tasks (id, board_id, channel, state, owner_actor, owner_principal,
+        "INSERT INTO tasks (id, board_id, channel, state, creator_actor, creator_principal,
                             assignee_principal, assignee_profile, assignee_handle,
                             changed_actor, changed_at, brief_revision, created_seq)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?5, ?10, ?11, ?12)",
@@ -753,7 +754,7 @@ fn record_key(
 }
 
 /// Called by an edit of a message, in its transaction. When the message is
-/// a task's brief, an edit by anyone but the owner holds the task, and any
+/// a task's brief, an edit by anyone but the creator holds the task, and any
 /// edit ends a claim on it (design S6). Returns the event appended, if any.
 pub(super) fn on_brief_edited(
     conn: &Connection,
@@ -767,14 +768,14 @@ pub(super) fn on_brief_edited(
     if states::is_finished(&task.state) {
         return Ok(None);
     }
-    if !owns(&task, by) {
+    if !is_creator(&task, by) {
         if task.state == states::BLOCKED {
             return Ok(None);
         }
         end_lease(conn, &task.id)?;
         conn.execute(
             "UPDATE tasks SET block_kind = 'brief_edited', reason = 'the brief was edited by \
-             someone other than the task''s owner' WHERE id = ?1",
+             someone other than the task''s creator' WHERE id = ?1",
             [&task.id],
         )?;
         return Ok(Some(change(
@@ -1131,7 +1132,7 @@ impl Store {
     }
 
     /// Claims the oldest ready task in `channel` that the caller may take:
-    /// one kept for it first, then an unassigned one from an owner it
+    /// one kept for it first, then an unassigned one from a creator it
     /// takes from. `Ok(None)` when there is none.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn claim_ready(
@@ -1140,7 +1141,7 @@ impl Store {
         by: &Writer,
         channel: &ChannelSel,
         labels: &[LabelFilter],
-        from: &[OwnerSel],
+        from: &[CreatorSel],
         lease_ms: Option<i64>,
         local: bool,
     ) -> Result<Option<ClaimOut>> {
@@ -1148,18 +1149,18 @@ impl Store {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         expire_due(&tx, board, now_ms())?;
 
-        let mut owner_principals = vec![by.principal_id.clone()];
-        let mut owner_actors: Vec<String> = Vec::new();
-        for owner in from {
-            match owner {
-                OwnerSel::Actor(id) => owner_actors.push(id.clone()),
-                OwnerSel::Handle { handle, profile } => {
-                    // An owner nobody has is skipped: it owns nothing.
+        let mut creator_principals = vec![by.principal_id.clone()];
+        let mut creator_actors: Vec<String> = Vec::new();
+        for creator in from {
+            match creator {
+                CreatorSel::Actor(id) => creator_actors.push(id.clone()),
+                CreatorSel::Handle { handle, profile } => {
+                    // A creator nobody has is skipped: it created nothing.
                     if let Some(principal) = find_principal(&tx, handle, local)? {
                         match profile {
-                            None => owner_principals.push(principal.id),
+                            None => creator_principals.push(principal.id),
                             Some(profile) => {
-                                owner_actors.push(principal.actor(Some(profile)).id);
+                                creator_actors.push(principal.actor(Some(profile)).id);
                             }
                         }
                     }
@@ -1175,7 +1176,7 @@ impl Store {
             "SELECT t.id FROM tasks t WHERE t.board_id = ? AND t.state = ? AND {}",
             channel_clause("t.channel", channel, &mut values)
         );
-        // Kept for the caller, or unassigned and from an owner it takes from.
+        // Kept for the caller, or unassigned and from a creator it takes from.
         sql.push_str(
             " AND ((t.assignee_principal = ? AND (t.assignee_profile IS NULL OR \
              (? IS NOT NULL AND lower(t.assignee_profile) = lower(?))))",
@@ -1184,15 +1185,15 @@ impl Store {
         let profile = by.actor.profile.clone().map_or(Value::Null, Value::Text);
         values.push(profile.clone());
         values.push(profile);
-        sql.push_str(" OR (t.assignee_principal IS NULL AND (t.owner_principal IN (");
-        sql.push_str(&vec!["?"; owner_principals.len()].join(", "));
+        sql.push_str(" OR (t.assignee_principal IS NULL AND (t.creator_principal IN (");
+        sql.push_str(&vec!["?"; creator_principals.len()].join(", "));
         sql.push(')');
-        values.extend(owner_principals.into_iter().map(Value::Text));
-        if !owner_actors.is_empty() {
-            sql.push_str(" OR t.owner_actor IN (");
-            sql.push_str(&vec!["?"; owner_actors.len()].join(", "));
+        values.extend(creator_principals.into_iter().map(Value::Text));
+        if !creator_actors.is_empty() {
+            sql.push_str(" OR t.creator_actor IN (");
+            sql.push_str(&vec!["?"; creator_actors.len()].join(", "));
             sql.push(')');
-            values.extend(owner_actors.into_iter().map(Value::Text));
+            values.extend(creator_actors.into_iter().map(Value::Text));
         }
         sql.push_str(")))");
         for label in labels {
@@ -1226,7 +1227,7 @@ impl Store {
 
     /// Applies one change to a task. `manage` is whether the caller holds
     /// the task-manage permission in the task's channel, which stands in
-    /// for ownership.
+    /// for creatorship.
     pub(crate) fn task_act(
         &self,
         board: &BoardRef,
@@ -1240,12 +1241,12 @@ impl Store {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let expired = expire_due(&tx, board, now_ms())?;
         let task = task_of(&tx, board, id)?;
-        let owner = owns(&task, by) || manage(&task.channel);
-        let require_owner = || {
-            if owner {
+        let creator = is_creator(&task, by) || manage(&task.channel);
+        let require_creator = || {
+            if creator {
                 Ok(())
             } else {
-                Err(StoreError::from(TaskError::NotOwned))
+                Err(StoreError::from(TaskError::NotCreator))
             }
         };
         let mut claim = None;
@@ -1314,7 +1315,7 @@ impl Store {
             } => {
                 match (&proof, task.state.as_str()) {
                     (Some(proof), _) => check_claim(&task, by, proof)?,
-                    (None, states::READY | states::WAITING) => require_owner()?,
+                    (None, states::READY | states::WAITING) => require_creator()?,
                     (None, states::CLAIMED) => {
                         return Err(if task.holder_actor.as_deref() == Some(&by.actor.id) {
                             TaskError::ClaimNotHeld
@@ -1341,7 +1342,7 @@ impl Store {
                 )?)
             }
             Act::Unblock => {
-                require_owner()?;
+                require_creator()?;
                 if task.state != states::BLOCKED {
                     return Err(TaskError::State(task.state.clone()).into());
                 }
@@ -1357,7 +1358,7 @@ impl Store {
                 Some(change(&tx, board, &task, by, next, ev::TASK_UNBLOCKED)?)
             }
             Act::Reopen => {
-                require_owner()?;
+                require_creator()?;
                 if task.state != states::FAILED {
                     return Err(TaskError::State(task.state.clone()).into());
                 }
@@ -1370,12 +1371,14 @@ impl Store {
                 Some(change(&tx, board, &task, by, next, ev::TASK_REOPENED)?)
             }
             Act::Assign(spec) => {
-                require_owner()?;
+                require_creator()?;
                 if states::is_finished(&task.state) {
                     return Err(TaskError::Finished.into());
                 }
                 let assignee = match &spec {
-                    Some(spec) => Some(resolve_assignee(&tx, spec, &task.owner_principal, local)?),
+                    Some(spec) => {
+                        Some(resolve_assignee(&tx, spec, &task.creator_principal, local)?)
+                    }
                     None => None,
                 };
                 tx.execute(
@@ -1392,7 +1395,7 @@ impl Store {
                 Some(change(&tx, board, &task, by, &state, ev::TASK_ASSIGNED)?)
             }
             Act::Needs(needs) => {
-                require_owner()?;
+                require_creator()?;
                 match task.state.as_str() {
                     states::CLAIMED => return Err(TaskError::Claimed.into()),
                     state if states::is_finished(state) => return Err(TaskError::Finished.into()),
@@ -1408,7 +1411,7 @@ impl Store {
                 Some(change(&tx, board, &task, by, next, ev::TASK_NEEDS_CHANGED)?)
             }
             Act::Cancel(reason) => {
-                require_owner()?;
+                require_creator()?;
                 if matches!(task.state.as_str(), states::COMPLETED | states::CANCELED) {
                     return Err(TaskError::Finished.into());
                 }
@@ -1584,7 +1587,7 @@ pub(super) fn fill_tasks(
                 h.id, h.kind, h.handle, h.profile,
                 (SELECT json_group_array(n.needs_id) FROM task_needs n WHERE n.task_id = t.id)
          FROM tasks t
-         JOIN actors o ON o.id = t.owner_actor
+         JOIN actors o ON o.id = t.creator_actor
          JOIN actors c ON c.id = t.changed_actor
          LEFT JOIN actors h ON h.id = t.holder_actor
          WHERE t.id IN (SELECT value FROM json_each(?1))",
@@ -1615,7 +1618,7 @@ pub(super) fn fill_tasks(
             },
             changed_at: r.get(8)?,
             brief_revision: r.get(9)?,
-            owner: actor_from_row(r, 10)?,
+            creator: actor_from_row(r, 10)?,
             changed_by: actor_from_row(r, 14)?,
             holder: match (claimed, holder) {
                 (true, Some(_)) => Some(actor_from_row(r, 18)?),

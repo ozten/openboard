@@ -130,8 +130,8 @@ pub enum Action {
     /// claim is a fixed rule the server applies on top.
     ClaimTask,
     /// Block, unblock, reopen, assign, change the needs of and cancel tasks
-    /// the caller does not own (`task.manage`). The owner of a task needs
-    /// no permission for these: ownership is a fixed rule.
+    /// the caller did not create (`task.manage`). The creator of a task needs
+    /// no permission for these: that is a fixed rule.
     ManageTasks,
 }
 
@@ -187,7 +187,7 @@ impl Policy for LocalPolicy {
 /// do everything except manage tasks it does not own, and an
 /// unauthenticated caller may only check health, enrol, sign in and fetch
 /// the web UI's static files. Nobody holds [`Action::ManageTasks`] until
-/// grants exist to give it, so only a task's owner changes it.
+/// grants exist to give it, so only a task's creator changes it.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NetworkPolicy;
 

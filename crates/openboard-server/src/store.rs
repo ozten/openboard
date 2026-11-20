@@ -33,8 +33,8 @@ use crate::Mode;
 mod tasks;
 
 pub(crate) use tasks::{
-    Act, AssigneeSpec, BatchEntry, Brief, ClaimOut, ClaimProof, Need, NewTask, OwnerSel, TaskError,
-    TaskQuery,
+    Act, AssigneeSpec, BatchEntry, Brief, ClaimOut, ClaimProof, CreatorSel, Need, NewTask,
+    TaskError, TaskQuery,
 };
 
 /// File name of the board database inside the data directory.
@@ -229,8 +229,8 @@ CREATE TABLE tasks (
     board_id           INTEGER NOT NULL REFERENCES boards(id),
     channel            TEXT NOT NULL,
     state              TEXT NOT NULL,
-    owner_actor        TEXT NOT NULL REFERENCES actors(id),
-    owner_principal    TEXT NOT NULL,
+    creator_actor        TEXT NOT NULL REFERENCES actors(id),
+    creator_principal    TEXT NOT NULL,
     assignee_principal TEXT,
     assignee_profile   TEXT,
     assignee_handle    TEXT,

@@ -2,9 +2,9 @@
 //!
 //! Every handler authorizes through the same seam as the message routes:
 //! creating needs `CreateTask` (and `Post`, since a task is a thread),
-//! claiming and settling need `ClaimTask`, and an owner's changes need
-//! `CreateTask` from the owner or `ManageTasks` from anyone else. Who holds
-//! a claim and who owns a task are fixed rules the store applies on top.
+//! claiming and settling need `ClaimTask`, and a creator's changes need
+//! `CreateTask` from the creator or `ManageTasks` from anyone else. Who holds
+//! a claim and who created a task are fixed rules the store applies on top.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -35,7 +35,7 @@ use crate::chain::hex;
 use crate::names::{self, ChannelSel};
 use crate::store::{
     event_cursor, parse_cursor, Act, AssigneeSpec, BatchEntry, BoardRef, Brief, ClaimOut,
-    ClaimProof, LabelFilter, Need, NewTask, OwnerSel, PostTarget, TaskError, TaskQuery,
+    ClaimProof, CreatorSel, LabelFilter, Need, NewTask, PostTarget, TaskError, TaskQuery,
     MAX_LABELS_PER_MESSAGE,
 };
 use crate::Mode;
@@ -53,27 +53,27 @@ pub(super) fn task_error(error: TaskError) -> AppError {
             codes::TASK_ASSIGNED,
             "the task is kept for someone else",
         )
-        .next("claim a task kept for you or for anyone; the owner can return it with `tasks assign <id> --pool`"),
+        .next("claim a task kept for you or for anyone; the creator can return it with `tasks assign <id> --pool`"),
         TaskError::Waiting => AppError::new(
             codes::TASK_WAITING,
             "the task needs tasks that have not completed",
         )
         .next("claim it once what it needs has completed; `openboard tasks show <id>` lists them"),
         TaskError::Blocked => AppError::new(codes::TASK_BLOCKED, "the task is blocked")
-            .next("its owner unblocks it with `openboard tasks unblock <id>`"),
+            .next("its creator unblocks it with `openboard tasks unblock <id>`"),
         TaskError::Finished => AppError::new(
             codes::TASK_FINISHED,
             "the task is completed, failed or canceled",
         )
-        .next("a failed task can be reopened by its owner with `openboard tasks reopen <id>`"),
+        .next("a failed task can be reopened by its creator with `openboard tasks reopen <id>`"),
         TaskError::State(state) => AppError::new(
             codes::TASK_STATE,
             format!("the task is {state}, and that change needs another state"),
         )
         .next("read the task's state with `openboard tasks show <id>`"),
-        TaskError::NotOwned => AppError::new(
-            codes::TASK_NOT_OWNED,
-            "only the task's owner may do this",
+        TaskError::NotCreator => AppError::new(
+            codes::NOT_TASK_CREATOR,
+            "only the task's creator may do this",
         )
         .next("use the login and --as profile that created the task"),
         TaskError::ClaimLost => AppError::new(
@@ -138,16 +138,16 @@ fn parse_assignee(raw: &str) -> ApiResult<AssigneeSpec> {
     }
 }
 
-/// An owner named in a ready claim's `from`.
-fn parse_owner(raw: &str) -> ApiResult<OwnerSel> {
+/// A creator named in a ready claim's `from`.
+fn parse_creator(raw: &str) -> ApiResult<CreatorSel> {
     let raw = raw.trim();
     if raw.starts_with("act_") {
-        return Ok(OwnerSel::Actor(raw.to_owned()));
+        return Ok(CreatorSel::Actor(raw.to_owned()));
     }
     match parse_assignee(&format!("@{}", raw.trim_start_matches('@'))) {
-        Ok(AssigneeSpec::Handle { handle, profile }) => Ok(OwnerSel::Handle { handle, profile }),
+        Ok(AssigneeSpec::Handle { handle, profile }) => Ok(CreatorSel::Handle { handle, profile }),
         _ => Err(AppError::invalid(
-            "an owner in `from` is an actor ID, `name` or `name/profile`",
+            "a creator in `from` is an actor ID, `name` or `name/profile`",
         )),
     }
 }
@@ -636,7 +636,7 @@ pub(super) async fn claim_ready(
     }
     if request.from.len() > MAX_CLAIM_FROM {
         return Err(AppError::invalid(format!(
-            "a claim names at most {MAX_CLAIM_FROM} owners"
+            "a claim names at most {MAX_CLAIM_FROM} creators"
         )));
     }
     let labels: Vec<LabelFilter> = request
@@ -644,10 +644,10 @@ pub(super) async fn claim_ready(
         .iter()
         .map(|raw| parse_label_filter(raw))
         .collect::<ApiResult<_>>()?;
-    let from: Vec<OwnerSel> = request
+    let from: Vec<CreatorSel> = request
         .from
         .iter()
-        .map(|raw| parse_owner(raw))
+        .map(|raw| parse_creator(raw))
         .collect::<ApiResult<_>>()?;
     let lease = lease_ms(request.lease_secs)?;
     let wait = Duration::from_secs(request.wait.unwrap_or(0).min(MAX_WAIT_SECS));

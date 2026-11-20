@@ -2061,7 +2061,7 @@ mod tasks {
         .json();
         assert_eq!(claim.task.id, id);
         assert_eq!(claim.epoch, 1);
-        assert_eq!(claim.trust.owner.handle, "local/lead");
+        assert_eq!(claim.trust.creator.handle, "local/lead");
 
         // Another profile holds no claim, and its attempt changes nothing.
         let out = run(cli(&board, "worker-2").args(["--json", "tasks", "complete", &id]));
@@ -2111,7 +2111,7 @@ mod tasks {
     }
 
     #[test]
-    fn owners_block_unblock_assign_and_cancel() {
+    fn creators_block_unblock_assign_and_cancel() {
         let board = Board::start();
         let id = create(&board, &["build", "Pick a database"]).task.id;
         run(cli(&board, "worker-1").args(["tasks", "claim", &id])).ok();
@@ -2135,7 +2135,7 @@ mod tasks {
         run(cli(&board, "lead").args(["tasks", "assign", &id, "worker-2"])).ok();
         let task = view(&board, &id).task.task.unwrap();
         assert_eq!(task.assignee.as_deref(), Some("local/worker-2"));
-        // An owner blocks a task nobody holds, without a claim.
+        // A creator blocks a task nobody holds, without a claim.
         run(cli(&board, "lead").args(["tasks", "block", &id, "hold on"])).ok();
         assert_eq!(state(&board, &id), "blocked");
         run(cli(&board, "lead").args(["tasks", "cancel", &id, "not needed"])).ok();
@@ -2277,6 +2277,101 @@ mod tasks {
         let woke: Value = out.json();
         assert_eq!(woke["event"]["type"], "task.completed", "{out:?}");
         assert_eq!(woke["message"]["id"], id.as_str());
+    }
+
+    #[cfg(unix)]
+    fn alive(pid: &str) -> bool {
+        Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_command_stops_before_its_claim_is_released() {
+        let board = Board::start();
+        let id = create(&board, &["build", "slow to stop"]).task.id;
+        let seen = board.dir.path().join("seen.json");
+        // On SIGTERM the command takes a moment, then looks at its task.
+        let script = r#"trap 'sleep 1; "$BIN" --json tasks show "$BOARD_TASK" > "$SEEN"; exit 0' TERM
+sleep 60 & wait"#;
+        let child = cli(&board, "worker-1")
+            .env("BIN", env!("CARGO_BIN_EXE_openboard"))
+            .env("SEEN", &seen)
+            .args(["tasks", "run", &id, "--", "sh", "-c", script])
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while state(&board, &id) != "claimed" {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()
+            .unwrap()
+            .success());
+        let out = finish(child, Duration::from_secs(30));
+        assert_eq!(out.code, Some(143), "{out:?}");
+        // While the command was stopping, the task was still claimed.
+        let during: TaskView =
+            serde_json::from_str(&std::fs::read_to_string(&seen).unwrap()).unwrap();
+        assert_eq!(during.task.task.unwrap().state, "claimed");
+        assert_eq!(state(&board, &id), "ready");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn what_the_command_leaves_running_stops_with_it() {
+        let board = Board::start();
+        let id = create(&board, &["build", "leaves a helper"]).task.id;
+        let pid_file = board.dir.path().join("helper.pid");
+        run(cli(&board, "worker-1")
+            .env("PID_FILE", &pid_file)
+            .args(["tasks", "run", &id, "--", "sh", "-c"])
+            .arg(r#"sleep 60 & echo $! > "$PID_FILE""#))
+        .ok();
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        assert!(!alive(&pid), "the helper {pid} still runs");
+        assert_eq!(state(&board, &id), "completed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_run_that_cannot_renew_stops_the_command_before_the_lease_ends() {
+        let board = Board::start();
+        let id = create(&board, &["build", "board goes away"]).task.id;
+        let pid_file = board.dir.path().join("worker.pid");
+        let child = cli(&board, "worker-1")
+            .env("PID_FILE", &pid_file)
+            .args([
+                "--json", "tasks", "run", &id, "--lease", "6s", "--", "sh", "-c",
+            ])
+            .arg(r#"echo $$ > "$PID_FILE"; sleep 60"#)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !pid_file.exists()
+            || std::fs::read_to_string(&pid_file)
+                .unwrap()
+                .trim()
+                .is_empty()
+        {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let stopped_at = Instant::now();
+        let _dir = board.stop();
+        let out = finish(child, Duration::from_secs(30));
+        // Within the 6 second lease, not after it.
+        assert!(stopped_at.elapsed() < Duration::from_secs(7), "{out:?}");
+        failed(&out, 1, "lease_unconfirmed");
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        assert!(!alive(&pid), "the command {pid} still runs");
     }
 
     #[cfg(unix)]

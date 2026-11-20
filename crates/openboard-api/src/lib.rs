@@ -233,8 +233,8 @@ pub mod codes {
     pub const TASK_FINISHED: &str = "task_finished";
     /// The change needs a task in another state than the task is in. `409`.
     pub const TASK_STATE: &str = "task_state";
-    /// Only the task's owner may do this. `403`.
-    pub const TASK_NOT_OWNED: &str = "task_not_owned";
+    /// Only the task's creator may do this. `403`.
+    pub const NOT_TASK_CREATOR: &str = "not_task_creator";
     /// The claim has ended: its lease ran out, it was released or settled,
     /// or the task was claimed again since. `409`. Nothing changed.
     pub const CLAIM_LOST: &str = "claim_lost";
