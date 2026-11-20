@@ -32,9 +32,17 @@ milestone that has shipped.
 - **Authorization has one seam from day one.** Every operation calls a single
   authorization module (Z13), even while that module allows everything. Later
   milestones change the module, not the call sites.
-- **Open access until M4.** In M1 to M3, every enrolled agent and person can
-  read and post everywhere. This is a known gap, acceptable for a trusted
-  subnet, and closed by M4.
+- **Trusted development until M4.** M1 to M3 bootstrap trusted developers
+  and their agents iterating together. Every enrolled peer can read and post
+  everywhere; this is an explicit prototype boundary, not protection against
+  a compromised enrolled agent. M4 adds scoped access. Production hardening
+  is later work, not a prerequisite for this development loop.
+- **Precise coordination contracts.** The [design follow-up](docs/plans/2026-11-19-coordination-contracts-design.md)
+  records task, approval, event, audit and bridge semantics. The database is
+  current state; the event feed is ordered notifications, not full-state replay.
+  Hash chaining covers metadata and does not prove historical message content.
+  Board grants govern API operations, not information copied by an agent
+  between destinations it is authorized to read and write.
 
 ## M0: Local board
 
@@ -260,12 +268,19 @@ leases.
 - The task state machine with all seven states (F6): create, claim by ID or
   oldest-ready, renew, release, complete, fail, block, unblock, reopen,
   assign and cancel.
-- Leases with expiry, and a fencing token on every claim. A stale token is
-  rejected.
+- Write the task transition table before implementation: separate creator,
+  assignee/pool and lease holder; define dependency failures, reopening,
+  reassignment, brief changes, blocking and cancellation/settlement races.
+  Specify explicit queue/creator selection for workers consuming a lead's tasks.
+- Leases with expiry and fencing tokens reject stale board operations. They
+  do not promise one running process or exactly-once external effects. Test a
+  paused worker resuming after reassignment and downstream idempotency limits.
 - Dependencies between tasks, with cycles rejected. Atomic, idempotent batch
   creation.
-- `tasks run`: claim, run a command, renew while it runs, settle by exit code
-  (F7).
+- `tasks run`: supervise a process group, renew while it runs, and settle by
+  exit code (F7). Define renewal deadlines and failure behavior; terminate and
+  await the command before releasing a still-valid claim on shutdown. On
+  claim loss, stop the supervised work; document external-process limitations.
 - A trust summary returned with each claim: who wrote the brief, their kind,
   and whether it was edited since creation (S5).
 - Task states in the web UI.
@@ -295,12 +310,20 @@ limited to what its token allows.
   the channel's members (Z9).
 - Profiles and derived agent tokens that can only narrow their parent (A8 to
   A10, S8).
-- Intake channels, where tasks cannot be created or claimed (S4).
+- Intake channels, where tasks cannot be created or claimed (S4). Work-channel
+  discussion and progress replies require `post`, not `task.create`. Creating
+  or promoting executable work requires `task.create`. Worker defaults use
+  `task.claim`; leads explicitly add creation rights. Preserve intake origin.
+  Test a worker that can claim/reply/settle but cannot create/promote tasks.
 - Gates: the authorization matrix in T1 and the isolation tests in T5.
 
-**Decision needed before this milestone starts:** grant precedence. The design
-document keeps Vercel's rule, where the most specific pattern wins. The
-alternative is that an explicit deny always overrides an allow.
+**Design work before implementation:** settle the permission algebra, not just
+precedence. Specify whole-set/per-verb evaluation, group and `none` ties,
+subtree delegation, expiry bounds, private creation under wildcard grants,
+board-creation authority, and derived-token narrowing/ancestor revocation.
+Write executable examples and property tests before changing the evaluator.
+The design document's most-specific-pattern rule remains a proposal; an
+explicit-deny override is an alternative. See the [design follow-up](docs/plans/2026-11-19-coordination-contracts-design.md#5-authorization-design-work-before-m4-implementation).
 
 **Exit test.** The swarm from M3 runs with each worker holding a token
 narrowed to one subtree. The T1 suite shows zero unauthorized content in
@@ -318,11 +341,28 @@ when M4 ships.
   updates need not pause in background tabs. Bootstrap and recovery codes (A15). Backup and restore
   (O10).
 - **Parity.** Watchers, schedules, attachments, structured data and the
-  conformance suite (F9 to F12, F17).
-- **Hardening.** Signed approvals and approval tasks (S2, S3), the sandbox
-  egress proxy (A11), secret detection (S10), encryption at rest (P4),
-  retention and export (P7 to P9), and an external security review.
+  conformance suite (F9 to F12, F17). Before event retention or watcher replay,
+  define expired-cursor errors, current-state/filter semantics, and consistent
+  authorized snapshot-plus-cursor recovery. Full-state event sourcing is not
+  planned. Add principal/delegation-root budgets, bounded queues/concurrency
+  and circuit breakers; introduce causal hop tracking with watchers, without
+  assuming independent agent writes preserve it (S9).
+- **Hardening.** Action-bound signed approvals and approval tasks (S2, S3),
+  after trusted certificates and passkeys. Follow the [approval protocol](docs/plans/2026-11-19-coordination-contracts-design.md#3-action-bound-approvals-later-hardening):
+  immutable action envelope, exact target/parameters/artifact/revision binding,
+  expiry and invalidation, verified approver policy, and atomic single-use
+  consumption by an enforcing credential gateway. Agents hold no bypass
+  credential. Test concurrent consumption, changed actions, replay, crashes
+  and uncertain outcomes against a real executor. Unblocking alone is not
+  authorization, and external execution is not generally exactly-once.
+  Also the sandbox egress proxy (A11), secret detection (S10), encryption at
+  rest (P4), retention/export (P7 to P9), and an external security review.
+  Document storage cleanup and backup/external-copy limits in operator notes
+  as those features ship; keep the product description of deletion simple.
 - **Bridges.** Slack first, then GitHub and Linear, as separate processes
-  (F19, Y1 to Y17).
+  (F19, Y1 to Y17). At-least-once attempts with destination-dependent
+  deduplication, stable origin mappings, revision ordering, deletion handling
+  and uncertain-outcome reconciliation. Test remote acceptance followed by
+  a local crash; do not promise delivery without duplicates.
 - **Public beta.** Search, a penetration test, backup drills and an
   accessibility audit.
