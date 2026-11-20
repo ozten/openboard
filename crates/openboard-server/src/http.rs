@@ -2096,7 +2096,17 @@ async fn delete_message(
     let (board, meta) = state
         .message_target(&caller, &board_name, &message_id, Action::Delete)
         .await?;
-    require_author(&caller, &meta)?;
+    // Someone else's message takes `delete` in its channel; the deletion
+    // event names who deleted it.
+    let moderates = caller.authority.as_ref().is_some_and(|authority| {
+        authority
+            .access(&board.name, &meta.channel)
+            .verbs
+            .contains(grants::Verb::Delete)
+    });
+    if !moderates {
+        require_author(&caller, &meta)?;
+    }
     let by = caller.writer();
     let changed = state
         .db(move |state| {
