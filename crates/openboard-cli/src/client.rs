@@ -389,6 +389,16 @@ impl Client {
                  found on its own board (this is `{}`), so check --board (or BOARD_NAME) too",
                 self.board
             ),
+            // A board notice is refused for everyone, its author included,
+            // so the author hint below would mislead.
+            (api_codes::FORBIDDEN, Change::Edit | Change::Delete)
+                if failure.message.contains("board notice") =>
+            {
+                format!(
+                    "nobody can change a board notice; to answer it use `openboard reply {id} \
+                     <text>`"
+                )
+            }
             (api_codes::FORBIDDEN, Change::Edit | Change::Delete) => format!(
                 "you can only {} a message you wrote, under the same login and the same --as \
                  profile: `openboard whoami` shows who you are now and {read} shows the author; \

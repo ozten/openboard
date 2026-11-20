@@ -216,13 +216,20 @@ pub(super) async fn remove_grant(
     let board = state.board_named(&caller, &board_name).await?;
     let issuer = changing_issuer(&caller, &board.name)?;
     let writer = caller.writer();
-    let (removed, authorized_by) = state
-        .db(move |state| state.store.remove_grant(&board, &writer, &issuer, &id))
+    let on = board.clone();
+    let removed = state
+        .db(move |state| {
+            let removed = state.store.remove_grant(&on, &writer, &issuer, &id)?;
+            if let Some(seq) = removed.seq {
+                state.hub.publish(on.id, seq);
+            }
+            Ok(removed)
+        })
         .await?;
     Ok(Json(GrantChanged {
-        grant: view(&removed, now_ms()),
-        authorized_by,
-        notices: Vec::new(),
+        grant: view(&removed.grant, now_ms()),
+        authorized_by: removed.authorized_by,
+        notices: removed.notices,
     }))
 }
 
@@ -246,7 +253,7 @@ pub(super) async fn explain(
     let caller = state.caller(&identity, &headers).await?;
     let Query(query) = query.map_err(bad_query)?;
     names::validate_channel(&query.channel).map_err(invalid_channel)?;
-    let board = state.board(&caller, board).await?;
+    let (board_name, board) = state.board_or_unreadable(&caller, board).await?;
     let Some(authority) = caller.authority.clone() else {
         return Ok(Json(Explained {
             channel: query.channel,
@@ -256,10 +263,16 @@ pub(super) async fn explain(
             narrowed: false,
         }));
     };
-    let board_id = board.id;
-    let stored = state
-        .db(move |state| state.store.board_grants(board_id))
-        .await?;
+    // A board that does not exist and that the caller could not read has no
+    // grants, which is what an existing board nobody granted it looks like.
+    let stored = match board.as_ref().map(|board| board.id) {
+        Some(board_id) => {
+            state
+                .db(move |state| state.store.board_grants(board_id))
+                .await?
+        }
+        None => Vec::new(),
+    };
     let now = now_ms();
     let held: Vec<Grant> = stored.iter().map(|stored| stored.grant.clone()).collect();
     let decided = |access: &grants::Access| -> Vec<GrantView> {
@@ -271,7 +284,7 @@ pub(super) async fn explain(
     };
     match &query.for_ {
         None => {
-            let access = authority.access(&board.name, &query.channel);
+            let access = authority.access(&board_name, &query.channel);
             Ok(Json(Explained {
                 deciding: decided(&access),
                 channel: query.channel,
@@ -281,7 +294,7 @@ pub(super) async fn explain(
             }))
         }
         Some(handle) => {
-            let issuer = issuer(&caller, &board.name)?;
+            let issuer = issuer(&caller, &board_name)?;
             let allowed = {
                 let ceilings: Vec<&grants::Ceiling> = issuer.ceilings.iter().collect();
                 grants::authority(

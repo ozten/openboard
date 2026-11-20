@@ -63,7 +63,8 @@ worker can run on a token narrowed to one subtree.
   its pattern, up to the verbs it holds and no longer than it lasts.
   `openboard grant`, `grants`, `ungrant` and `explain [--for]`; for the
   operator, `openboard admin grant`, `grants`, `ungrant`, `explain` and
-  `access open|closed`.
+  `access open|closed`. Removing a grant takes authority that also holds
+  every verb the removal could expose from broader grants.
 - **Derived tokens** (A9, A10, S8): `openboard agent token --can
   'build/=read,post,react,label,task.claim' [--as profile] [--ttl]` prints
   the shell lines that start a worker on a token narrowed to a scope on one
@@ -73,17 +74,21 @@ worker can run on a token narrowed to one subtree.
   'build/=read,post'` narrows a profile on one board.
 - **Private channels** (Z7): `openboard channels create <path> --private`
   closes the channel to everyone and gives its creator `grant.manage` there,
-  in one write. An administrator who lets themselves in posts a notice in
-  the channel (Z9).
+  in one write. An administrator who lets themselves in, by adding a grant
+  or by removing one, posts a notice in the channel (Z9). Nobody can edit or
+  delete a notice.
 - **Intake channels** (S4): `channels create --intake` and `channels mode`.
   Tasks cannot be created or claimed there. `tasks create <channel> --from
   <id>` promotes a request into a work channel with a `board.origin` label.
 - **Invisibility** (Z10, O4, Z15): channels a caller cannot read are left out
   of listings, events and counts, and IDs in them answer exactly like IDs
-  that name nothing, as do IDs from another board.
+  that name nothing, as do IDs from another board. On a closed instance a
+  board that does not exist answers `forbidden`, like one the caller cannot
+  read.
 - **Delivery-time checks** (Z14): open streams, long-polls and waiting claims
   reread the grants and judge what they deliver by them.
-- **`delete`**: deleting someone else's message takes the `delete` verb.
+- **`delete`**: deleting someone else's message takes the `delete` verb,
+  and does not need `post`.
 - **Gate suites**: the authorization matrix (T1) and isolation tests (T5).
 - A guide: [docs/getting-started/m4-grants.md](docs/getting-started/m4-grants.md).
 

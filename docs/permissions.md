@@ -115,16 +115,26 @@ private channel they cannot read. Z9 makes doing so for themselves visible.
   authorizing grant expires, the new grant must expire no later. A request
   through a derived token, or under a profile whose ceiling lacks
   `grant.manage` at P, cannot change grants.
-- **Removing a grant** takes authority at its pattern, with any verbs.
-  Removing a grant can widen access: removing `hr/ everyone none` opens `hr/`
-  to the broader grants.
+- **Removing a grant** can widen access: removing `hr/ everyone none` opens
+  `hr/` to the broader grants. So it takes authority at the grant's pattern
+  that also holds every verb the removal could expose. Those are the verbs of
+  every other active grant whose pattern contains the removed one's and whose
+  grantee could be the same principal, less the verbs the removed grant gave.
+  `everyone` could be anyone, and a named principal could be in any group.
+  With `* agents read,post,delete`, `build/ agents read` and
+  `build/ lead read,grant.manage`, lead cannot remove `build/ agents read`:
+  that would give agents `post` and `delete` in `build/`, which lead does not
+  hold. The operator's `admin ungrant` has no such limit.
 - **Issued grants outlive their issuer.** Revoking the administrator who
   made a grant does not remove it. The grant log records who made each one.
   (Tokens are the opposite: they end with their parent.)
 - **Admin self-grants are visible (Z9).** A grant that gives its own issuer
   `read` somewhere they could not read before posts a notice, written as the
   issuer and labelled `board.notice=access_granted`, in each existing channel
-  it opens. The notice cannot be turned off.
+  it opens. Removing a grant does the same when the removal gives the remover
+  `read` somewhere they could not read before. The notice cannot be turned
+  off, and a message labelled `board.notice` cannot be edited or deleted by
+  anyone, its author and holders of `delete` included.
 
 ## Private channels (Z7)
 
@@ -181,7 +191,7 @@ in M3.
 |---|---|
 | Read threads, messages, events; see the channel in listings | `read` |
 | Post a thread or reply; edit or delete one's own message | `post` |
-| Delete someone else's message | `delete` |
+| Delete someone else's message | `delete` (not `post`) |
 | Set or clear labels | `label` |
 | React | `react` |
 | Create a channel by posting to a new path | `create` and `post` |
@@ -195,6 +205,7 @@ in M3.
 | Explain someone else's access | `grant.manage` at `*` |
 
 Every action also needs `read` in the channel, apart from `explain`.
+`delete` covers one's own messages too.
 
 ## Visibility (Z10, O4, Z15)
 
@@ -210,7 +221,9 @@ A caller learns nothing about a channel it cannot read:
   edits, deletions, labels, reactions, task dependencies and event filters.
   A cursor from another board is `invalid_cursor` (Z15).
 - A board the caller cannot read answers `forbidden` whether it exists or
-  not, and does not appear in the board listing.
+  not, and does not appear in the board listing. On an open instance a
+  caller who may create boards can still tell that a name is free, since it
+  could create the board; that is inherent.
 
 ## Delivery-time checks (Z14)
 

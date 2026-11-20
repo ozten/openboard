@@ -444,6 +444,16 @@ pub(crate) struct GrantAdded {
     pub seq: Option<i64>,
 }
 
+/// A grant just removed.
+#[derive(Debug)]
+pub(crate) struct GrantRemoved {
+    pub grant: StoredGrant,
+    pub authorized_by: String,
+    /// The notices posted (Z9), and the event position of the last one.
+    pub notices: Vec<String>,
+    pub seq: Option<i64>,
+}
+
 /// A channel just created.
 #[derive(Debug)]
 pub(crate) struct ChannelMade {
@@ -458,6 +468,54 @@ fn channel_paths(conn: &Connection, board_id: i64) -> rusqlite::Result<Vec<Strin
     conn.prepare("SELECT path FROM channels WHERE board_id = ?1 ORDER BY path")?
         .query_map([board_id], |row| row.get(0))?
         .collect()
+}
+
+/// Posts `text`, written as `by` and labelled `board.notice=access_granted`,
+/// in every existing channel where `subject` can read under `after` but not
+/// under `before` (Z9). Returns the notice IDs and the last event position.
+fn post_notices(
+    tx: &Connection,
+    board: &super::BoardRef,
+    by: &super::Writer,
+    subject: &crate::grants::Subject,
+    before: &[Grant],
+    after: &[Grant],
+    text: &str,
+) -> super::Result<(Vec<String>, Option<i64>)> {
+    use crate::grants::{evaluate, Verb};
+    let now = now_ms();
+    let mut notices = Vec::new();
+    let mut seq = None;
+    for channel in channel_paths(tx, board.id)? {
+        let was = evaluate(before, subject, &channel, now);
+        let is = evaluate(after, subject, &channel, now);
+        if was.verbs.contains(Verb::Read) || !is.verbs.contains(Verb::Read) {
+            continue;
+        }
+        let inserted = super::insert_message(
+            tx,
+            board,
+            &channel,
+            None,
+            by,
+            text,
+            &super::MentionInput {
+                candidates: Vec::new(),
+                local: false,
+            },
+        )?;
+        tx.execute(
+            "INSERT INTO labels (message_id, thread_id, key, value) VALUES (?1, ?1, ?2, ?3)",
+            params![
+                inserted.id,
+                openboard_api::grants::NOTICE_LABEL,
+                openboard_api::grants::NOTICE_ACCESS_GRANTED
+            ],
+        )?;
+        seq = Some(inserted.seq);
+        notices.push(inserted.id);
+    }
+    Ok((notices, seq))
 }
 
 impl super::Store {
@@ -475,7 +533,7 @@ impl super::Store {
         verbs: Verbs,
         expires_at: Option<i64>,
     ) -> super::Result<GrantAdded> {
-        use crate::grants::{evaluate, Grant, Verb};
+        use crate::grants::Grant;
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = now_ms();
@@ -515,45 +573,15 @@ impl super::Store {
             &by.actor.handle,
         )?;
 
-        let mut notices = Vec::new();
-        let mut seq = None;
         let mut after = held.clone();
         after.push(new.clone());
-        for channel in channel_paths(&tx, board.id)? {
-            let before = evaluate(&held, &issuer.subject, &channel, now);
-            let now_reads = evaluate(&after, &issuer.subject, &channel, now);
-            if before.verbs.contains(Verb::Read) || !now_reads.verbs.contains(Verb::Read) {
-                continue;
-            }
-            let text = format!(
-                "**Admin access:** {} gave themselves {} at `{}` (grant {}), so they can now \
-                 read this channel. The board posts this notice whenever an administrator \
-                 grants themselves access to a channel, and it cannot be turned off.",
-                by.actor.handle, new.verbs, new.pattern, new.id
-            );
-            let inserted = super::insert_message(
-                &tx,
-                board,
-                &channel,
-                None,
-                by,
-                &text,
-                &super::MentionInput {
-                    candidates: Vec::new(),
-                    local: false,
-                },
-            )?;
-            tx.execute(
-                "INSERT INTO labels (message_id, thread_id, key, value) VALUES (?1, ?1, ?2, ?3)",
-                params![
-                    inserted.id,
-                    openboard_api::grants::NOTICE_LABEL,
-                    openboard_api::grants::NOTICE_ACCESS_GRANTED
-                ],
-            )?;
-            seq = Some(inserted.seq);
-            notices.push(inserted.id);
-        }
+        let text = format!(
+            "**Admin access:** {} gave themselves {} at `{}` (grant {}), so they can now \
+             read this channel. The board posts this notice whenever an administrator \
+             grants themselves access to a channel, and it cannot be turned off.",
+            by.actor.handle, new.verbs, new.pattern, new.id
+        );
+        let (notices, seq) = post_notices(&tx, board, by, &issuer.subject, &held, &after, &text)?;
         let grant = board_grants(&tx, board.id)?
             .into_iter()
             .find(|stored| stored.grant.id == new.id)
@@ -568,14 +596,16 @@ impl super::Store {
     }
 
     /// Removes a grant of `board`, checked against the grants as they are.
-    /// Returns it, and the caller's grant that authorized the removal.
+    /// Returns it, and the caller's grant that authorized the removal. A
+    /// removal that gives its own issuer `read` in an existing channel it
+    /// could not read posts a notice there (Z9).
     pub(crate) fn remove_grant(
         &self,
         board: &super::BoardRef,
         by: &super::Writer,
         issuer: &IssuerSpec,
         id: &str,
-    ) -> super::Result<(StoredGrant, String)> {
+    ) -> super::Result<GrantRemoved> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let stored = board_grants(&tx, board.id)?;
@@ -590,8 +620,31 @@ impl super::Store {
             .find(|stored| stored.grant.id == id)
             .ok_or(super::StoreError::Grant(GrantFailure::NoSuchGrant))?;
         remove(&tx, board.id, id, &by.actor.handle)?;
+        let after: Vec<Grant> = held.iter().filter(|g| g.id != id).cloned().collect();
+        let text = format!(
+            "**Admin access:** {} removed grant {} ({} for {} at `{}`), so they can now \
+             read this channel. The board posts this notice whenever an administrator \
+             removes a grant and so gains access to a channel, and it cannot be turned off.",
+            by.actor.handle,
+            target.grant.id,
+            target.grant.verbs,
+            target
+                .grantee_handle
+                .clone()
+                .unwrap_or_else(|| match &target.grant.grantee {
+                    Grantee::Group(group) => group.name().to_owned(),
+                    _ => "everyone".to_owned(),
+                }),
+            target.grant.pattern
+        );
+        let (notices, seq) = post_notices(&tx, board, by, &issuer.subject, &held, &after, &text)?;
         tx.commit()?;
-        Ok((target, authorized_by))
+        Ok(GrantRemoved {
+            grant: target,
+            authorized_by,
+            notices,
+            seq,
+        })
     }
 
     /// The grants of `board` that `issuer` may manage.
@@ -745,11 +798,15 @@ impl super::Store {
     ) -> super::Result<ChannelMade> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // Z7's "nothing under it" rule protects a private channel's new
+        // grants. A public creation fails only on the exact path, so it
+        // cannot reveal a hidden child.
         let taken = channel_paths(&tx, board.id)?.iter().any(|existing| {
             existing == path
-                || existing
-                    .strip_prefix(path)
-                    .is_some_and(|rest| rest.starts_with('/'))
+                || (private
+                    && existing
+                        .strip_prefix(path)
+                        .is_some_and(|rest| rest.starts_with('/')))
         });
         if taken {
             return Err(super::StoreError::Grant(GrantFailure::ChannelExists));

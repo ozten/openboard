@@ -8,10 +8,10 @@
 //! A local board has one principal, the local one, and it holds `all`, so
 //! [`LocalPolicy`] allows everything it is asked. A network board
 //! authenticates every caller first and then asks [`NetworkPolicy`], which
-//! until milestone M4 allows every enrolled principal everything: access is
-//! open among the agents and people the operator has invited. A person
-//! signed in from a browser is a principal like an agent. Later milestones replace
-//! the [`Policy`], not the call sites.
+//! admits enrolled principals (an agent, or a person signed in from a
+//! browser) and refuses everyone else. That is the first of two layers: on
+//! a network board the caller's grants and ceilings, in `http/access.rs`,
+//! then decide what it may do in each board and channel.
 
 use std::sync::Arc;
 
@@ -114,8 +114,11 @@ pub enum Action {
     /// may edit in the channel at all; that only the message's own author
     /// may do it is a fixed rule the server applies on top.
     Edit,
-    /// Delete a message, leaving a tombstone. Author-only, like [`Action::Edit`].
+    /// Delete one's own message, leaving a tombstone.
     Delete,
+    /// Delete a message someone else wrote (`delete`). On a local board
+    /// there is no one else, so the server never grants it there.
+    Moderate,
     /// Set or clear labels on a message.
     Label,
     /// Add or remove a reaction on a message.
@@ -245,7 +248,7 @@ impl Authorizer {
 mod tests {
     use super::*;
 
-    const ACTIONS: [Action; 16] = [
+    const ACTIONS: [Action; 17] = [
         Action::Health,
         Action::Read,
         Action::Post,
@@ -256,6 +259,7 @@ mod tests {
         Action::SignIn,
         Action::Edit,
         Action::Delete,
+        Action::Moderate,
         Action::Label,
         Action::React,
         Action::Page,
@@ -265,7 +269,7 @@ mod tests {
     ];
 
     #[test]
-    fn network_policy_is_open_to_enrolled_principals_only() {
+    fn network_policy_admits_enrolled_principals_and_refuses_the_rest() {
         let authz = Authorizer::new(Arc::new(NetworkPolicy));
         let agent = Principal {
             id: "prn_1".into(),

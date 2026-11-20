@@ -589,6 +589,11 @@ impl From<StoreError> for AppError {
                 "the message was deleted and cannot be changed",
             )
             .next("reply to its thread instead; replying still works"),
+            StoreError::BoardNotice => AppError::new(
+                codes::FORBIDDEN,
+                "a board notice cannot be edited or deleted",
+            )
+            .next("reply to its thread instead; replying still works"),
             StoreError::RevisionConflict => AppError::new(
                 codes::REVISION_CONFLICT,
                 "the message is not at the revision the request named",
@@ -1319,7 +1324,9 @@ impl AppState {
             return false;
         }
         match (self.mode, &caller.authority) {
-            (Mode::Local, _) => true,
+            // A local board has one principal: nobody else's message exists
+            // to moderate, and deleting is author-only.
+            (Mode::Local, _) => action != Action::Moderate,
             (Mode::Network, Some(authority)) => authority.allows(action, board, channel),
             (Mode::Network, None) => false,
         }
@@ -1357,6 +1364,23 @@ impl AppState {
     ) -> ApiResult<BoardRef> {
         let Path(name) = name.map_err(|_| bad_path())?;
         self.board_named(caller, &name).await
+    }
+
+    /// Like [`AppState::board`], for a route that answers a caller who
+    /// cannot read the board the same way for a board that exists and one
+    /// that does not (`explain`): a missing board the caller could not read
+    /// anyway is `None`, with its name.
+    async fn board_or_unreadable(
+        self: &Arc<Self>,
+        caller: &Caller,
+        name: Result<Path<String>, PathRejection>,
+    ) -> ApiResult<(String, Option<BoardRef>)> {
+        let Path(name) = name.map_err(|_| bad_path())?;
+        match self.find_board(&name).await? {
+            Some(board) => Ok((board.name.clone(), Some(board))),
+            None if self.allows(caller, Action::Read, &name, None) => Err(board_not_found()),
+            None => Ok((name, None)),
+        }
     }
 
     async fn board_named(self: &Arc<Self>, caller: &Caller, name: &str) -> ApiResult<BoardRef> {
@@ -2098,18 +2122,17 @@ async fn delete_message(
     let Path((board_name, message_id)) = path.map_err(|_| bad_path())?;
     let Query(query) = query.map_err(bad_query)?;
     let (board, meta) = state
-        .message_target(&caller, &board_name, &message_id, Action::Delete)
+        .message_target(&caller, &board_name, &message_id, Action::Read)
         .await?;
-    // Someone else's message takes `delete` in its channel; the deletion
-    // event names who deleted it.
-    let moderates = caller.authority.as_ref().is_some_and(|authority| {
-        authority
-            .access(&board.name, &meta.channel)
-            .verbs
-            .contains(grants::Verb::Delete)
-    });
-    if !moderates {
-        require_author(&caller, &meta)?;
+    // One's own message takes `post` or `delete`; someone else's takes
+    // `delete`.
+    let own = caller.actor().id == meta.actor_id;
+    let as_author = own && state.allows(&caller, Action::Delete, &board.name, Some(&meta.channel));
+    if !as_author && !state.allows(&caller, Action::Moderate, &board.name, Some(&meta.channel)) {
+        return Err(match require_author(&caller, &meta) {
+            Err(not_author) => not_author,
+            Ok(()) => AppError::forbidden(),
+        });
     }
     let by = caller.writer();
     let changed = state

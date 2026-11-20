@@ -329,6 +329,19 @@ impl Grantee {
         }
     }
 
+    /// Whether some principal could be a grantee of both. Conservative: a
+    /// principal's kind is not known here, so a named principal may be in
+    /// any group.
+    fn overlaps(&self, other: &Grantee) -> bool {
+        match (self, other) {
+            (Grantee::Everyone, _) | (_, Grantee::Everyone) => true,
+            (Grantee::Principal(a), Grantee::Principal(b)) => a == b,
+            (Grantee::Group(a), Grantee::Group(b)) => a == b,
+            (Grantee::Principal(_), Grantee::Group(_))
+            | (Grantee::Group(_), Grantee::Principal(_)) => true,
+        }
+    }
+
     fn applies_to(&self, subject: &Subject) -> bool {
         match self {
             Grantee::Principal(id) => *id == subject.id,
@@ -606,6 +619,11 @@ pub fn check_add<'a>(
 
 /// Checks that `issuer` may remove the grant `id`. Returns the grant that
 /// authorizes it.
+///
+/// Removing a grant can hand its grantee the verbs of the broader grants it
+/// shadowed. So the authorizing grant must hold every verb of every other
+/// active grant that contains the target's pattern and could share its
+/// grantee, less the verbs of the target itself.
 pub fn check_remove<'a>(
     grants: &'a [Grant],
     issuer: &Issuer<'_>,
@@ -616,7 +634,17 @@ pub fn check_remove<'a>(
         .iter()
         .find(|grant| grant.id == id)
         .ok_or(GrantError::NoSuchGrant)?;
-    authority(grants, issuer, &target.pattern, Verbs::NONE, now)
+    let uncovered = grants
+        .iter()
+        .filter(|other| {
+            other.id != target.id
+                && other.is_active(now)
+                && other.pattern.contains(&target.pattern)
+                && other.grantee.overlaps(&target.grantee)
+        })
+        .fold(Verbs::NONE, |set, other| set.union(other.verbs))
+        .minus(target.verbs);
+    authority(grants, issuer, &target.pattern, uncovered, now)
 }
 
 /// The grants that make `path` a private channel owned by `creator`, or
@@ -1158,6 +1186,69 @@ mod tests {
     }
 
     #[test]
+    fn removing_cannot_hand_out_verbs_the_remover_lacks() {
+        let grants = table(
+            "
+            *        agents   read,post,delete
+            build/   agents   read
+            build/   lead     read,grant.manage
+            ",
+        );
+        let lead = agent("lead");
+        // Lead cannot grant post in build/ ...
+        let new = Grant {
+            id: "new".into(),
+            pattern: pattern("build/"),
+            grantee: grantee("lead"),
+            verbs: verbs("post"),
+            expires_at: None,
+        };
+        assert!(check_add(&grants, &issuer(&lead), &new, 0).is_err());
+        // ... so it cannot remove the grant that shadows post and delete.
+        assert!(matches!(
+            check_remove(&grants, &issuer(&lead), "g1", 0),
+            Err(GrantError::NoAuthority { .. })
+        ));
+        // An administrator holding everything may.
+        let mut with_admin = grants.clone();
+        with_admin.push(Grant {
+            id: "root".into(),
+            pattern: pattern("*"),
+            grantee: grantee("boss"),
+            verbs: Verbs::all(),
+            expires_at: None,
+        });
+        assert!(check_remove(&with_admin, &issuer(&agent("boss")), "g1", 0).is_ok());
+        // A named principal may be in the group, so that still counts.
+        let named = table(
+            "
+            *        other    read,post,delete
+            build/   agents   read
+            build/   lead     read,grant.manage
+            ",
+        );
+        assert!(check_remove(&named, &issuer(&lead), "g1", 0).is_err());
+        // Two different groups cannot overlap.
+        let groups = table(
+            "
+            *        people   read,post,delete
+            build/   agents   read
+            build/   lead     read,grant.manage
+            ",
+        );
+        assert!(check_remove(&groups, &issuer(&lead), "g1", 0).is_ok());
+        // Grants to different named principals cannot overlap.
+        let apart = table(
+            "
+            *        other    read,post,delete
+            build/   someone  read
+            build/   lead     read,grant.manage
+            ",
+        );
+        assert!(check_remove(&apart, &issuer(&lead), "g1", 0).is_ok());
+    }
+
+    #[test]
     fn a_private_channel_closes_and_admits_its_creator() {
         let grants = table(
             "
@@ -1463,6 +1554,34 @@ mod tests {
                                     access.verbs.intersect(new.verbs)
                                 ));
                             }
+                        }
+                    }
+                }
+            }
+
+            #[test]
+            fn an_authorized_removal_gives_only_what_its_issuer_holds(
+                grants in any_grants(),
+                issuer_subject in any_subject(),
+                target in 0usize..10,
+                channel in path(),
+                now in 0i64..25,
+            ) {
+                let Some(target) = grants.get(target) else { return Ok(()); };
+                let issuer = Issuer { subject: &issuer_subject, ceilings: &[], derived: false };
+                if let Ok(by) = check_remove(&grants, &issuer, &target.id, now) {
+                    prop_assert!(by.grantee.applies_to(&issuer_subject));
+                    prop_assert!(by.is_active(now));
+                    prop_assert!(by.pattern.contains(&target.pattern));
+                    prop_assert!(by.verbs.contains(Verb::GrantManage));
+                    let after: Vec<Grant> =
+                        grants.iter().filter(|g| g.id != target.id).cloned().collect();
+                    for id in IDS {
+                        for kind in [ActorKind::Agent, ActorKind::Person, ActorKind::Service] {
+                            let s = Subject { id: id.into(), kind };
+                            let before = evaluate(&grants, &s, &channel, now).verbs;
+                            let later = evaluate(&after, &s, &channel, now).verbs;
+                            prop_assert!(by.verbs.union(before).contains_all(later));
                         }
                     }
                 }

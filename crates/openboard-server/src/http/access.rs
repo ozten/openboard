@@ -67,10 +67,14 @@ impl Authority {
 
     /// The grants of `board`. A board that does not exist yet is judged by
     /// the grants it would start with if this caller created it: `all` for
-    /// its creator. Creating it is a separate check ([`Action::CreateBoard`]).
+    /// its creator, but only when the caller may create boards
+    /// ([`Action::CreateBoard`]). Otherwise a missing board has no grants, so
+    /// it answers exactly as a board the caller cannot read.
     fn grants_of(&self, board: &str) -> std::borrow::Cow<'_, [grants::Grant]> {
         if self.snapshot.has_board(board) {
             std::borrow::Cow::Borrowed(self.snapshot.grants(board))
+        } else if !self.may_create_boards() {
+            std::borrow::Cow::Borrowed(&[])
         } else {
             std::borrow::Cow::Owned(vec![grants::Grant {
                 id: String::new(),
@@ -93,13 +97,15 @@ impl Authority {
         )
     }
 
+    fn may_create_boards(&self) -> bool {
+        self.snapshot.access == Access::Open
+            && matches!(self.subject.kind, ActorKind::Agent | ActorKind::Person)
+            && !self.derived
+    }
+
     pub(crate) fn allows(&self, action: Action, board: &str, channel: Option<&str>) -> bool {
         match (action, channel) {
-            (Action::CreateBoard, _) => {
-                self.snapshot.access == Access::Open
-                    && matches!(self.subject.kind, ActorKind::Agent | ActorKind::Person)
-                    && !self.derived
-            }
+            (Action::CreateBoard, _) => self.may_create_boards(),
             (Action::Read, None) => grants::holds_somewhere(
                 &self.grants_of(board),
                 &self.subject,
@@ -135,6 +141,7 @@ fn needed(action: Action) -> Option<Verbs> {
     let verb = match action {
         Action::Read => Verb::Read,
         Action::Post | Action::Edit | Action::Delete => Verb::Post,
+        Action::Moderate => Verb::Delete,
         Action::CreateChannel => Verb::Create,
         Action::Label => Verb::Label,
         Action::React => Verb::React,

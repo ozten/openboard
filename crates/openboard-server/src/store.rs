@@ -288,6 +288,9 @@ pub(crate) enum StoreError {
     MessageMissing,
     /// The message is a tombstone and cannot be changed.
     MessageDeleted,
+    /// The message is a board notice (label `board.notice`), which nobody
+    /// may edit or delete.
+    BoardNotice,
     /// A conditional edit or delete named a revision that is not current.
     RevisionConflict,
     /// A conditional label write found the condition on this key false.
@@ -314,6 +317,7 @@ impl fmt::Display for StoreError {
             StoreError::ThreadMissing => f.write_str("thread missing"),
             StoreError::MessageMissing => f.write_str("message missing"),
             StoreError::MessageDeleted => f.write_str("message deleted"),
+            StoreError::BoardNotice => f.write_str("board notice"),
             StoreError::RevisionConflict => f.write_str("revision conflict"),
             StoreError::LabelConflict(_) => f.write_str("label conflict"),
             StoreError::TooManyLabels => f.write_str("too many labels"),
@@ -1220,6 +1224,7 @@ impl Store {
         if current.deleted {
             return Err(StoreError::MessageDeleted);
         }
+        refuse_notice(&tx, message_id)?;
         if revision.is_some_and(|expected| expected != current.revision) {
             return Err(StoreError::RevisionConflict);
         }
@@ -1268,6 +1273,7 @@ impl Store {
             let message = load_message(&tx, board, message_id)?;
             return Ok(Changed { message, seq: None });
         }
+        refuse_notice(&tx, message_id)?;
         if revision.is_some_and(|expected| expected != current.revision) {
             return Err(StoreError::RevisionConflict);
         }
@@ -2190,6 +2196,15 @@ struct Current {
     thread_id: String,
     revision: u32,
     deleted: bool,
+}
+
+/// Refuses to change a board notice: a message with the reserved label
+/// `board.notice`. No request can set or clear that label.
+fn refuse_notice(conn: &Connection, message_id: &str) -> Result<()> {
+    if labels_of(conn, message_id)?.contains_key(openboard_api::grants::NOTICE_LABEL) {
+        return Err(StoreError::BoardNotice);
+    }
+    Ok(())
 }
 
 fn current_message(conn: &Connection, board: &BoardRef, message_id: &str) -> Result<Current> {
