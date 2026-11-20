@@ -1469,7 +1469,7 @@ impl Store {
     pub(crate) fn channels(&self, board_id: i64) -> Result<Vec<ChannelInfo>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT path, thread_count, last_activity_at FROM channels
+            "SELECT path, thread_count, last_activity_at, intake FROM channels
              WHERE board_id = ?1 ORDER BY path",
         )?;
         let rows = stmt.query_map([board_id], |row| {
@@ -1477,6 +1477,7 @@ impl Store {
                 path: row.get(0)?,
                 thread_count: row.get::<_, i64>(1)?.max(0) as u64,
                 last_activity_at: row.get(2)?,
+                intake: row.get(3)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)

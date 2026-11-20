@@ -757,6 +757,21 @@ impl Client {
             .map_err(|failure| self.needs(GRANTS, failure))
     }
 
+    /// `POST /channels/mode`.
+    pub async fn set_channel_mode(
+        &self,
+        request: &openboard_api::grants::ChannelMode,
+    ) -> Result<openboard_api::grants::ChannelMode, Failure> {
+        let http = self.request(
+            Method::POST,
+            self.endpoint(&["channels", "mode"]),
+            Some(REQUEST_TIMEOUT),
+        );
+        self.json(Self::with_json(http, request)?)
+            .await
+            .map_err(|failure| self.needs(GRANTS, failure))
+    }
+
     /// `GET /grants`.
     pub async fn grants(&self) -> Result<openboard_api::grants::GrantList, Failure> {
         let http = self.request(

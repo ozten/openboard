@@ -346,12 +346,12 @@ pub(super) async fn create_channel(
         Mode::Network => issuer(&caller, &board.name)?,
     };
     let writer = caller.writer();
-    let (path, private) = (request.path.clone(), request.private);
+    let (path, private, intake) = (request.path.clone(), request.private, request.intake);
     let made = state
         .db(move |state| {
             state
                 .store
-                .create_channel(&board, &writer, &issuer, &path, private)
+                .create_channel(&board, &writer, &issuer, &path, private, intake)
         })
         .await?;
     let now = now_ms();
@@ -360,7 +360,59 @@ pub(super) async fn create_channel(
         Json(ChannelCreated {
             path: request.path,
             private: request.private,
+            intake: request.intake,
             grants: made.grants.iter().map(|stored| view(stored, now)).collect(),
         }),
     ))
+}
+
+/// `POST /v1/boards/{board}/channels/mode`: makes a channel a work or an
+/// intake channel (S4). It takes `grant.manage` there, as it changes what
+/// may be done in it.
+pub(super) async fn set_channel_mode(
+    State(state): State<Shared>,
+    Extension(identity): Extension<Identity>,
+    headers: HeaderMap,
+    board: Result<Path<String>, PathRejection>,
+    body: Result<Bytes, BytesRejection>,
+) -> ApiResult<Json<openboard_api::grants::ChannelMode>> {
+    let caller = state.caller(&identity, &headers).await?;
+    let board: BoardRef = state.board(&caller, board).await?;
+    let request: openboard_api::grants::ChannelMode =
+        read_json(&headers, body, "channel mode", || {
+            AppError::invalid("the request body is too large for a channel mode")
+                .status(StatusCode::PAYLOAD_TOO_LARGE)
+        })?;
+    names::validate_channel(&request.path).map_err(invalid_channel)?;
+    state.require(&caller, Action::Read, &board.name, Some(&request.path))?;
+    if let Some(authority) = &caller.authority {
+        if authority.derived {
+            return Err(AppError::new(
+                codes::DERIVED_TOKEN,
+                "a derived token cannot change a channel's mode",
+            ));
+        }
+        if !authority
+            .access(&board.name, &request.path)
+            .verbs
+            .contains(grants::Verb::GrantManage)
+        {
+            return Err(AppError::new(
+                codes::NO_AUTHORITY,
+                "changing a channel's mode takes grant.manage there",
+            )
+            .next("`openboard explain <channel>` shows what you hold"));
+        }
+    }
+    let (board_id, path, intake) = (board.id, request.path.clone(), request.intake);
+    let found = state
+        .db(move |state| state.store.set_channel_intake(board_id, &path, intake))
+        .await?;
+    if !found {
+        return Err(
+            AppError::new(codes::NOT_FOUND, "no such channel on this board")
+                .next("create it with `openboard channels create <path> --intake`"),
+        );
+    }
+    Ok(Json(request))
 }

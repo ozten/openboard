@@ -1181,7 +1181,9 @@ impl Store {
             Value::Text(states::READY.to_owned()),
         ];
         let mut sql = format!(
-            "SELECT t.id, t.channel FROM tasks t WHERE t.board_id = ? AND t.state = ? AND {}",
+            "SELECT t.id, t.channel FROM tasks t WHERE t.board_id = ? AND t.state = ? \
+             AND NOT EXISTS (SELECT 1 FROM channels c WHERE c.board_id = t.board_id \
+                             AND c.path = t.channel AND c.intake = 1) AND {}",
             channel_clause("t.channel", channel, &mut values)
         );
         // Kept for the caller, or unassigned and from a creator it takes from.

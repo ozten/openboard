@@ -33,6 +33,7 @@ ALTER TABLE credentials ADD COLUMN board TEXT;
 ALTER TABLE credentials ADD COLUMN scope TEXT;
 ALTER TABLE credentials ADD COLUMN profile TEXT;
 CREATE INDEX credentials_by_parent ON credentials(parent_id) WHERE parent_id IS NOT NULL;
+ALTER TABLE channels ADD COLUMN intake INTEGER NOT NULL DEFAULT 0;
 CREATE TABLE profile_limits (
     principal_id TEXT NOT NULL REFERENCES principals(id),
     board_id     INTEGER NOT NULL REFERENCES boards(id),
@@ -698,6 +699,32 @@ impl super::Store {
         Ok((snapshot, limits))
     }
 
+    /// Whether the channel is an intake channel (S4); `None` when it does
+    /// not exist.
+    pub(crate) fn channel_intake(&self, board_id: i64, path: &str) -> super::Result<Option<bool>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT intake FROM channels WHERE board_id = ?1 AND path = ?2",
+                params![board_id, path],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Sets a channel's mode. Whether the channel exists.
+    pub(crate) fn set_channel_intake(
+        &self,
+        board_id: i64,
+        path: &str,
+        intake: bool,
+    ) -> super::Result<bool> {
+        Ok(self.conn().execute(
+            "UPDATE channels SET intake = ?3 WHERE board_id = ?1 AND path = ?2",
+            params![board_id, path, intake],
+        )? == 1)
+    }
+
     pub(crate) fn board_grants(&self, board_id: i64) -> super::Result<Vec<StoredGrant>> {
         Ok(board_grants(&self.conn(), board_id)?)
     }
@@ -714,6 +741,7 @@ impl super::Store {
         issuer: &IssuerSpec,
         path: &str,
         private: bool,
+        intake: bool,
     ) -> super::Result<ChannelMade> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -762,9 +790,10 @@ impl super::Store {
         }
         let now = crate::time::now_rfc3339();
         tx.execute(
-            "INSERT INTO channels (board_id, path, created_at, thread_count, last_activity_at)
-             VALUES (?1, ?2, ?3, 0, ?3)",
-            params![board.id, path, now],
+            "INSERT INTO channels (board_id, path, created_at, thread_count, last_activity_at,
+                                   intake)
+             VALUES (?1, ?2, ?3, 0, ?3, ?4)",
+            params![board.id, path, now, intake],
         )?;
         tx.commit()?;
         Ok(ChannelMade { grants: made })

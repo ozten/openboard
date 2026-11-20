@@ -40,6 +40,18 @@ use crate::store::{
 };
 use crate::Mode;
 
+/// The error for a task created or claimed in an intake channel (S4).
+fn intake_refused() -> AppError {
+    AppError::new(
+        codes::INTAKE_CHANNEL,
+        "this is an intake channel: tasks cannot be created or claimed here",
+    )
+    .next(
+        "promote the request into a work channel with `openboard tasks create <work-channel> \
+         --from <message-id>`",
+    )
+}
+
 /// The error for a refused task write.
 pub(super) fn task_error(error: TaskError) -> AppError {
     match error {
@@ -243,12 +255,12 @@ impl AppState {
             Some(board) => {
                 self.require(caller, Action::Post, &board.name, Some(channel))?;
                 self.require(caller, Action::CreateTask, &board.name, Some(channel))?;
-                let (board_id, path) = (board.id, channel.to_owned());
-                if !self
-                    .db(move |state| state.store.channel_exists(board_id, &path))
-                    .await?
-                {
-                    self.require(caller, Action::CreateChannel, &board.name, Some(channel))?;
+                match self.intake(board.id, channel).await? {
+                    None => {
+                        self.require(caller, Action::CreateChannel, &board.name, Some(channel))?
+                    }
+                    Some(true) => return Err(intake_refused()),
+                    Some(false) => {}
                 }
                 Ok(PostTarget::Board(board))
             }
@@ -260,6 +272,17 @@ impl AppState {
                 Ok(PostTarget::NewBoard(board_name.to_owned()))
             }
         }
+    }
+
+    /// Whether a channel is an intake channel; `None` when it does not exist.
+    async fn intake(
+        self: &std::sync::Arc<Self>,
+        board_id: i64,
+        channel: &str,
+    ) -> ApiResult<Option<bool>> {
+        let path = channel.to_owned();
+        self.db(move |state| state.store.channel_intake(board_id, &path))
+            .await
     }
 
     /// Refuses prerequisites in channels the caller may not read, with the
@@ -326,7 +349,7 @@ pub(super) async fn create_task(
     names::validate_board(&board_name)
         .map_err(|reason| AppError::new(codes::INVALID_BOARD, reason))?;
     let limit = state.max_message_chars;
-    let request: CreateTaskRequest = read_json(&headers, body, "task request", || {
+    let mut request: CreateTaskRequest = read_json(&headers, body, "task request", || {
         message_too_large(format!(
             "the request body is too large for a brief of at most {limit} characters"
         ))
@@ -365,6 +388,9 @@ pub(super) async fn create_task(
         (None, None, Some(thread_id)) => {
             let (board, channel) = state.task_place(&caller, &board_name, thread_id).await?;
             state.require(&caller, Action::CreateTask, &board.name, Some(&channel))?;
+            if state.intake(board.id, &channel).await? == Some(true) {
+                return Err(intake_refused());
+            }
             if !request.labels.is_empty() {
                 state.require(&caller, Action::Label, &board.name, Some(&channel))?;
             }
@@ -385,6 +411,34 @@ pub(super) async fn create_task(
         state
             .readable_needs(&caller, board, request.needs.clone())
             .await?;
+    }
+    // Promoting a request (S4): the task records where it came from. The
+    // caller must read the request, and needs task.create where the task
+    // goes, which was checked above.
+    if let Some(origin) = request.origin.clone() {
+        let PostTarget::Board(board) = &target else {
+            return Err(thread_not_found());
+        };
+        if request.thread_id.is_some() {
+            return Err(AppError::invalid(
+                "`origin` promotes a request into a new task: give `channel` and `text`",
+            ));
+        }
+        let (_, from) = state.task_place(&caller, &board.name, &origin).await?;
+        if state.intake(board.id, &from).await? != Some(true) {
+            return Err(AppError::invalid(
+                "`origin` names a message in an intake channel; this one is in a work channel",
+            )
+            .next("make the thread itself a task with `openboard tasks create <id>`"));
+        }
+        if request.labels.len() + 1 >= MAX_LABELS_PER_MESSAGE {
+            return Err(invalid_label(
+                "a promoted task keeps one label for its origin",
+            ));
+        }
+        request
+            .labels
+            .insert(openboard_api::grants::ORIGIN_LABEL.to_owned(), origin);
     }
 
     let by = caller.writer();
@@ -842,6 +896,9 @@ pub(super) async fn task_action(
     ) || (action == actions::BLOCK && proof.is_some());
     if claiming {
         state.require(&caller, Action::ClaimTask, &board.name, Some(&channel))?;
+        if action == actions::CLAIM && state.intake(board.id, &channel).await? == Some(true) {
+            return Err(intake_refused());
+        }
     } else if !state.allows(&caller, Action::CreateTask, &board.name, Some(&channel))
         && !state.allows(&caller, Action::ManageTasks, &board.name, Some(&channel))
     {

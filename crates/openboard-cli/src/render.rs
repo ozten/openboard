@@ -285,10 +285,11 @@ pub fn channels(list: &ChannelList, board: &str) -> String {
     for channel in &list.channels {
         let _ = writeln!(
             out,
-            "{:width$}  {:>11}  last activity {}",
+            "{:width$}  {:>11}  last activity {}{}",
             line(&channel.path),
             count(channel.thread_count, "thread", "threads"),
             line(&channel.last_activity_at),
+            if channel.intake { "  (intake)" } else { "" },
         );
     }
     out.truncate(out.trim_end().len());

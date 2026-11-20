@@ -531,6 +531,9 @@ async fn dispatch(
             Command::Channels(cli::ChannelsArgs {
                 command: Some(cli::ChannelsCommand::Create(args)),
             }) => grants::create_channel(&ctx, args).await,
+            Command::Channels(cli::ChannelsArgs {
+                command: Some(cli::ChannelsCommand::Mode(args)),
+            }) => grants::channel_mode(&ctx, args).await,
             Command::Grant(args) => grants::grant(&ctx, args).await,
             Command::Grants => grants::list(&ctx).await,
             Command::Profiles(args) => grants::profiles(&ctx, args).await,

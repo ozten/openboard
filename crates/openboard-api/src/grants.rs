@@ -127,16 +127,38 @@ pub struct NewChannel {
     /// others (Z7).
     #[serde(default)]
     pub private: bool,
+    /// An intake channel (S4), where tasks cannot be created or claimed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub intake: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChannelCreated {
     pub path: String,
     pub private: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub intake: bool,
     /// The grants written with a private channel.
     #[serde(default)]
     pub grants: Vec<Grant>,
 }
+
+/// `POST` sets a channel's mode: work or intake (S4). It takes
+/// `grant.manage` in the channel.
+pub fn channel_mode_path(board: &str) -> String {
+    format!("/v1/boards/{board}/channels/mode")
+}
+
+/// The body of `POST /v1/boards/{board}/channels/mode`, and its answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelMode {
+    pub path: String,
+    pub intake: bool,
+}
+
+/// The label a task promoted from an intake request carries: the request's
+/// message ID (S4).
+pub const ORIGIN_LABEL: &str = "board.origin";
 
 /// The label on a notice the board posts itself. Its value says why, such
 /// as [`NOTICE_ACCESS_GRANTED`].

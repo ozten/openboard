@@ -119,6 +119,7 @@ pub async fn create_channel(ctx: &Ctx<'_>, args: &ChannelCreateArgs) -> Result<(
         .create_channel(&NewChannel {
             path: args.path.clone(),
             private: args.private,
+            intake: args.intake,
         })
         .await?;
     ctx.print(&created, || {
@@ -128,9 +129,32 @@ pub async fn create_channel(ctx: &Ctx<'_>, args: &ChannelCreateArgs) -> Result<(
                 "created private channel {path}: only you can use it; admit others with \
                  `openboard grant {path}/ <who> <verbs>`"
             )
+        } else if created.intake {
+            format!("created intake channel {path}: tasks cannot be created or claimed in it")
         } else {
             format!("created channel {path}")
         }
+    })
+}
+
+pub async fn channel_mode(
+    ctx: &Ctx<'_>,
+    args: &crate::cli::ChannelModeArgs,
+) -> Result<(), Failure> {
+    let intake = args.mode == crate::cli::ChannelModeArg::Intake;
+    let set = ctx
+        .client
+        .set_channel_mode(&openboard_api::grants::ChannelMode {
+            path: args.path.clone(),
+            intake,
+        })
+        .await?;
+    ctx.print(&set, || {
+        format!(
+            "{} is now {} channel",
+            render::safe(&set.path),
+            if set.intake { "an intake" } else { "a work" }
+        )
     })
 }
 

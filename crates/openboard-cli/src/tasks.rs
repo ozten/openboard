@@ -432,6 +432,7 @@ async fn create(ctx: &Ctx<'_>, args: &TaskCreateArgs, input: CreateInput) -> Res
                 claim: args.claim,
                 lease_secs: lease_secs(args.lease),
                 idempotency_key: args.key.clone(),
+                origin: args.origin.clone(),
                 ..CreateTaskRequest::default()
             };
             created_one(ctx, &request).await

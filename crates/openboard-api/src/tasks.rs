@@ -218,6 +218,10 @@ pub struct CreateTaskRequest {
     /// with the task created first, `duplicate: true`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
+    /// Promote a request: the ID of a message in an intake channel this
+    /// task carries out (S4). The task gets the `board.origin` label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -1090,3 +1090,167 @@ async fn a_claim_across_a_subtree_takes_only_what_the_caller_may_claim() {
         .unwrap();
     assert_eq!(refused.status(), StatusCode::FORBIDDEN);
 }
+
+// ---------------------------------------------------------------------------
+// Intake channels (S4)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn requests_arrive_in_intake_and_only_task_creators_promote_them() {
+    let board = Board::closed().await;
+    let lead = board.enrol("lead").await;
+    let worker = board.enrol("worker").await;
+    let customer = board.enrol("customer").await;
+    board.grant("*", "lead", "all");
+    board.grant("inbox", "customer", "read,post");
+    board.grant("inbox", "worker", "read");
+    board.grant("build/", "worker", "read,post,react,label,task.claim");
+
+    let made = board
+        .post_json(
+            &lead,
+            "/v1/boards/general/channels",
+            json!({ "path": "inbox", "intake": true }),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(made.status(), StatusCode::CREATED);
+    let request = board
+        .posted(&customer, "inbox", "please add CSV export")
+        .await;
+    let request_id = request.message.id.clone();
+
+    // No tasks in intake: not created there, not made from its threads.
+    let create = |token: &str, body: Value| {
+        board
+            .post_json(token, "/v1/boards/general/tasks", body)
+            .send()
+    };
+    error_of(
+        create(&lead, json!({ "channel": "inbox", "text": "a task" }))
+            .await
+            .unwrap(),
+        StatusCode::CONFLICT,
+        codes::INTAKE_CHANNEL,
+    )
+    .await;
+    error_of(
+        create(&lead, json!({ "thread_id": request_id }))
+            .await
+            .unwrap(),
+        StatusCode::CONFLICT,
+        codes::INTAKE_CHANNEL,
+    )
+    .await;
+
+    // The worker cannot promote it: it lacks task.create in build/.
+    error_of(
+        create(
+            &worker,
+            json!({ "channel": "build/api", "text": "CSV export", "origin": request_id }),
+        )
+        .await
+        .unwrap(),
+        StatusCode::FORBIDDEN,
+        codes::FORBIDDEN,
+    )
+    .await;
+    board.posted(&lead, "build/api", "the work channel").await;
+    let promoted: Value = create(
+        &lead,
+        json!({ "channel": "build/api", "text": "CSV export", "origin": request_id }),
+    )
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(
+        promoted["task"]["labels"]["board.origin"], request_id,
+        "{promoted}"
+    );
+
+    // The worker claims, replies and completes it with post and task.claim.
+    let claimed: Value = board
+        .post_json(
+            &worker,
+            "/v1/boards/general/tasks/claim",
+            json!({ "channel": "build/", "from": ["lead"] }),
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let claim = &claimed["claim"];
+    let id = claim["task"]["id"].as_str().unwrap().to_owned();
+    let reply = board
+        .post_json(
+            &worker,
+            "/v1/boards/general/messages",
+            json!({ "thread_id": id, "text": "halfway" }),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert!(reply.status().is_success(), "{}", reply.status());
+    let done = board
+        .post_json(
+            &worker,
+            &format!("/v1/boards/general/tasks/{id}/complete"),
+            json!({ "epoch": claim["epoch"], "token": claim["token"], "result": "shipped" }),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        done.status(),
+        StatusCode::OK,
+        "{}",
+        done.text().await.unwrap()
+    );
+
+    // An origin in a work channel is refused; changing a mode takes
+    // grant.manage there.
+    let wrong = create(
+        &lead,
+        json!({ "channel": "build/api", "text": "again", "origin": id }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(wrong.status(), StatusCode::BAD_REQUEST);
+    let mode = |token: &str| {
+        board
+            .post_json(
+                token,
+                "/v1/boards/general/channels/mode",
+                json!({ "path": "inbox", "intake": false }),
+            )
+            .send()
+    };
+    error_of(
+        mode(&worker).await.unwrap(),
+        StatusCode::FORBIDDEN,
+        codes::NO_AUTHORITY,
+    )
+    .await;
+    assert_eq!(mode(&lead).await.unwrap().status(), StatusCode::OK);
+    let channels: Value = board
+        .get(&lead, "/v1/boards/general/channels")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        channels["channels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|channel| channel.get("intake").is_none()),
+        "{channels}"
+    );
+}

@@ -1341,6 +1341,24 @@ pub struct ChannelsArgs {
 pub enum ChannelsCommand {
     /// Create an empty channel
     Create(ChannelCreateArgs),
+    /// Make a channel a work channel or an intake channel (needs grant.manage there)
+    Mode(ChannelModeArgs),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ChannelModeArg {
+    /// Tasks are created and claimed here
+    Work,
+    /// Requests arrive here; tasks cannot be created or claimed
+    Intake,
+}
+
+#[derive(Debug, Args)]
+pub struct ChannelModeArgs {
+    /// The channel path
+    pub path: String,
+    #[arg(value_enum)]
+    pub mode: ChannelModeArg,
 }
 
 #[derive(Debug, Args)]
@@ -1350,6 +1368,10 @@ pub struct ChannelCreateArgs {
     /// Close it to everyone but you; you can admit others with `openboard grant`
     #[arg(long)]
     pub private: bool,
+    /// An intake channel: requests arrive here, and tasks cannot be created
+    /// or claimed; promote one with `openboard tasks create <channel> --from <id>`
+    #[arg(long)]
+    pub intake: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1841,6 +1863,11 @@ pub struct TaskCreateArgs {
     /// Idempotency key: running the same command again creates nothing more
     #[arg(long, visible_alias = "idempotency-key", value_name = "KEY")]
     pub key: Option<String>,
+
+    /// Promote a request: the ID of a message in an intake channel this task
+    /// carries out. The task gets the `board.origin` label
+    #[arg(long = "from", value_name = "MESSAGE_ID", conflicts_with = "file")]
+    pub origin: Option<String>,
 }
 
 #[derive(Debug, Args)]

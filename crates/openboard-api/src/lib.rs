@@ -249,6 +249,8 @@ pub mod codes {
     /// A derived token cannot do this (A10): change grants, create private
     /// channels or boards, or mint a token deeper than the limit.
     pub const DERIVED_TOKEN: &str = "derived_token";
+    /// Tasks cannot be created or claimed in an intake channel (S4).
+    pub const INTAKE_CHANNEL: &str = "intake_channel";
     /// The channel, or a channel under it, exists, or a grant already
     /// reaches it, so it cannot be created as asked.
     pub const CHANNEL_EXISTS: &str = "channel_exists";
@@ -532,6 +534,10 @@ pub struct ChannelInfo {
     pub thread_count: u64,
     /// RFC 3339 timestamp of the newest message in the channel.
     pub last_activity_at: String,
+    /// An intake channel (S4): requests arrive here, and tasks cannot be
+    /// created or claimed in it. Absent means a work channel.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub intake: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

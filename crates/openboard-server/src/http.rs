@@ -281,6 +281,10 @@ pub(crate) fn router(parts: Parts) -> (Router, Maintenance) {
         )
         .route("/v1/boards/{board}/explain", get(grants_routes::explain))
         .route(
+            "/v1/boards/{board}/channels/mode",
+            post(grants_routes::set_channel_mode),
+        )
+        .route(
             "/v1/boards/{board}/profiles",
             get(tokens_routes::list_profiles),
         )
@@ -424,6 +428,7 @@ impl AppError {
             | codes::NOT_TASK_CREATOR
             | codes::NO_AUTHORITY
             | codes::DERIVED_TOKEN => StatusCode::FORBIDDEN,
+            codes::INTAKE_CHANNEL => StatusCode::CONFLICT,
             codes::UNAUTHENTICATED => StatusCode::UNAUTHORIZED,
             codes::RATE_LIMITED => StatusCode::TOO_MANY_REQUESTS,
             codes::IDEMPOTENCY_CONFLICT
