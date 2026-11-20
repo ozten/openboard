@@ -42,7 +42,11 @@ async fn hosted() -> Hosted {
     authority
         .distinguished_name
         .push(DnType::CommonName, "openboard test authority");
-    let authority_der = authority.self_signed(&authority_key).unwrap().der().to_vec();
+    let authority_der = authority
+        .self_signed(&authority_key)
+        .unwrap()
+        .der()
+        .to_vec();
     let issuer = Issuer::new(authority, authority_key);
     let key = KeyPair::generate().unwrap();
     let cert = CertificateParams::new(vec!["localhost".to_owned()])
@@ -80,13 +84,12 @@ async fn hosted() -> Hosted {
 
     let mut roots = RootCertStore::empty();
     roots.add(CertificateDer::from(authority_der)).unwrap();
-    let tls = ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_protocol_versions(&[&rustls::version::TLS13])
-    .unwrap()
-    .with_root_certificates(roots)
-    .with_no_client_auth();
+    let tls =
+        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
     let http = Client::builder()
         .no_proxy()
         .use_preconfigured_tls(tls)
@@ -159,7 +162,10 @@ async fn a_person_signs_in_at_the_host_name_and_the_session_belongs_to_it() {
     for attribute in ["Secure", "HttpOnly", "SameSite=Strict", "Path=/"] {
         assert!(set_cookie.contains(attribute), "{set_cookie}");
     }
-    assert!(!set_cookie.to_ascii_lowercase().contains("domain"), "{set_cookie}");
+    assert!(
+        !set_cookie.to_ascii_lowercase().contains("domain"),
+        "{set_cookie}"
+    );
     let cookie = set_cookie.split(';').next().unwrap().to_owned();
     let session: Session = response.json().await.unwrap();
     assert_eq!(session.actor.handle, "ada@example.com");

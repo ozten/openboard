@@ -488,6 +488,17 @@ fn agents_join_a_trusted_board_by_its_host_name_with_no_fingerprint() {
         "{human:?}"
     );
 
+    // A person is told what their browser will show.
+    let person = run(openboard()
+        .args(["invite", "ada@example.com", "--data-dir"])
+        .arg(hosted.data_dir()))
+    .ok();
+    assert!(
+        person.stdout.contains("shows no certificate warning"),
+        "{person:?}"
+    );
+    assert!(!person.stdout.contains("self-signed"), "{person:?}");
+
     // Joining needs the invite and nothing else.
     let agent = hosted.agent();
     let joined = run(agent.cli().args(["--json", "join", &invite]))

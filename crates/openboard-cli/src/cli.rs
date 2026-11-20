@@ -1112,8 +1112,19 @@ pub struct SecurityLogArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct BackupArgs {
+    /// Write the backup to this file, which must not exist, or into this
+    /// directory under its default name [default: the data directory]
+    #[arg(long, value_name = "FILE_OR_DIR")]
+    pub to: Option<PathBuf>,
+
+    #[command(flatten)]
+    pub data: DataDirArgs,
+}
+
+#[derive(Debug, Args)]
 pub struct BackupsArgs {
-    /// Delete every backup listed, instead of listing them
+    /// Delete the backups taken before migrations, instead of listing them
     #[arg(long)]
     pub prune: bool,
 
@@ -1149,13 +1160,40 @@ Example:
   openboard admin upgrade-check --data-dir ./board-data")]
     UpgradeCheck(DataDirArgs),
 
-    /// List the backups taken before migrations, or delete them with --prune
+    /// Write a consistent copy of the board's database, also while it runs
+    #[command(after_help = "\
+The copy is one file that holds the board as it was at one moment, even while
+the board goes on writing. Copy it off the machine to keep it. By default it
+is written into the data directory as openboard.db.backup-<UTC time>. --to
+names a file, or a directory to write that file into. The file is readable
+only by its owner, and a backup never replaces a file that exists.
+
+The backup holds hashes of every token and session, and the text of every
+message, including messages deleted after it was taken. It does not hold the
+board's certificate: for a board with a self-signed certificate, keep
+tls-cert.pem and tls-key.pem from the data directory too. See
+docs/backup-and-restore.md in the repository for how to restore.
+
+Nothing is migrated: a database older than this openboard is copied as it is,
+and one newer than it is refused.
+
+Examples:
+  openboard admin backup --data-dir ./board-data
+  openboard admin backup --to /var/backups/openboard --data-dir ./board-data
+  openboard admin backup --json --to ./board.db --data-dir ./board-data")]
+    Backup(BackupArgs),
+
+    /// List the backups in the data directory, or delete the pre-migration ones with --prune
     #[command(after_help = "\
 Before a newer server migrates the database it writes a whole copy beside it,
 named openboard.db.pre-v<N>-<UTC time>. That copy keeps the text of every
 message as it was, including messages deleted or edited later, so delete it
 once the upgrade is confirmed. --prune removes every such file and never
 touches the database itself.
+
+Backups taken with `openboard admin backup` into the data directory, named
+openboard.db.backup-<UTC time>, are listed too, as on-demand backups. --prune
+leaves them alone: delete them yourself when you no longer need them.
 
 Examples:
   openboard admin backups --data-dir ./board-data

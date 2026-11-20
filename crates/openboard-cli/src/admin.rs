@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use openboard_api::auth::{CredentialInfo, DEFAULT_TOKEN_TTL_SECS};
 use openboard_api::ActorKind;
 use openboard_server::operator::{
-    self, Backup, InviteOptions, Invited, OperatorError, PersonInvite, PrincipalInfo,
+    self, Backup, BackupKind, InviteOptions, Invited, OperatorError, PersonInvite, PrincipalInfo,
     UpgradeAction, UpgradeCheck,
 };
 use openboard_server::Mode;
@@ -24,6 +24,16 @@ use crate::{cli, render, shell_quote, write_stdout};
 /// Every credential ID starts with this, and no agent name can: names have
 /// no underscore. That is how `admin revoke` tells the two apart.
 const CREDENTIAL_ID_PREFIX: &str = "crd_";
+
+/// Where the restore procedure is written down, as `admin backup` points to
+/// it.
+const RESTORE_DOC: &str = "https://github.com/ozten/openboard/blob/main/docs/backup-and-restore.md";
+
+/// What every backup holds, as `admin backup` and the restore document say
+/// it.
+const BACKUP_WARNING: &str = "the backup holds the hashes of every token and session and the \
+                              text of every message, including messages deleted after it was \
+                              taken, so keep it as private as the data directory";
 
 /// The current time as the server writes timestamps: RFC 3339 in UTC with
 /// milliseconds, a fixed width, so two of them compare as text.
@@ -93,6 +103,15 @@ fn failure_of(error: OperatorError, data_dir: &Path) -> Failure {
         OperatorError::NotMigrated => Failure::new(codes::OPERATOR_FAILED, message).next(format!(
             "run `openboard admin upgrade-check --data-dir {dir}`, then start the server once"
         )),
+        OperatorError::BackupExists(_) => Failure::new(codes::FILE_EXISTS, message).next(
+            "pass --to with a file name that is not taken yet, or with a directory to write a new \
+             file into",
+        ),
+        OperatorError::BackupNotWritten(_, _) => Failure::new(codes::OPERATOR_FAILED, message)
+            .next(format!(
+                "pass --to with a directory this user can write to, with room for a copy of the \
+                 database (`openboard admin upgrade-check --data-dir {dir}` shows its size)"
+            )),
         OperatorError::Storage(_) => Failure::new(codes::OPERATOR_FAILED, message)
             .next("check that you can read and write the data directory, then retry"),
     }
@@ -224,6 +243,7 @@ fn person_invited(
                 "url": person.url,
                 "expires_at": person.expires_at,
                 "session_ttl_secs": person.session_ttl_secs,
+                "certificate_warning": !person.trusted,
             })
             .to_string(),
         );
@@ -246,15 +266,26 @@ fn person_invited(
          Send this link to {email} yourself, over a channel you trust: no email is sent, and \
          whoever opens it first becomes {email} on the board.\n\
          Opening it and pressing \"Sign in\" signs that browser in. It works once.\n\
-         The browser will show a certificate warning, because the board's certificate is \
-         self-signed. Before accepting it, they should check that the address is {}.",
+         {}",
         person.id,
         person.url,
         person.expires_at,
         cli::format_duration(args.ttl),
         cli::format_duration(Duration::from_secs(person.session_ttl_secs)),
         person.link,
-        person.url,
+        if person.trusted {
+            format!(
+                "The browser shows no certificate warning. If it does, they should not go on: \
+                 the address is not {}, or the connection is being intercepted.",
+                person.url
+            )
+        } else {
+            format!(
+                "The browser will show a certificate warning, because the board's certificate \
+                 is self-signed. Before accepting it, they should check that the address is {}.",
+                person.url
+            )
+        },
     ))
 }
 
@@ -316,6 +347,7 @@ fn data_dir_of(command: &AdminCommand) -> PathBuf {
         | AdminCommand::Invites(args) => args.data_dir.clone(),
         AdminCommand::Revoke(args) => args.data.data_dir.clone(),
         AdminCommand::SecurityLog(args) => args.data.data_dir.clone(),
+        AdminCommand::Backup(args) => args.data.data_dir.clone(),
         AdminCommand::Backups(args) => args.data.data_dir.clone(),
         AdminCommand::VerifyLog(args) => args.data_dir.clone(),
         AdminCommand::Grant(args) => args.data.data_dir.clone(),
@@ -543,6 +575,57 @@ note: {note}"
     }
 }
 
+/// `admin backup [--to <file-or-dir>]`.
+async fn backup(json_output: bool, dir: &Path, to: Option<PathBuf>) -> Result<(), Failure> {
+    let (written, info) = operate(dir, move |dir| {
+        let written = operator::backup(dir, to.as_deref())?;
+        // Only to say whether the certificate files matter; the backup is
+        // written either way.
+        Ok((written, operator::board_info(dir).ok()))
+    })
+    .await?;
+    if json_output {
+        return write_stdout(
+            &json!({
+                "path": written.path.display().to_string(),
+                "bytes": written.bytes,
+                "schema_version": written.schema_version,
+                "created_at": written.created_at,
+            })
+            .to_string(),
+        );
+    }
+    let mut human = format!(
+        "backup written: {} ({}, readable only by its owner)\n\
+         taken at {}, schema version {}\n\
+         {BACKUP_WARNING}",
+        written.path.display(),
+        bytes(written.bytes),
+        written.created_at,
+        written.schema_version,
+    );
+    let self_signed = info.is_some_and(|info| info.mode == Mode::Network && !info.trusted);
+    if self_signed {
+        human.push_str(&format!(
+            "\nthe board's certificate is not in it: keep {} and {} from {} with it, or every \
+             agent must enrol again after a restore",
+            openboard_server::CERT_FILE_NAME,
+            openboard_server::KEY_FILE_NAME,
+            dir.display(),
+        ));
+    }
+    human.push_str(&format!("\nto restore it, follow {RESTORE_DOC}"));
+    write_stdout(&human)
+}
+
+/// What a backup is, for people.
+fn backup_kind(kind: BackupKind) -> &'static str {
+    match kind {
+        BackupKind::PreMigration => "pre-migration",
+        BackupKind::OnDemand => "on-demand",
+    }
+}
+
 /// `admin backups [--prune]`.
 async fn backups(json_output: bool, dir: &Path, prune: bool) -> Result<(), Failure> {
     let found: Vec<Backup> = if prune {
@@ -550,11 +633,18 @@ async fn backups(json_output: bool, dir: &Path, prune: bool) -> Result<(), Failu
     } else {
         operate(dir, operator::list_backups).await?
     };
+    // What --prune leaves, so that it can say so.
+    let kept = if prune {
+        operate(dir, operator::list_backups).await?.len()
+    } else {
+        0
+    };
     if json_output {
         let rows: Vec<serde_json::Value> = found
             .iter()
             .map(|backup| {
                 json!({
+                    "kind": backup.kind.as_str(),
                     "path": backup.path.display().to_string(),
                     "file_name": backup.file_name,
                     "size_bytes": backup.size_bytes,
@@ -567,36 +657,66 @@ async fn backups(json_output: bool, dir: &Path, prune: bool) -> Result<(), Failu
         return write_stdout(&json!({ "backups": rows, "pruned": prune }).to_string());
     }
     let dir_flag = shell_quote(&dir.display().to_string());
+    let on_demand_kept = format!(
+        "{kept} on-demand backup(s) taken with `openboard admin backup` are kept: --prune never \
+         deletes them"
+    );
+    if prune {
+        let mut human = if found.is_empty() {
+            format!("no pre-migration backups in {}", dir.display())
+        } else {
+            let names: Vec<String> = found.iter().map(|b| render::safe(&b.file_name)).collect();
+            format!(
+                "deleted {} pre-migration backup(s) from {}: {}",
+                found.len(),
+                dir.display(),
+                names.join(", ")
+            )
+        };
+        if kept > 0 {
+            human.push_str(&format!("\n{on_demand_kept}"));
+        }
+        return write_stdout(&human);
+    }
     if found.is_empty() {
         return write_stdout(&format!("no backups in {}", dir.display()));
-    }
-    if prune {
-        let names: Vec<String> = found.iter().map(|b| render::safe(&b.file_name)).collect();
-        return write_stdout(&format!(
-            "deleted {} backup(s) from {}: {}",
-            found.len(),
-            dir.display(),
-            names.join(", ")
-        ));
     }
     let rows: Vec<Vec<String>> = found
         .iter()
         .map(|backup| {
             vec![
                 backup.file_name.clone(),
+                backup_kind(backup.kind).to_owned(),
                 bytes(backup.size_bytes),
                 backup.age_secs.map_or_else(|| "-".to_owned(), age),
                 or_dash(&backup.modified_at),
             ]
         })
         .collect();
-    write_stdout(&format!(
+    let mut human = format!(
         "{}\n\
-         each backup keeps the text of messages deleted or edited since it was taken; once the \
-         upgrade is confirmed, delete them with: openboard admin backups --prune --data-dir \
-         {dir_flag}",
-        render::table(&["FILE", "SIZE", "AGE", "WRITTEN"], &rows)
-    ))
+         each backup keeps the text of messages deleted or edited since it was taken",
+        render::table(&["FILE", "KIND", "SIZE", "AGE", "WRITTEN"], &rows)
+    );
+    if found
+        .iter()
+        .any(|backup| backup.kind == BackupKind::PreMigration)
+    {
+        human.push_str(&format!(
+            "\nonce the upgrade is confirmed, delete the pre-migration ones with: openboard \
+             admin backups --prune --data-dir {dir_flag}"
+        ));
+    }
+    if found
+        .iter()
+        .any(|backup| backup.kind == BackupKind::OnDemand)
+    {
+        human.push_str(
+            "\n--prune leaves the on-demand ones alone: delete those yourself once a newer copy \
+             is kept off the machine",
+        );
+    }
+    write_stdout(&human)
 }
 
 /// What an empty listing means on this data directory.
@@ -626,10 +746,16 @@ pub async fn run(json_output: bool, command: &AdminCommand) -> Result<(), Failur
         AdminCommand::Backups(args) => return backups(json_output, &dir, args.prune).await,
         _ => {}
     }
+    // This opens the database as the commands below do, and copies it.
+    if let AdminCommand::Backup(args) = command {
+        return backup(json_output, &dir, args.to.clone()).await;
+    }
     // Also the check that the directory holds a board at all.
     let info = operate(&dir, operator::board_info).await?;
     match command {
-        AdminCommand::UpgradeCheck(_) | AdminCommand::Backups(_) => Ok(()),
+        AdminCommand::UpgradeCheck(_) | AdminCommand::Backups(_) | AdminCommand::Backup(_) => {
+            Ok(())
+        }
         AdminCommand::Info(_) => {
             let check = operate(&dir, operator::upgrade_check).await?;
             let mut human = format!("mode: {}", info.mode);

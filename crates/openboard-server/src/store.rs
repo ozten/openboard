@@ -1803,8 +1803,13 @@ pub(crate) fn unsupported_schema(conn: &Connection, found: i64) -> String {
     )
 }
 
-/// The start of every backup's file name.
+/// The start of the file name of every backup a server writes before a
+/// migration.
 pub(crate) const BACKUP_PREFIX: &str = "openboard.db.pre-v";
+
+/// The start of the file name of every backup taken on demand with
+/// `openboard admin backup`: `openboard.db.backup-20261119T153000Z`.
+pub(crate) const ON_DEMAND_BACKUP_PREFIX: &str = "openboard.db.backup-";
 
 /// The file names of the backups taken before a migration to `schema`, as
 /// a pattern for people.
@@ -1812,9 +1817,9 @@ pub(crate) fn backup_pattern(schema: i64) -> String {
     format!("{BACKUP_PREFIX}{schema}-<UTC time>")
 }
 
-/// The file name of a backup taken now, before a migration to `schema`:
-/// `openboard.db.pre-v3-20261119T153000Z`.
-pub(crate) fn backup_file_name(schema: i64) -> String {
+/// The current time in UTC to the second, as backup file names carry it:
+/// `20261119T153000Z`. Such names sort in the order they were taken.
+fn compact_utc_now() -> String {
     // `2026-11-19T15:30:00.123Z` without its punctuation and milliseconds.
     let now = now_rfc3339();
     let compact: String = now
@@ -1822,35 +1827,57 @@ pub(crate) fn backup_file_name(schema: i64) -> String {
         .take(19)
         .filter(|c| !matches!(c, '-' | ':'))
         .collect();
-    format!("{BACKUP_PREFIX}{schema}-{compact}Z")
+    format!("{compact}Z")
 }
 
-/// Writes a consistent copy of the database beside it, before a migration
-/// from schema version `found` changes anything, and tells the operator on
-/// stderr where it is and how to go back. An error means no migration may
-/// run: the database has not been touched, and what there is of the copy
-/// has been removed.
+/// The file name of a backup taken now, before a migration to `schema`:
+/// `openboard.db.pre-v3-20261119T153000Z`.
+pub(crate) fn backup_file_name(schema: i64) -> String {
+    format!("{BACKUP_PREFIX}{schema}-{}", compact_utc_now())
+}
+
+/// The file name of a backup taken now on demand:
+/// `openboard.db.backup-20261119T153000Z`.
+pub(crate) fn on_demand_backup_file_name() -> String {
+    format!("{ON_DEMAND_BACKUP_PREFIX}{}", compact_utc_now())
+}
+
+/// Why [`write_copy`] wrote no copy.
+#[derive(Debug)]
+pub(crate) enum CopyError {
+    /// The file could not be created, so nothing was written. A file that
+    /// was already there is left as it was.
+    Create(std::io::Error),
+    /// The copy could not be written, or it did not match the database.
+    /// What there was of it has been removed.
+    Write(String),
+}
+
+impl fmt::Display for CopyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CopyError::Create(error) => error.fmt(f),
+            CopyError::Write(detail) => f.write_str(detail),
+        }
+    }
+}
+
+/// Writes a consistent copy of the database `conn` has open to `path`, a
+/// file that must not exist yet, and returns the copy's size in bytes.
+/// `schema` is the schema version the database is at, which the copy is
+/// checked against.
 ///
-/// The copy is made by SQLite's `VACUUM INTO` through the connection that
-/// will migrate, so it holds exactly what that connection sees, including
-/// what is still in the write-ahead log. It is one file, private to its
-/// owner.
-fn backup_before_migration(
+/// The copy is made by SQLite's `VACUUM INTO`, in one read transaction, so
+/// it holds exactly what `conn` sees at one moment, including what is still
+/// in the write-ahead log, while other connections go on writing. It is one
+/// file, created private to its owner before anything is written to it, and
+/// it must open and pass `PRAGMA quick_check` before it counts as written.
+/// On any failure after the file was created, the file is removed.
+pub(crate) fn write_copy(
     conn: &Connection,
-    data_dir: &Path,
-    found: i64,
-) -> std::result::Result<PathBuf, String> {
-    let path = data_dir.join(backup_file_name(SCHEMA_VERSION));
-    let refused = |detail: String| {
-        format!(
-            "the database is at schema version {found} and must be migrated to version \
-             {SCHEMA_VERSION}, but the backup that comes first could not be written to {}: \
-             {detail}. Nothing was changed. Make the data directory writable with room for a \
-             copy of the database (`openboard admin upgrade-check` shows how much), then start \
-             again",
-            path.display()
-        )
-    };
+    path: &Path,
+    schema: i64,
+) -> std::result::Result<u64, CopyError> {
     // Created here, empty, so that it has its final mode before it has any
     // content. `VACUUM INTO` accepts an empty file and no other.
     let mut options = OpenOptions::new();
@@ -1860,9 +1887,7 @@ fn backup_before_migration(
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let file = options
-        .open(&path)
-        .map_err(|error| refused(error.to_string()))?;
+    let file = options.open(path).map_err(CopyError::Create)?;
     let written = (|| -> std::result::Result<u64, String> {
         let target = path
             .to_str()
@@ -1870,9 +1895,9 @@ fn backup_before_migration(
         conn.execute("VACUUM INTO ?1", [target])
             .map_err(|error| error.to_string())?;
         file.sync_all().map_err(|error| error.to_string())?;
-        // The copy must open, be whole, and be at the old version.
+        // The copy must open, be whole, and be at the database's version.
         let copy = Connection::open_with_flags(
-            &path,
+            path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .map_err(|error| error.to_string())?;
@@ -1882,21 +1907,44 @@ fn backup_before_migration(
         let check: String = copy
             .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
             .map_err(|error| error.to_string())?;
-        if version != found || check != "ok" {
+        if version != schema || check != "ok" {
             return Err("the copy does not match the database".to_owned());
         }
         drop(copy);
-        std::fs::metadata(&path)
+        std::fs::metadata(path)
             .map(|found| found.len())
             .map_err(|error| error.to_string())
     })();
-    let bytes = match written {
-        Ok(bytes) => bytes,
-        Err(detail) => {
-            let _ = std::fs::remove_file(&path);
-            return Err(refused(detail));
-        }
-    };
+    written.map_err(|detail| {
+        let _ = std::fs::remove_file(path);
+        CopyError::Write(detail)
+    })
+}
+
+/// Writes a consistent copy of the database beside it, before a migration
+/// from schema version `found` changes anything, and tells the operator on
+/// stderr where it is and how to go back. An error means no migration may
+/// run: the database has not been touched, and what there is of the copy
+/// has been removed.
+///
+/// The copy is made by [`write_copy`] through the connection that will
+/// migrate, so it holds exactly what that connection sees.
+fn backup_before_migration(
+    conn: &Connection,
+    data_dir: &Path,
+    found: i64,
+) -> std::result::Result<PathBuf, String> {
+    let path = data_dir.join(backup_file_name(SCHEMA_VERSION));
+    let bytes = write_copy(conn, &path, found).map_err(|error| {
+        format!(
+            "the database is at schema version {found} and must be migrated to version \
+             {SCHEMA_VERSION}, but the backup that comes first could not be written to {}: \
+             {error}. Nothing was changed. Make the data directory writable with room for a \
+             copy of the database (`openboard admin upgrade-check` shows how much), then start \
+             again",
+            path.display()
+        )
+    })?;
     let database = data_dir.join(DB_FILE_NAME);
     let old = match started_by(conn) {
         Some(by) => format!("the OLD binary ({})", by.describe()),

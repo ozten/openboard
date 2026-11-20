@@ -28,6 +28,9 @@
 //! the backups earlier migrations left. They read the directory whatever
 //! version wrote it, a newer one included.
 //!
+//! [`backup`] writes a consistent copy of the database on demand, also while
+//! a server is writing to it.
+//!
 //! Nothing returned here holds a secret, with two exceptions that exist
 //! nowhere else and cannot be read back: [`CreatedInvite::invite`] carries
 //! a new enrolment code, and [`PersonInvite::link`] and
@@ -46,8 +49,11 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 
 use crate::identity::{self, InviteKind, LogEntry};
 use crate::names;
-use crate::store::{BACKUP_PREFIX, DB_FILE_NAME, OLDEST_IDENTITY_SCHEMA, SCHEMA_VERSION};
-use crate::time::{now_ms, rfc3339_from_ms};
+use crate::store::{
+    CopyError, BACKUP_PREFIX, DB_FILE_NAME, OLDEST_IDENTITY_SCHEMA, ON_DEMAND_BACKUP_PREFIX,
+    SCHEMA_VERSION,
+};
+use crate::time::{now_ms, now_rfc3339, rfc3339_from_ms};
 use crate::Mode;
 
 pub use crate::identity::log_kinds;
@@ -76,6 +82,12 @@ pub enum OperatorError {
     /// The database is older than this version: start the server on it once
     /// to migrate it first.
     NotMigrated,
+    /// [`backup`] found a file where it would write, and left it alone. Holds
+    /// the path.
+    BackupExists(PathBuf),
+    /// [`backup`] could not write its copy, and left no file behind. Holds the
+    /// path and the reason.
+    BackupNotWritten(PathBuf, String),
     /// The database could not be read or written.
     Storage(String),
 }
@@ -99,6 +111,16 @@ impl fmt::Display for OperatorError {
             OperatorError::NotMigrated => f.write_str(
                 "this data directory has no grants yet: start this version of the server on it \
                  once, which migrates it",
+            ),
+            OperatorError::BackupExists(path) => write!(
+                f,
+                "{} already exists, and a backup never replaces a file",
+                path.display()
+            ),
+            OperatorError::BackupNotWritten(path, detail) => write!(
+                f,
+                "cannot write the backup to {}: {detail}; no file was left there",
+                path.display()
             ),
             OperatorError::Storage(detail) => {
                 write!(f, "cannot use the board database: {detail}")
@@ -196,6 +218,9 @@ pub struct PersonInvite {
     /// Lifetime of the browser session the link turns into, in seconds,
     /// counted from sign-in.
     pub session_ttl_secs: u64,
+    /// True when the board serves a certificate browsers already trust, so
+    /// the person meets no certificate warning.
+    pub trusted: bool,
 }
 
 /// The result of [`create_invite`].
@@ -426,7 +451,7 @@ pub fn create_person_invite(
 ) -> Result<PersonInvite> {
     let handle = names::validate_email(email).map_err(OperatorError::InvalidName)?;
     let session_ttl_secs = options.token_ttl_secs.unwrap_or(DEFAULT_SESSION_TTL_SECS);
-    let (created, url, _fingerprint) = new_invite(
+    let (created, url, fingerprint) = new_invite(
         data_dir,
         &handle,
         InviteKind::Person,
@@ -434,6 +459,7 @@ pub fn create_person_invite(
         session_ttl_secs,
     )?;
     Ok(PersonInvite {
+        trusted: fingerprint.is_none(),
         link: sign_in_link(&url, &created.code),
         code: created.code,
         url,
@@ -699,9 +725,32 @@ pub enum UpgradeAction {
     Refuse,
 }
 
-/// One backup the server wrote before a migration. See [`list_backups`].
+/// Which kind of backup a file in the data directory is, by its name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackupKind {
+    /// Written by a server before it migrated the database:
+    /// `openboard.db.pre-v<N>-<UTC time>`. [`prune_backups`] deletes these.
+    PreMigration,
+    /// Written by [`backup`] with its default name:
+    /// `openboard.db.backup-<UTC time>`. Nothing here deletes these.
+    OnDemand,
+}
+
+impl BackupKind {
+    /// `pre_migration` or `on_demand`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BackupKind::PreMigration => "pre_migration",
+            BackupKind::OnDemand => "on_demand",
+        }
+    }
+}
+
+/// One backup in the data directory: one a server wrote before a migration,
+/// or one [`backup`] wrote there. See [`list_backups`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Backup {
+    pub kind: BackupKind,
     pub path: PathBuf,
     pub file_name: String,
     pub size_bytes: u64,
@@ -711,7 +760,21 @@ pub struct Backup {
     pub age_secs: Option<u64>,
     /// The schema version the migration went to, from the file name. The
     /// backup holds the database as it was before, at an older version.
+    /// `None` for an on-demand backup.
     pub before_schema_version: Option<i64>,
+}
+
+/// What [`backup`] wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupWritten {
+    pub path: PathBuf,
+    /// Size of the copy, in bytes.
+    pub bytes: u64,
+    /// The schema version of the database, and so of the copy.
+    pub schema_version: i64,
+    /// When the copy was started; it holds what the board held then. RFC
+    /// 3339 timestamp in UTC.
+    pub created_at: String,
 }
 
 fn database_path(data_dir: &Path) -> Result<PathBuf> {
@@ -825,9 +888,17 @@ fn backup_files(data_dir: &Path) -> Result<Vec<Backup>> {
         let Ok(file_name) = entry.file_name().into_string() else {
             continue;
         };
-        let Some(rest) = file_name.strip_prefix(BACKUP_PREFIX) else {
-            continue;
-        };
+        let (kind, before_schema_version) =
+            if let Some(rest) = file_name.strip_prefix(BACKUP_PREFIX) {
+                (
+                    BackupKind::PreMigration,
+                    rest.split('-').next().and_then(|n| n.parse().ok()),
+                )
+            } else if file_name.starts_with(ON_DEMAND_BACKUP_PREFIX) {
+                (BackupKind::OnDemand, None)
+            } else {
+                continue;
+            };
         // Never a link or a directory: pruning removes what is listed.
         let Ok(found) = std::fs::symlink_metadata(entry.path()) else {
             continue;
@@ -841,12 +912,13 @@ fn backup_files(data_dir: &Path) -> Result<Vec<Backup>> {
             .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
             .and_then(|since| i64::try_from(since.as_millis()).ok());
         backups.push(Backup {
+            kind,
             path: entry.path(),
             size_bytes: found.len(),
             modified_at: modified_ms.map(rfc3339_from_ms),
             age_secs: modified_ms
                 .map(|at| u64::try_from(now_ms().saturating_sub(at) / 1000).unwrap_or(0)),
-            before_schema_version: rest.split('-').next().and_then(|n| n.parse().ok()),
+            before_schema_version,
             file_name,
         });
     }
@@ -854,29 +926,86 @@ fn backup_files(data_dir: &Path) -> Result<Vec<Backup>> {
     Ok(backups)
 }
 
-/// The backups in `data_dir` that servers wrote before migrating its
-/// database, by file name, which is oldest first for one schema version.
+/// The backups in `data_dir`, by file name: first the ones [`backup`] wrote
+/// there, oldest first, then the ones servers wrote before migrating its
+/// database, oldest first for one schema version. A backup [`backup`] wrote
+/// elsewhere, or under a name of the operator's, is not listed.
 ///
-/// A backup is a whole copy of the database from before an upgrade. It
-/// keeps everything the board held then, including the text of messages
-/// that were deleted or edited afterwards, so it should not be kept longer
+/// A backup is a whole copy of the database. It keeps everything the board
+/// held then, including the text of messages that were deleted or edited
+/// afterwards. A backup from before an upgrade should not be kept longer
 /// than it takes to trust the upgrade; see [`prune_backups`].
 pub fn list_backups(data_dir: &Path) -> Result<Vec<Backup>> {
     database_path(data_dir)?;
     backup_files(data_dir)
 }
 
-/// Deletes every backup [`list_backups`] finds and returns what it
-/// deleted. The database itself is never touched. Fails on the first file
-/// that cannot be removed, having removed the ones before it.
+/// Deletes every backup [`list_backups`] finds that a server wrote before a
+/// migration, and returns what it deleted. On-demand backups and the
+/// database itself are never touched. Fails on the first file that cannot
+/// be removed, having removed the ones before it.
 pub fn prune_backups(data_dir: &Path) -> Result<Vec<Backup>> {
-    let backups = list_backups(data_dir)?;
+    let mut backups = list_backups(data_dir)?;
+    backups.retain(|backup| backup.kind == BackupKind::PreMigration);
     for backup in &backups {
         std::fs::remove_file(&backup.path).map_err(|error| {
             OperatorError::Storage(format!("cannot delete {}: {error}", backup.path.display()))
         })?;
     }
     Ok(backups)
+}
+
+/// Writes a consistent copy of the database in `data_dir`, and returns where
+/// it is and what it holds. It works beside a running server, which goes on
+/// writing while the copy is made, and on a stopped board.
+///
+/// With no `to`, the copy goes into `data_dir` as
+/// `openboard.db.backup-<UTC time>`. A `to` that is a directory gets a file
+/// of that name inside it, and any other `to` is the path of the file to
+/// write. The file is created private to its owner and never replaces one
+/// that exists: that fails with [`OperatorError::BackupExists`]. Any other
+/// failure is [`OperatorError::BackupNotWritten`], and leaves no file.
+///
+/// The copy is one SQLite database, made in one read transaction, so it
+/// holds the board as it was at one moment. It is checked before this
+/// returns: it opens and passes `PRAGMA quick_check`. It holds what the
+/// database holds: hashes of tokens and session secrets, and the text of
+/// every message, including messages deleted after it was taken. It does
+/// not hold the board's certificate and key files.
+///
+/// The database is opened as every function here opens it. A database
+/// newer than this version fails with [`OperatorError::Storage`], and an
+/// older one is copied as it is: nothing is migrated.
+pub fn backup(data_dir: &Path, to: Option<&Path>) -> Result<BackupWritten> {
+    let (conn, _) = open(data_dir, false)?;
+    let schema_version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let path = match to {
+        None => data_dir.join(crate::store::on_demand_backup_file_name()),
+        Some(dir) if dir.is_dir() => dir.join(crate::store::on_demand_backup_file_name()),
+        Some(file) => file.to_path_buf(),
+    };
+    let created_at = now_rfc3339();
+    match crate::store::write_copy(&conn, &path, schema_version) {
+        Ok(bytes) => Ok(BackupWritten {
+            path,
+            bytes,
+            schema_version,
+            created_at,
+        }),
+        Err(CopyError::Create(error)) => Err(match error.kind() {
+            std::io::ErrorKind::AlreadyExists => OperatorError::BackupExists(path),
+            std::io::ErrorKind::NotFound => OperatorError::BackupNotWritten(
+                path,
+                "the directory it would go in does not exist".to_owned(),
+            ),
+            std::io::ErrorKind::PermissionDenied => OperatorError::BackupNotWritten(
+                path,
+                "this user may not create files in that directory".to_owned(),
+            ),
+            _ => OperatorError::BackupNotWritten(path, error.to_string()),
+        }),
+        Err(CopyError::Write(detail)) => Err(OperatorError::BackupNotWritten(path, detail)),
+    }
 }
 
 /// One grant, as the operator commands show it.

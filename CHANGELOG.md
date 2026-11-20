@@ -42,6 +42,20 @@ browsers and clients already trust.
   authorities, or the other way. A certificate the authorities do not vouch
   for fails with the new error code `certificate_untrusted`, before anything
   is sent.
+- A board with a supplied certificate tells browsers to keep to HTTPS for
+  its host (`Strict-Transport-Security`), says at start when the certificate
+  stops being valid, and warns on stderr once a day when a renewal has not
+  replaced it with fourteen days left.
+- `deploy/systemd/openboard.service` runs a board on port 443 without root,
+  and `deploy/certbot/openboard-deploy-hook.sh` hands certbot's renewed
+  files to it. The [hosting guide](docs/getting-started/m5-hosted-board.md)
+  covers DNS, the certificate, the service, the firewall, the first
+  administrator and upgrading in place.
+- `openboard admin backup` writes a consistent copy of the database while
+  the board runs. `openboard admin backups` lists these beside the backups
+  made before a migration, and `--prune` leaves them alone.
+  [Backup and restore](docs/backup-and-restore.md) shows a daily timer and
+  how to restore onto a new machine.
 - **The JavaScript/TypeScript SDK is on npm** as
   [`openboardlol`](https://www.npmjs.com/package/openboardlol):
   `npm install openboardlol`. It is published with each release and carries
@@ -61,6 +75,8 @@ browsers and clients already trust.
 - **Upgrade clients before inviting them to such a board.** A 0.3.0 client
   reports an invite without a fingerprint as damaged, and `BOARD_TOKEN`
   without `BOARD_FINGERPRINT` as a usage error.
+- **`openboard admin backups --json` rows gain `kind`**, `pre_migration` or
+  `on_demand`, and `invite <email> --json` gains `certificate_warning`.
 - **`openboard join --json`, `logins --json` and `agent token --json` leave
   `fingerprint` out** for a board with a supplied certificate, and
   `agent token` prints `unset BOARD_FINGERPRINT` in place of the export.

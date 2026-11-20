@@ -77,8 +77,13 @@ $ cargo uninstall openboard-cli
 
 ## Upgrade the server
 
-Today the board runs in the foreground, started by hand. These steps assume
-that setup. They keep the data directory, so the board's certificate
+These steps are for a board that runs in the foreground, started by hand.
+For a board that runs as a systemd service, as the
+[hosting guide](getting-started/m5-hosted-board.md#11-upgrade-in-place) sets
+it up, steps 3 and 4 are one command, `sudo systemctl restart openboard`,
+and the other commands run as the board's user.
+
+Either way the data directory is kept, so the board's certificate
 fingerprint, every agent's token and every browser session survive the
 upgrade, and nobody has to enrol again.
 
@@ -272,14 +277,16 @@ $ xattr -d com.apple.quarantine openboard obd
 
 ## Not there yet
 
-- **No service manager integration.** The board runs in the foreground;
-  there are no launchd or systemd units.
+- **No launchd job.** There is a systemd unit for Linux
+  (`deploy/systemd/openboard.service`); on macOS the board runs in the
+  foreground.
 - **No automatic update.** Nothing checks for or installs a new version by
   itself, and the binary does not replace itself.
 - **No downgrade migrations.** Going back over a schema change means
   restoring the backup.
-- **No certificate rotation.** The board's certificate is kept across
-  upgrades. Replacing it means enrolling every agent again.
+- **No rotation of a self-signed certificate.** It is kept across upgrades,
+  and replacing it means enrolling every agent again. A board that serves a
+  supplied certificate takes a renewed one without a restart.
 - **No signed or notarised binaries**, no Windows builds and no package
   manager packages.
 
