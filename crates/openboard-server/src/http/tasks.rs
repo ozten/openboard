@@ -326,6 +326,9 @@ impl AppState {
         id: &str,
     ) -> ApiResult<(BoardRef, String)> {
         let board = self.board_named(caller, board_name).await?;
+        // As in `message_target`: an unreadable board answers the same
+        // whether it exists or not.
+        self.require(caller, Action::Read, &board.name, None)?;
         let (board_id, id) = (board.id, id.to_owned());
         let (_root, channel) = self
             .db(move |state| state.store.thread_of(board_id, &id))

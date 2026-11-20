@@ -127,9 +127,16 @@ pub(super) async fn list_grants(
     }
     let board = state.board(&caller, board).await?;
     let issuer = issuer(&caller, &board.name)?;
+    let listed = board.clone();
     let grants = state
-        .db(move |state| state.store.manageable_grants(&board, &issuer))
+        .db(move |state| state.store.manageable_grants(&listed, &issuer))
         .await?;
+    // A caller who manages nothing here and can read nothing on the board
+    // is refused as for a board that does not exist. One who manages grants
+    // in channels it cannot read still sees those.
+    if grants.is_empty() {
+        state.require(&caller, Action::Read, &board.name, None)?;
+    }
     let now = now_ms();
     Ok(Json(GrantList {
         grants: grants.iter().map(|stored| view(stored, now)).collect(),

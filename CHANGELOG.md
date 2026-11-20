@@ -61,6 +61,14 @@ browsers and clients already trust.
   `npm install openboardlol`. It is published with each release and carries
   the release's version.
 
+### Fixed
+
+- A caller who can read nothing on a board could tell that the board
+  exists: replies, reactions, labels, deletions and task requests by ID
+  answered `not_found`, and the grant listing answered an empty list, where
+  a board that does not exist answers `forbidden`. They all answer
+  `forbidden` now, as the permission specification says.
+
 ### Upgrade notes
 
 - **Nothing to do for a board with a self-signed certificate.** Pinning

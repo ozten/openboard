@@ -1436,6 +1436,9 @@ impl AppState {
         action: Action,
     ) -> ApiResult<(BoardRef, MessageMeta)> {
         let board = self.board_named(caller, board).await?;
+        // A caller who can read nothing on the board is refused as for a
+        // board that does not exist, before any ID is looked at.
+        self.require(caller, Action::Read, &board.name, None)?;
         let (board_id, id) = (board.id, message_id.to_owned());
         let meta = self
             .db(move |state| state.store.message_meta(board_id, &id))
@@ -2011,6 +2014,9 @@ async fn post_message(
         (None, Some(target)) => {
             // A reply needs a thread, so it never creates a board.
             let board = found.ok_or_else(|| state.missing_board(&caller, &board_name))?;
+            // As in `message_target`: an unreadable board answers the same
+            // whether it exists or not.
+            state.require(&caller, Action::Read, &board.name, None)?;
             let (board_id, target) = (board.id, target.clone());
             let (root, channel) = state
                 .db(move |state| state.store.thread_of(board_id, &target))
