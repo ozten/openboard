@@ -940,3 +940,153 @@ async fn a_limited_profile_narrows_only_on_its_board_and_only_when_declared() {
     assert_eq!(lift.status(), StatusCode::NO_CONTENT);
     board.posted(&bound.token, "docs", "lifted").await;
 }
+
+// ---------------------------------------------------------------------------
+// Delivery-time checks (Z14) and claims across a subtree
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn removing_a_grant_ends_open_waits_and_streams() {
+    let board = Board::closed().await;
+    let admin = board.enrol("admin").await;
+    let worker = board.enrol("worker").await;
+    board.grant("*", "admin", "all");
+    let grant = board.grant("build/", "worker", "read,post");
+    board.posted(&admin, "build/api", "work").await;
+
+    let poll = board
+        .get(
+            &worker,
+            "/v1/boards/general/events?channel=build/api&wait=30",
+        )
+        .send();
+    let stream = board
+        .get(&worker, "/v1/boards/general/events/stream?channel=build/")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stream.status(), StatusCode::OK);
+    let data_dir = board.data_dir();
+    let revoke = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        tokio::task::spawn_blocking(move || operator::ungrant(&data_dir, &grant))
+            .await
+            .unwrap()
+            .unwrap();
+    };
+    let (response, ()) =
+        tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(poll, revoke) })
+            .await
+            .expect("the long-poll ends promptly");
+    error_of(response.unwrap(), StatusCode::FORBIDDEN, codes::FORBIDDEN).await;
+    let sent = tokio::time::timeout(Duration::from_secs(5), stream.text())
+        .await
+        .expect("the stream ends promptly")
+        .unwrap();
+    assert!(!sent.contains("data:"), "{sent}");
+}
+
+#[tokio::test]
+async fn a_narrowed_grant_filters_what_an_open_wait_delivers() {
+    let board = Board::closed().await;
+    let admin = board.enrol("admin").await;
+    let worker = board.enrol("worker").await;
+    board.grant("*", "admin", "all");
+    board.grant("*", "worker", "read");
+    board.posted(&admin, "docs", "open for now").await;
+    let start: Value = board
+        .get(&worker, "/v1/boards/general/events")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let cursor = start["cursor"].as_str().unwrap().to_owned();
+    let poll = board
+        .get(
+            &worker,
+            &format!("/v1/boards/general/events?after={cursor}&wait=10"),
+        )
+        .send();
+    let narrow = async {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let response = board.add_grant(&admin, "docs", "worker", "none").await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        // Past the next recheck.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        board.posted(&admin, "docs", "closed now").await;
+        board.posted(&admin, "build", "still open").await;
+    };
+    let (response, ()) = tokio::join!(poll, narrow);
+    let events: Value = response.unwrap().json().await.unwrap();
+    let channels: Vec<&str> = events["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| event["channel"].as_str().unwrap())
+        .collect();
+    assert!(!channels.contains(&"docs"), "{events}");
+}
+
+#[tokio::test]
+async fn a_claim_across_a_subtree_takes_only_what_the_caller_may_claim() {
+    let board = Board::closed().await;
+    let lead = board.enrol("lead").await;
+    let worker = board.enrol("worker").await;
+    board.grant("*", "lead", "all");
+    board.grant("build/", "worker", "read,post");
+    board.grant("build/api", "worker", "read,post,task.claim");
+    for channel in ["build/web", "build/api"] {
+        let created = board
+            .post_json(
+                &lead,
+                "/v1/boards/general/tasks",
+                json!({ "channel": channel, "text": format!("work in {channel}") }),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert!(created.status().is_success(), "{}", created.status());
+    }
+    let claimed: Value = board
+        .post_json(
+            &worker,
+            "/v1/boards/general/tasks/claim",
+            json!({ "channel": "build/", "from": ["lead"] }),
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        claimed["claim"]["task"]["channel"], "build/api",
+        "{claimed}"
+    );
+    let again: Value = board
+        .post_json(
+            &worker,
+            "/v1/boards/general/tasks/claim",
+            json!({ "channel": "build/", "from": ["lead"] }),
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(again["claim"].is_null(), "{again}");
+    // Where it holds no task.claim at all, the claim is refused outright.
+    let refused = board
+        .post_json(
+            &worker,
+            "/v1/boards/general/tasks/claim",
+            json!({ "channel": "build/web" }),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+}

@@ -262,6 +262,38 @@ impl AppState {
         }
     }
 
+    /// Refuses prerequisites in channels the caller may not read, with the
+    /// error for a task that does not exist (Z15). The store checks the rest.
+    async fn readable_needs(
+        self: &std::sync::Arc<Self>,
+        caller: &Caller,
+        board: &BoardRef,
+        ids: Vec<String>,
+    ) -> ApiResult<()> {
+        if self.mode != Mode::Network || ids.is_empty() {
+            return Ok(());
+        }
+        let board_id = board.id;
+        let places = self
+            .db(move |state| {
+                ids.into_iter()
+                    .map(|id| Ok((state.store.thread_of(board_id, &id)?, id)))
+                    .collect::<Result<Vec<_>, crate::store::StoreError>>()
+            })
+            .await?;
+        for (place, id) in places {
+            if let Some((_, channel)) = place {
+                if !self.allows(caller, Action::Read, &board.name, Some(&channel)) {
+                    let shown: String = id.chars().take(40).collect();
+                    return Err(task_error(TaskError::InvalidNeeds(format!(
+                        "`{shown}` is not a task on this board"
+                    ))));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The board and the channel of the thread holding `id`, once the caller
     /// may read it. Anything it may not read is reported as missing.
     async fn task_place(
@@ -350,6 +382,9 @@ pub(super) async fn create_task(
         if claim.is_some() {
             state.require(&caller, Action::ClaimTask, &board.name, Some(&channel))?;
         }
+        state
+            .readable_needs(&caller, board, request.needs.clone())
+            .await?;
     }
 
     let by = caller.writer();
@@ -463,6 +498,17 @@ pub(super) async fn create_tasks(
     let target = state
         .task_target(&caller, &board_name, &request.channel)
         .await?;
+    if let PostTarget::Board(board) = &target {
+        let ids = entries
+            .iter()
+            .flat_map(|entry| entry.needs.iter())
+            .filter_map(|need| match need {
+                Need::Id(id) => Some(id.clone()),
+                Need::Key(_) => None,
+            })
+            .collect();
+        state.readable_needs(&caller, board, ids).await?;
+    }
     let idempotency = request.idempotency_key.clone().map(|key| {
         let mut unkeyed = request.clone();
         unkeyed.idempotency_key = None;
@@ -616,7 +662,7 @@ pub(super) async fn claim_ready(
     board: Result<Path<String>, PathRejection>,
     body: Result<Bytes, BytesRejection>,
 ) -> ApiResult<Json<ClaimReadyResponse>> {
-    let caller = state.caller(&identity, &headers).await?;
+    let mut caller = state.caller(&identity, &headers).await?;
     let board = state.board(&caller, board).await?;
     let request: ClaimReadyRequest = read_json(&headers, body, "claim request", || {
         AppError::invalid("the request body is too large for a claim request")
@@ -674,13 +720,25 @@ pub(super) async fn claim_ready(
                     return Err(AppError::unauthenticated());
                 }
             }
+            // And with the grants as they are now (Z14).
+            state.refresh(&mut caller).await?;
+            state.require(&caller, Action::ClaimTask, &board.name, exact)?;
         }
         first = false;
         wake.borrow_and_update();
         let (claim_on, by_now) = (board.clone(), by.clone());
         let (channel_now, labels_now, from_now) = (channel.clone(), labels.clone(), from.clone());
+        let (claim_state, claim_caller) = (state.clone(), caller.clone());
         let claimed = state
             .db(move |state| {
+                let can_claim = |channel: &str| {
+                    claim_state.allows(
+                        &claim_caller,
+                        Action::ClaimTask,
+                        &claim_on.name,
+                        Some(channel),
+                    )
+                };
                 let claimed = state.store.claim_ready(
                     &claim_on,
                     &by_now,
@@ -688,6 +746,7 @@ pub(super) async fn claim_ready(
                     &labels_now,
                     &from_now,
                     lease,
+                    &can_claim,
                     local,
                 )?;
                 let head = state.store.head(claim_on.id)?;
@@ -847,7 +906,10 @@ pub(super) async fn task_action(
             )),
         },
         actions::NEEDS => match &request.needs {
-            Some(needs) => Act::Needs(needs.clone()),
+            Some(needs) => {
+                state.readable_needs(&caller, &board, needs.clone()).await?;
+                Act::Needs(needs.clone())
+            }
             None => return Err(AppError::invalid("set `needs`; an empty list clears it")),
         },
         actions::CANCEL => Act::Cancel(reason("reason")?),
@@ -855,12 +917,7 @@ pub(super) async fn task_action(
     };
 
     let manage_state = state.clone();
-    let manage_caller = Caller {
-        principal: caller.principal.clone(),
-        profile: caller.profile.clone(),
-        credential_id: caller.credential_id.clone(),
-        authority: caller.authority.clone(),
-    };
+    let manage_caller = caller.clone();
     let on = board.clone();
     let (changed, head) = state
         .db(move |state| {

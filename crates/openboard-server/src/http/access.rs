@@ -107,7 +107,19 @@ impl Authority {
                 Verb::Read,
                 now_ms(),
             ),
-            (_, None) => false,
+            // Across a subtree: whether the caller holds the verbs anywhere.
+            // Each item found is then judged in its own channel.
+            (action, None) => needed(action).is_some_and(|verbs| {
+                verbs.iter().all(|verb| {
+                    grants::holds_somewhere(
+                        &self.grants_of(board),
+                        &self.subject,
+                        &self.ceilings_on(board),
+                        verb,
+                        now_ms(),
+                    )
+                })
+            }),
             (action, Some(channel)) => match needed(action) {
                 Some(verbs) => self.access(board, channel).verbs.contains_all(verbs),
                 None => false,

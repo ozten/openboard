@@ -1148,6 +1148,7 @@ fn is_loopback_host(host: &str) -> bool {
 
 /// Who is calling: the principal [`gate`] established, plus the profile the
 /// caller declared. The profile header only picks a label.
+#[derive(Clone)]
 struct Caller {
     principal: Principal,
     profile: Option<String>,
@@ -1269,6 +1270,32 @@ impl AppState {
             caller.authority = Some(Arc::new(authority));
         }
         Ok(caller)
+    }
+
+    /// Reads the grants and profile limits again, for a request held open
+    /// (Z14): what it delivers from now on is judged by them. A token's
+    /// scope never changes, so it is kept.
+    async fn refresh(self: &Arc<Self>, caller: &mut Caller) -> ApiResult<()> {
+        let Some(old) = caller.authority.clone() else {
+            return Ok(());
+        };
+        let principal_id = caller.principal.id.clone();
+        let profile = caller.profile.clone();
+        let (snapshot, limits) = self
+            .db(move |state| {
+                state
+                    .store
+                    .authority_inputs(&principal_id, profile.as_deref())
+            })
+            .await?;
+        let mut fresh = (*old).clone();
+        fresh.snapshot = snapshot;
+        fresh.profile_limits = limits
+            .iter()
+            .map(|(board, scope)| Ok((board.clone(), parse_ceiling(scope)?)))
+            .collect::<ApiResult<_>>()?;
+        caller.authority = Some(Arc::new(fresh));
+        Ok(())
     }
 
     /// The one place handlers ask whether the caller may do something. The
@@ -2212,6 +2239,32 @@ async fn list_boards(
     let caller = state.caller(&identity, &headers).await?;
     let mut boards = state.db(|state| state.store.boards()).await?;
     boards.retain(|board| state.allows(&caller, Action::Read, &board.name, None));
+    if state.mode == Mode::Network {
+        // The newest activity the caller can see, not the board's: a time
+        // from a channel it cannot read would tell it that channel is busy
+        // (Z10).
+        let names: Vec<String> = boards.iter().map(|board| board.name.clone()).collect();
+        let channels = state
+            .db(move |state| {
+                names
+                    .iter()
+                    .map(|name| match state.store.find_board(name)? {
+                        Some(board) => state.store.channels(board.id),
+                        None => Ok(Vec::new()),
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .await?;
+        for (board, channels) in boards.iter_mut().zip(channels) {
+            board.last_activity_at = channels
+                .into_iter()
+                .filter(|channel| {
+                    state.allows(&caller, Action::Read, &board.name, Some(&channel.path))
+                })
+                .map(|channel| channel.last_activity_at)
+                .max();
+        }
+    }
     Ok(Json(BoardList { boards }))
 }
 
@@ -2395,6 +2448,8 @@ struct EventScan {
     board: BoardRef,
     filter: EventFilter,
     limit: u32,
+    /// The last check found the credential good but the access gone (Z14).
+    denied: bool,
     /// Position every earlier event has been considered up to.
     after: i64,
     wake: watch::Receiver<i64>,
@@ -2488,6 +2543,7 @@ impl EventScan {
                 label,
             },
             limit,
+            denied: false,
             after,
             wake,
             checked_at,
@@ -2530,6 +2586,15 @@ impl EventScan {
         event_cursor(&self.board.tag, self.after)
     }
 
+    /// The error for a scan the last check stopped.
+    fn refusal(&self) -> AppError {
+        if self.denied {
+            AppError::forbidden()
+        } else {
+            AppError::unauthenticated()
+        }
+    }
+
     /// How long a credential check stays good; see
     /// [`Limits::credential_recheck`].
     fn recheck_period(&self) -> Duration {
@@ -2549,11 +2614,28 @@ impl EventScan {
         // Taken before the read, so the check is never credited with being
         // newer than it is.
         let asked_at = Instant::now();
-        let usable = self
+        let mut usable = self
             .state
             .db(move |state| state.store.credential_usable(&id))
             .await
             .unwrap_or(false);
+        // Access can be revoked without the credential (Z14): read the
+        // grants again, and end the scan when what it watches is no longer
+        // readable at all.
+        if usable {
+            let state = Arc::clone(&self.state);
+            usable = state.refresh(&mut self.caller).await.is_ok()
+                && self.state.allows(
+                    &self.caller,
+                    Action::Read,
+                    &self.board.name,
+                    match &self.filter.channel {
+                        Some(ChannelSel::Exact(path)) => Some(path.as_str()),
+                        _ => None,
+                    },
+                );
+            self.denied = !usable;
+        }
         if usable {
             self.checked_at = asked_at;
             self.waited = false;
@@ -2648,7 +2730,7 @@ async fn get_events(
             // The credential the request arrived with may have been revoked
             // or have expired while it was held open or scanning.
             if !scan.may_deliver().await {
-                return Err(AppError::unauthenticated());
+                return Err(scan.refusal());
             }
             return Ok(Json(EventsResponse {
                 events,
@@ -2666,7 +2748,7 @@ async fn get_events(
             () = stopping(&mut shutdown) => expired = true,
             _ = recheck.tick(), if has_credential => {
                 if !scan.recheck().await {
-                    return Err(AppError::unauthenticated());
+                    return Err(scan.refusal());
                 }
                 // The wait goes on, so the next delivery checks again.
                 scan.waited = true;

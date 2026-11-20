@@ -842,6 +842,9 @@ pub(super) fn forget_task_fingerprint(conn: &Connection, board: &BoardRef, id: &
     Ok(())
 }
 
+/// The most ready tasks one claim looks through for one the caller may claim.
+const MAX_CLAIM_SCAN: usize = 1000;
+
 impl Store {
     /// Creates one task: a new thread, or an existing one made a task.
     pub(crate) fn create_task(
@@ -1147,6 +1150,7 @@ impl Store {
         labels: &[LabelFilter],
         from: &[CreatorSel],
         lease_ms: Option<i64>,
+        can_claim: &dyn Fn(&str) -> bool,
         local: bool,
     ) -> Result<Option<ClaimOut>> {
         let mut conn = self.conn();
@@ -1177,7 +1181,7 @@ impl Store {
             Value::Text(states::READY.to_owned()),
         ];
         let mut sql = format!(
-            "SELECT t.id FROM tasks t WHERE t.board_id = ? AND t.state = ? AND {}",
+            "SELECT t.id, t.channel FROM tasks t WHERE t.board_id = ? AND t.state = ? AND {}",
             channel_clause("t.channel", channel, &mut values)
         );
         // Kept for the caller, or unassigned and from a creator it takes from.
@@ -1213,10 +1217,23 @@ impl Store {
             }
             sql.push(')');
         }
-        sql.push_str(" ORDER BY (t.assignee_principal IS NULL), t.created_seq LIMIT 1");
-        let found: Option<String> = tx
-            .query_row(&sql, params_from_iter(values), |r| r.get(0))
-            .optional()?;
+        // The first in order that the caller may claim in its own channel; a
+        // subtree selection can reach channels it may not claim in.
+        sql.push_str(&format!(
+            " ORDER BY (t.assignee_principal IS NULL), t.created_seq LIMIT {MAX_CLAIM_SCAN}"
+        ));
+        let mut found: Option<String> = None;
+        {
+            let mut statement = tx.prepare(&sql)?;
+            let mut rows = statement.query(params_from_iter(values))?;
+            while let Some(row) = rows.next()? {
+                let channel: String = row.get(1)?;
+                if can_claim(&channel) {
+                    found = Some(row.get(0)?);
+                    break;
+                }
+            }
+        }
         let claim = match found {
             None => None,
             Some(id) => {
