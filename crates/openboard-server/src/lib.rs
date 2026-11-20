@@ -136,7 +136,7 @@ pub use chain::{verify_log, BoardReport, BrokenEntry, VerifyError, VerifyReport}
 pub use limits::{Limits, LogRetention};
 pub use store::grants::Access;
 pub use store::{DB_FILE_NAME, LOCK_FILE_NAME};
-pub use tls::{CERT_FILE_NAME, KEY_FILE_NAME};
+pub use tls::{CERTIFICATE_EXPIRY_WARNING_DAYS, CERT_FILE_NAME, KEY_FILE_NAME};
 
 /// How a board is served. See the crate documentation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -379,6 +379,7 @@ pub struct Server {
     tls: Option<Arc<rustls::ServerConfig>>,
     /// Set when the certificate was supplied: puts a renewed one in service.
     reloader: Option<tls::Reloader>,
+    certificate_expires_at: Option<String>,
     limits: Limits,
     maintenance: http::Maintenance,
     local_addr: SocketAddr,
@@ -435,6 +436,20 @@ impl Server {
     /// clients check against their certificate authorities instead.
     pub fn fingerprint(&self) -> Option<&str> {
         self.fingerprint.as_deref()
+    }
+
+    /// When the supplied certificate this start loaded stops being valid,
+    /// as an RFC 3339 timestamp in UTC. `None` on a board with a
+    /// self-signed certificate, which does not expire in practice, and on a
+    /// local board.
+    ///
+    /// The board does not renew anything. While it runs it reads a renewed
+    /// certificate from the same files, and it says so on stderr once a day
+    /// when the one in service has less than
+    /// [`CERTIFICATE_EXPIRY_WARNING_DAYS`] days left, which means the
+    /// renewal is not happening.
+    pub fn certificate_expires_at(&self) -> Option<&str> {
+        self.certificate_expires_at.as_deref()
     }
 
     /// Answers requests until `shutdown` completes, then stops gracefully:
@@ -670,6 +685,7 @@ async fn bind_inner(
             identity.reloader,
         ),
     };
+    let certificate_expires_at = reloader.as_ref().and_then(tls::Reloader::expires_at);
 
     let policy = policy.unwrap_or_else(|| match mode {
         Mode::Local => Arc::new(authz::LocalPolicy),
@@ -686,12 +702,14 @@ async fn bind_inner(
         retention: config.security_log,
         shutdown: stopping,
         in_use,
+        hsts: is_supplied,
     });
     Ok(Server {
         nobody_manages,
         listener,
         tls,
         reloader,
+        certificate_expires_at,
         limits: config.limits,
         maintenance,
         local_addr,

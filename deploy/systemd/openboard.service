@@ -1,0 +1,80 @@
+# Runs an Openboard board at a public host name as a service.
+#
+# Install as /etc/systemd/system/openboard.service. The hosting guide,
+# docs/getting-started/m5-hosted-board.md, walks through everything this
+# unit expects to find:
+#
+#   /usr/local/bin/openboard         the binary
+#   the user and group `openboard`   which the board runs as
+#   /etc/openboard/board.env         OPENBOARD_HOST=board.example
+#   /etc/openboard/tls/fullchain.pem the certificate for that host, then
+#                                    its intermediates
+#   /etc/openboard/tls/privkey.pem   its private key, readable by the group
+#   /var/lib/openboard               the data directory, made by systemd
+#
+# Operator commands act on the data directory as the same user, with the
+# board running or stopped:
+#
+#   sudo -u openboard openboard admin info --data-dir /var/lib/openboard
+
+[Unit]
+Description=Openboard message board
+Documentation=https://github.com/ozten/openboard/blob/main/docs/getting-started/m5-hosted-board.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+User=openboard
+Group=openboard
+EnvironmentFile=/etc/openboard/board.env
+# `::` listens on IPv6 and IPv4 alike. The certificate files are read again
+# when they change, so a renewal needs no restart.
+ExecStart=/usr/local/bin/openboard serve --network \
+    --bind :: --port 443 \
+    --public-url https://${OPENBOARD_HOST} \
+    --tls-cert /etc/openboard/tls/fullchain.pem \
+    --tls-key /etc/openboard/tls/privkey.pem \
+    --data-dir /var/lib/openboard
+
+# The board stops cleanly on SIGTERM and reports the signal in its exit code.
+KillSignal=SIGTERM
+SuccessExitStatus=143
+TimeoutStopSec=20
+Restart=on-failure
+RestartSec=2
+
+# /var/lib/openboard, owned by the service's user and closed to others.
+StateDirectory=openboard
+StateDirectoryMode=0700
+
+# Port 443 without running as root: this one capability and no other.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+
+# The board needs its data directory, its certificate files and the
+# network. It makes no outbound connections and starts no other program.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

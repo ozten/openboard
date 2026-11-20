@@ -161,6 +161,9 @@ pub(crate) struct Parts {
     pub retention: LogRetention,
     pub shutdown: watch::Receiver<bool>,
     pub in_use: mpsc::Sender<()>,
+    /// Tell browsers to reach this host over HTTPS only; see
+    /// [`STRICT_TRANSPORT_SECURITY`].
+    pub hsts: bool,
 }
 
 /// Upkeep a running server does beside answering requests: it trims the
@@ -217,6 +220,7 @@ impl Maintenance {
 
 pub(crate) fn router(parts: Parts) -> (Router, Maintenance) {
     let max_message_chars = parts.max_message_chars;
+    let hsts = parts.hsts;
     let state = Arc::new(AppState {
         store: parts.store,
         authz: parts.authz,
@@ -323,7 +327,9 @@ pub(crate) fn router(parts: Parts) -> (Router, Maintenance) {
     // out, what routing adds to an answer; see `security_headers`.
     let router = Router::new()
         .fallback_service(router)
-        .layer(middleware::from_fn(security_headers));
+        .layer(middleware::from_fn(move |request: Request, next: Next| {
+            security_headers(hsts, request, next)
+        }));
     (router, Maintenance(state))
 }
 
@@ -360,11 +366,22 @@ const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; st
      img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'; \
      frame-ancestors 'none'";
 
+/// What a board with a supplied certificate tells a browser: for the next
+/// year, reach this host over HTTPS only, even when a link or the address
+/// bar says `http://`. Nothing listens for plain HTTP, so without it such
+/// an address fails to connect instead of reaching the board.
+///
+/// Only such a board sends it. A browser ignores the header on a
+/// connection it had to be talked into, which is every connection to a
+/// self-signed certificate, and a local board has no HTTPS to insist on.
+/// It names no subdomains: the board speaks for its own host only.
+const STRICT_TRANSPORT_SECURITY: &str = "max-age=31536000";
+
 /// Adds the headers every response carries, pages and API alike. Nothing
 /// may be cached except an asset that was found, which says for itself how.
 /// No `Access-Control-*` header is ever set, so no other origin can read a
 /// response.
-async fn security_headers(request: Request, next: Next) -> Response {
+async fn security_headers(hsts: bool, request: Request, next: Next) -> Response {
     let is_asset = request.uri().path().starts_with(pages::ASSETS_PREFIX);
     let mut response = next.run(request).await;
     let cacheable = is_asset && response.status() == StatusCode::OK;
@@ -390,6 +407,12 @@ async fn security_headers(request: Request, next: Next) -> Response {
     );
     if !cacheable {
         headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
+    if hsts {
+        headers.insert(
+            header::STRICT_TRANSPORT_SECURITY,
+            HeaderValue::from_static(STRICT_TRANSPORT_SECURITY),
+        );
     }
     // What this server is, the same on every response, so that a client
     // learns it from whatever it asked and a refusal looks like any other.

@@ -171,8 +171,12 @@ fn run_server(config: Config) -> ExitCode {
         } else if let Some(cert) = &config.tls_cert {
             eprintln!(
                 "obd: certificate from {}, checked by clients against their certificate \
-                 authorities",
-                cert.display()
+                 authorities{}",
+                cert.display(),
+                server
+                    .certificate_expires_at()
+                    .map(|when| format!(", valid until {when}"))
+                    .unwrap_or_default()
             );
         }
         server.run(shutdown_signal()).await

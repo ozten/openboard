@@ -665,6 +665,9 @@ async fn serve(
             /// `self_signed` or `supplied`, on a network board.
             #[serde(skip_serializing_if = "Option::is_none")]
             certificate: Option<&'a str>,
+            /// When a supplied certificate stops being valid.
+            #[serde(skip_serializing_if = "Option::is_none")]
+            certificate_expires_at: Option<&'a str>,
         }
         write_stdout(&to_json(&Listening {
             url: &url,
@@ -677,6 +680,7 @@ async fn serve(
                 (openboard_server::Mode::Network, Some(_)) => Some("self_signed"),
                 (openboard_server::Mode::Network, None) => Some("supplied"),
             },
+            certificate_expires_at: server.certificate_expires_at(),
         })?)?;
     } else if let Some(fingerprint) = server.fingerprint() {
         let dir = shell_quote(&data_dir);
@@ -695,12 +699,15 @@ async fn serve(
         write_stdout(&format!(
             "network board listening on {url} (data in {data_dir})\n\
              mode: network (TLS 1.3, a token on every request)\n\
-             certificate: supplied, read again when the files change; agents and browsers \
-             check it against their certificate authorities\n\
+             certificate: supplied, valid until {}, read again when the files change; agents \
+             and browsers check it against their certificate authorities\n\
              invite an agent from this host with: openboard invite <name> --data-dir {dir}\n\
              people use the web page at {url}/ ; sign a person in with: openboard invite \
              <email> --data-dir {dir}\n\
              version: openboard {}",
+            server
+                .certificate_expires_at()
+                .unwrap_or("an unreadable date"),
             openboard_api::build::DESCRIBE,
         ))?;
     } else {

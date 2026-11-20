@@ -92,6 +92,89 @@ pub(crate) struct Supplied {
     pub host: String,
 }
 
+/// A supplied certificate with fewer days than this left is reported on
+/// stderr once a day. Renewal tools replace a certificate well before
+/// this, so reaching it means the renewal is failing.
+pub const CERTIFICATE_EXPIRY_WARNING_DAYS: i64 = 14;
+
+/// The end of a certificate's validity, in milliseconds since the Unix
+/// epoch, or `None` when it cannot be read. This is for telling the
+/// operator, and decides nothing: clients judge validity for themselves.
+fn not_after_ms(der: &[u8]) -> Option<i64> {
+    /// One DER element: its tag, its content and what follows it.
+    fn element(input: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+        let (&tag, rest) = input.split_first()?;
+        let (&first, rest) = rest.split_first()?;
+        let (len, rest) = if first < 0x80 {
+            (usize::from(first), rest)
+        } else {
+            let count = usize::from(first & 0x7f);
+            if count == 0 || count > 4 || rest.len() < count {
+                return None;
+            }
+            let len = rest[..count]
+                .iter()
+                .fold(0usize, |len, &byte| (len << 8) | usize::from(byte));
+            (len, &rest[count..])
+        };
+        (rest.len() >= len).then(|| (tag, &rest[..len], &rest[len..]))
+    }
+    const SEQUENCE: u8 = 0x30;
+    const UTC_TIME: u8 = 0x17;
+    const GENERALIZED_TIME: u8 = 0x18;
+
+    // Certificate { tbsCertificate { [0] version, serialNumber, signature,
+    // issuer, validity { notBefore, notAfter }, ... }, ... }
+    let (SEQUENCE, certificate, _) = element(der)? else {
+        return None;
+    };
+    let (SEQUENCE, mut tbs, _) = element(certificate)? else {
+        return None;
+    };
+    if tbs.first() == Some(&0xa0) {
+        tbs = element(tbs)?.2;
+    }
+    for _ in 0..3 {
+        tbs = element(tbs)?.2;
+    }
+    let (SEQUENCE, validity, _) = element(tbs)? else {
+        return None;
+    };
+    let (tag, text, _) = element(element(validity)?.2)?;
+    let text = std::str::from_utf8(text).ok()?.strip_suffix('Z')?;
+    if !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let number = |range: std::ops::Range<usize>| text.get(range)?.parse::<i64>().ok();
+    let (year, rest) = match (tag, text.len()) {
+        // Two digits of year, which RFC 5280 places in 1950 to 2049.
+        (UTC_TIME, 12) => {
+            let year = number(0..2)?;
+            (if year >= 50 { 1900 + year } else { 2000 + year }, 2)
+        }
+        (GENERALIZED_TIME, 14) => (number(0..4)?, 4),
+        _ => return None,
+    };
+    let (month, day) = (number(rest..rest + 2)?, number(rest + 2..rest + 4)?);
+    let (hour, minute, second) = (
+        number(rest + 4..rest + 6)?,
+        number(rest + 6..rest + 8)?,
+        number(rest + 8..rest + 10)?,
+    );
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 {
+        return None;
+    }
+    // Days since the epoch of a date in the Gregorian calendar.
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let year_of_era = year.rem_euclid(400);
+    let month_from_march = (month + 9) % 12;
+    let day_of_year = (153 * month_from_march + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    Some((days * 86_400 + hour * 3_600 + minute * 60 + second) * 1000)
+}
+
 /// The files as they were at one moment: a digest of both, to tell whether
 /// they changed since.
 type Stamp = [u8; 32];
@@ -171,7 +254,9 @@ impl Supplied {
 /// Blocks on disk I/O.
 pub(crate) fn load_supplied(supplied: Supplied, interval: Duration) -> Result<TlsIdentity, String> {
     let (stamp, pair) = supplied.read();
-    let current = Arc::new(Current(RwLock::new(Arc::new(pair?))));
+    let pair = pair?;
+    let expires_ms = pair.cert.first().and_then(|cert| not_after_ms(cert));
+    let current = Arc::new(Current(RwLock::new(Arc::new(pair))));
     Ok(TlsIdentity {
         config: server_config(Arc::clone(&current) as Arc<dyn ResolvesServerCert>)?,
         fingerprint: None,
@@ -181,6 +266,8 @@ pub(crate) fn load_supplied(supplied: Supplied, interval: Duration) -> Result<Tl
             seen: stamp,
             complaint: None,
             interval,
+            expires_ms,
+            warned_ms: None,
         }),
     })
 }
@@ -205,9 +292,49 @@ pub(crate) struct Reloader {
     /// The last failure written to stderr, so it is not repeated.
     complaint: Option<String>,
     interval: Duration,
+    /// When the certificate in service stops being valid, if that can be
+    /// read from it.
+    expires_ms: Option<i64>,
+    /// When stderr was last told that it is about to.
+    warned_ms: Option<i64>,
 }
 
 impl Reloader {
+    /// See [`crate::Server::certificate_expires_at`].
+    pub(crate) fn expires_at(&self) -> Option<String> {
+        self.expires_ms.map(crate::time::rfc3339_from_ms)
+    }
+
+    /// Says on stderr, at most once a day, that the certificate in service
+    /// has little time left or none.
+    fn warn_if_expiring(&mut self, now_ms: i64) {
+        const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+        let Some(expires_ms) = self.expires_ms else {
+            return;
+        };
+        let left = expires_ms - now_ms;
+        if left > CERTIFICATE_EXPIRY_WARNING_DAYS * DAY_MS
+            || self.warned_ms.is_some_and(|at| now_ms - at < DAY_MS)
+        {
+            return;
+        }
+        self.warned_ms = Some(now_ms);
+        let path = self.supplied.cert_path.display();
+        let when = crate::time::rfc3339_from_ms(expires_ms);
+        if left <= 0 {
+            eprintln!(
+                "openboard-server: the certificate in {path} expired at {when}, so agents and \
+                 browsers refuse this board: renew it and replace the files"
+            );
+        } else {
+            eprintln!(
+                "openboard-server: the certificate in {path} expires at {when}, in {} days, and \
+                 no renewed one has replaced it: check the tool that renews it",
+                left / DAY_MS
+            );
+        }
+    }
+
     pub(crate) async fn run(mut self, mut stop: watch::Receiver<bool>) {
         loop {
             tokio::select! {
@@ -220,6 +347,7 @@ impl Reloader {
                 continue;
             };
             self.consider(stamp, pair);
+            self.warn_if_expiring(crate::time::now_ms());
         }
     }
 
@@ -229,12 +357,17 @@ impl Reloader {
         }
         match pair {
             Ok(pair) => {
+                self.expires_ms = pair.cert.first().and_then(|cert| not_after_ms(cert));
+                self.warned_ms = None;
                 self.current.replace(Arc::new(pair));
                 self.seen = stamp;
                 self.complaint = None;
                 eprintln!(
-                    "openboard-server: the certificate in {} changed and is now in use",
-                    self.supplied.cert_path.display()
+                    "openboard-server: the certificate in {} changed and is now in use{}",
+                    self.supplied.cert_path.display(),
+                    self.expires_at()
+                        .map(|when| format!(", valid until {when}"))
+                        .unwrap_or_default()
                 );
             }
             Err(reason) => {
@@ -397,6 +530,38 @@ fn restrict_to_owner(path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_end_of_a_certificates_validity_is_read_from_it() {
+        let made = |year, month, day| {
+            let key = rcgen::KeyPair::generate().unwrap();
+            let mut params = rcgen::CertificateParams::new(vec!["board.example".into()]).unwrap();
+            params.not_after = rcgen::date_time_ymd(year, month, day);
+            params.self_signed(&key).unwrap().der().to_vec()
+        };
+        // Before 2050 the date is written with two digits of year, after
+        // it with four.
+        for (year, month, day, expected) in [
+            (2027, 2, 18, "2027-02-18T00:00:00.000Z"),
+            (2049, 12, 31, "2049-12-31T00:00:00.000Z"),
+            (2050, 1, 1, "2050-01-01T00:00:00.000Z"),
+            (2100, 3, 1, "2100-03-01T00:00:00.000Z"),
+        ] {
+            let der = made(year, month, day);
+            assert_eq!(
+                not_after_ms(&der)
+                    .map(crate::time::rfc3339_from_ms)
+                    .as_deref(),
+                Some(expected)
+            );
+            // Cut short anywhere, it is unreadable, never a panic.
+            for len in 0..der.len().min(200) {
+                let _ = not_after_ms(&der[..len]);
+            }
+        }
+        assert_eq!(not_after_ms(b""), None);
+        assert_eq!(not_after_ms(&[0x30, 0x84, 0xff, 0xff, 0xff, 0xff]), None);
+    }
 
     #[test]
     fn a_key_left_by_an_interrupted_first_start_is_replaced() {
