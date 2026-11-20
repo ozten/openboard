@@ -92,6 +92,19 @@ fn issuer(caller: &Caller, board: &str) -> ApiResult<IssuerSpec> {
     })
 }
 
+/// A grant change through a derived token is refused before anything else
+/// is looked at (A10).
+fn changing_issuer(caller: &Caller, board: &str) -> ApiResult<IssuerSpec> {
+    let issuer = issuer(caller, board)?;
+    if issuer.derived {
+        return Err(
+            AppError::new(codes::DERIVED_TOKEN, "a derived token cannot change grants")
+                .next("change grants with your own login, not an agent token"),
+        );
+    }
+    Ok(issuer)
+}
+
 fn parse_pattern(raw: &str) -> ApiResult<Pattern> {
     Pattern::parse(raw, names::validate_channel)
         .map_err(|error| grant_error(GrantFailure::Invalid(error)))
@@ -164,7 +177,7 @@ pub(super) async fn add_grant(
             now_ms().saturating_add(i64::try_from(secs.saturating_mul(1000)).unwrap_or(i64::MAX)),
         ),
     };
-    let issuer = issuer(&caller, &board.name)?;
+    let issuer = changing_issuer(&caller, &board.name)?;
     let writer = caller.writer();
     let on = board.clone();
     let added = state
@@ -201,7 +214,7 @@ pub(super) async fn remove_grant(
     }
     let Path((board_name, id)) = path.map_err(|_| bad_path())?;
     let board = state.board_named(&caller, &board_name).await?;
-    let issuer = issuer(&caller, &board.name)?;
+    let issuer = changing_issuer(&caller, &board.name)?;
     let writer = caller.writer();
     let (removed, authorized_by) = state
         .db(move |state| state.store.remove_grant(&board, &writer, &issuer, &id))

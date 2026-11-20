@@ -484,7 +484,7 @@ async fn a_derived_token_only_narrows_and_dies_with_its_parent() {
     error_of(
         board.add_grant(&wide.token, "build/", "lead", "read").await,
         StatusCode::FORBIDDEN,
-        codes::NO_AUTHORITY,
+        codes::DERIVED_TOKEN,
     )
     .await;
     // Nor create a board or a private channel.

@@ -534,6 +534,10 @@ impl AppError {
             codes::FORBIDDEN,
             "the caller is not allowed to perform this action",
         )
+        .next(
+            "`openboard explain <channel>` shows what you may do there and which grant \
+             decides; ask someone with grant.manage for more",
+        )
     }
 
     fn invalid_cursor() -> Self {

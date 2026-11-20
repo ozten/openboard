@@ -429,6 +429,12 @@ async fn upgrade_check(json_output: bool, dir: &Path) -> Result<(), Failure> {
         UpgradeAction::Migrate { to, .. } => (true, Some(to)),
         _ => (false, None),
     };
+    // Moving to schema 5 brings grants (M4). Everyone keeps the access they
+    // had, and nobody may change grants until the operator says who may.
+    let grants_note = (check.schema_version < 5 && check.supported_schema_version >= 5)
+        .then_some(
+            "grants arrive with this upgrade: agents and people keep the access they have, and              nobody can change who may do what until you run `openboard admin grant '*' <your              name or email> all --data-dir <dir>` (or start once with `serve --admin <name>`)",
+        );
     let failure = match check.action {
         UpgradeAction::Refuse => Some(
             Failure::new(
@@ -482,6 +488,7 @@ async fn upgrade_check(json_output: bool, dir: &Path) -> Result<(), Failure> {
             "database_bytes": check.database_bytes,
             "free_bytes": check.free_bytes,
             "room_for_backup": check.room_for_backup,
+            "notes": grants_note.into_iter().collect::<Vec<_>>(),
         });
         if let Some(failure) = &failure {
             let error: serde_json::Value =
@@ -514,6 +521,12 @@ async fn upgrade_check(json_output: bool, dir: &Path) -> Result<(), Failure> {
                  {room}",
                 bytes(check.database_bytes),
                 check.free_bytes.map_or_else(|| "unknown".to_owned(), bytes),
+            ));
+        }
+        if let Some(note) = grants_note {
+            human.push_str(&format!(
+                "
+note: {note}"
             ));
         }
         write_stdout(&human)?;

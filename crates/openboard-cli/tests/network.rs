@@ -3196,7 +3196,7 @@ fn a_lead_starts_a_worker_with_a_derived_token_in_its_environment() {
         .json();
     assert_eq!(posted["message"]["by"]["profile"], "fx");
     run(worker().args(["--json", "post", "docs", "sneaky"])).error(1, "forbidden");
-    run(worker().args(["--json", "grant", "build/", "lead", "read"])).error(1, "no_authority");
+    run(worker().args(["--json", "grant", "build/", "lead", "read"])).error(1, "derived_token");
 
     let listed: Value = run(lead.cli().args(["--json", "agent", "tokens"]))
         .ok()

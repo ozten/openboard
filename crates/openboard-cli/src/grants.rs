@@ -24,6 +24,16 @@ fn line(grant: &Grant) -> String {
     line
 }
 
+/// A `not_found` from a grant command is about a name or a grant ID, not
+/// a thread.
+fn not_found_hint(failure: Failure, hint: &str) -> Failure {
+    if failure.code == openboard_api::codes::NOT_FOUND {
+        failure.next(hint)
+    } else {
+        failure
+    }
+}
+
 pub async fn grant(ctx: &Ctx<'_>, args: &GrantArgs) -> Result<(), Failure> {
     let changed = ctx
         .client
@@ -33,7 +43,15 @@ pub async fn grant(ctx: &Ctx<'_>, args: &GrantArgs) -> Result<(), Failure> {
             verbs: args.verbs.clone(),
             expires_in_secs: args.expires.map(|ttl| ttl.as_secs()),
         })
-        .await?;
+        .await
+        .map_err(|failure| {
+            not_found_hint(
+                failure,
+                "name an enrolled agent, a person's email address, agents, people, services or \
+                 everyone; a profile is not a grantee (`lead/worker-1` is lead's profile \
+                 worker-1: limit it with `openboard profiles limit`)",
+            )
+        })?;
     ctx.print(&changed, || {
         let mut human = format!(
             "granted {}\nauthorized by your grant {}",
@@ -82,7 +100,12 @@ pub async fn list(ctx: &Ctx<'_>) -> Result<(), Failure> {
 }
 
 pub async fn ungrant(ctx: &Ctx<'_>, args: &UngrantArgs) -> Result<(), Failure> {
-    let changed = ctx.client.remove_grant(&args.id).await?;
+    let changed = ctx.client.remove_grant(&args.id).await.map_err(|failure| {
+        not_found_hint(
+            failure,
+            "list the grants you manage with `openboard grants`",
+        )
+    })?;
     ctx.print(&changed, || format!("removed {}", line(&changed.grant)))
 }
 
