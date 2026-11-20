@@ -2,8 +2,9 @@
 //!
 //! The order, also documented in `openboard --help`:
 //!
-//! 1. `BOARD_TOKEN` in the environment. It needs `BOARD_URL` and, for an
-//!    `https://` board, `BOARD_FINGERPRINT`. The login file is not read.
+//! 1. `BOARD_TOKEN` in the environment. It needs `BOARD_URL`, and
+//!    `BOARD_FINGERPRINT` when the board has a self-signed certificate.
+//!    The login file is not read.
 //! 2. A stored login, filtered by `--url`/`BOARD_URL` and
 //!    `--login`/`BOARD_LOGIN` where given. Exactly one must match.
 //! 3. With no URL and no stored login, the local board at
@@ -11,6 +12,10 @@
 //!
 //! An `http://` URL always means a local board: no login is looked up and no
 //! token is ever sent to it.
+//!
+//! An `https://` board with a fingerprint is pinned to it. One without is
+//! checked against this machine's certificate authorities and its host
+//! name. See [`crate::tls`].
 
 use std::path::PathBuf;
 
@@ -38,9 +43,11 @@ pub enum Origin {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
     pub url: String,
-    /// The certificate pin. Set exactly when `url` is `https://`.
+    /// The certificate pin of an `https://` board with a self-signed
+    /// certificate. `None` for one whose certificate the certificate
+    /// authorities vouch for, and for a local board.
     pub fingerprint: Option<String>,
-    /// Set only together with `fingerprint`.
+    /// Set only for an `https://` board.
     pub token: Option<Secret>,
     /// The enrolled name, when a stored login was chosen.
     pub principal: Option<String>,
@@ -53,7 +60,7 @@ pub struct Target {
 
 impl Target {
     pub fn is_network(&self) -> bool {
-        self.fingerprint.is_some()
+        is_https(&self.url)
     }
 
     fn local(url: &str) -> Self {
@@ -69,10 +76,10 @@ impl Target {
     }
 
     /// The board an invite names, before there is a token for it.
-    pub fn for_join(url: &str, fingerprint: &str) -> Self {
+    pub fn for_join(url: &str, fingerprint: Option<&str>) -> Self {
         Self {
             url: url.to_owned(),
-            fingerprint: Some(fingerprint.to_owned()),
+            fingerprint: fingerprint.map(str::to_owned),
             token: None,
             principal: None,
             credential_id: None,
@@ -87,7 +94,11 @@ impl Target {
     }
 
     fn stored(login: &Login, path: PathBuf) -> Result<Self, Failure> {
-        if !is_https(&login.url) || parse_fingerprint(&login.fingerprint).is_none() {
+        let unreadable_pin = login
+            .fingerprint
+            .as_deref()
+            .is_some_and(|pin| parse_fingerprint(pin).is_none());
+        if !is_https(&login.url) || unreadable_pin {
             return Err(Failure::new(
                 codes::LOGIN_FILE,
                 format!(
@@ -101,7 +112,7 @@ impl Target {
         }
         Ok(Self {
             url: login.url.clone(),
-            fingerprint: Some(login.fingerprint.clone()),
+            fingerprint: login.fingerprint.clone(),
             token: Some(login.token.clone()),
             principal: Some(login.principal.clone()),
             credential_id: Some(login.credential_id.clone()),
@@ -169,8 +180,8 @@ pub fn resolve(
         let Some(url) = &wanted.url else {
             return Err(
                 Failure::usage("BOARD_TOKEN is set but BOARD_URL is not").next(
-                    "set BOARD_URL and BOARD_FINGERPRINT beside BOARD_TOKEN, or unset BOARD_TOKEN \
-                 to use a stored login",
+                    "set BOARD_URL beside BOARD_TOKEN (and BOARD_FINGERPRINT for a board with a \
+                     self-signed certificate), or unset BOARD_TOKEN to use a stored login",
                 ),
             );
         };
@@ -184,33 +195,27 @@ pub fn resolve(
                  board's https:// URL",
             ));
         }
-        let fingerprint = match &wanted.fingerprint {
-            Some(fingerprint) if parse_fingerprint(fingerprint).is_some() => fingerprint.clone(),
-            Some(_) => {
-                return Err(Failure::usage(
+        let fingerprint =
+            match &wanted.fingerprint {
+                Some(fingerprint) if parse_fingerprint(fingerprint).is_some() => {
+                    Some(fingerprint.clone())
+                }
+                Some(_) => return Err(Failure::usage(
                     "BOARD_FINGERPRINT is not a certificate fingerprint: it should be `sha256:` \
                      followed by 64 hex digits",
                 )
                 .next(
                     "copy it from `openboard admin info` on the board's host, or use `openboard \
-                     join <invite>`, which carries it",
-                ))
-            }
-            None => {
-                return Err(Failure::usage(format!(
-                    "BOARD_TOKEN is set for {url} but BOARD_FINGERPRINT is not, so there is no \
-                     certificate to pin"
-                ))
-                .next(
-                    "set BOARD_FINGERPRINT to the board's certificate fingerprint (`openboard \
-                     admin info` on the board's host prints it), or use `openboard join \
-                     <invite>`, which carries it",
-                ))
-            }
-        };
+                     join <invite>`, which carries it; unset it for a board whose certificate \
+                     comes from a certificate authority",
+                )),
+                // A board known by its host name: its certificate is checked
+                // against the certificate authorities.
+                None => None,
+            };
         return Ok(Target {
             url: url.trim_end_matches('/').to_owned(),
-            fingerprint: Some(fingerprint),
+            fingerprint,
             token: Some(token.clone()),
             principal: None,
             credential_id: None,
@@ -251,10 +256,9 @@ pub fn resolve(
         [] => {
             let message = match (&wanted.url, &wanted.login) {
                 (Some(url), Some(name)) => format!("no stored login for {url} as {name}"),
-                (Some(url), None) => format!(
-                    "no stored login for {url}, so there is no certificate fingerprint to pin \
-                     and no token to send"
-                ),
+                (Some(url), None) => {
+                    format!("no stored login for {url}, so there is no token to send")
+                }
                 (None, Some(name)) => format!("no stored login is named {name}"),
                 (None, None) => "no stored login".to_owned(),
             };
@@ -301,7 +305,7 @@ mod tests {
     fn login(url: &str, principal: &str) -> Login {
         Login {
             url: url.into(),
-            fingerprint: fp(),
+            fingerprint: Some(fp()),
             principal: principal.into(),
             credential_id: format!("crd_{principal}"),
             token: Secret::new(format!("obt_secret_{principal}")),
@@ -408,7 +412,7 @@ mod tests {
         for logins in [Vec::new(), vec![login("https://other:1", "agent-a")]] {
             let failure = resolve(&wanted(Some("https://b:1"), None), store(logins)).unwrap_err();
             assert_eq!(failure.exit, EXIT_USAGE);
-            assert!(failure.message.contains("fingerprint"), "{failure:?}");
+            assert!(failure.message.contains("no token"), "{failure:?}");
             assert!(failure.next.unwrap().contains("openboard join"));
         }
         let failure = resolve(
@@ -420,7 +424,27 @@ mod tests {
     }
 
     #[test]
-    fn a_token_in_the_environment_wins_and_needs_a_url_and_a_fingerprint() {
+    fn a_stored_login_without_a_fingerprint_is_checked_by_certificate_authorities() {
+        let trusted = Login {
+            fingerprint: None,
+            ..login("https://board.example", "agent-a")
+        };
+        let target = resolve(&wanted(None, None), store(vec![trusted.clone()])).unwrap();
+        assert!(target.is_network());
+        assert_eq!(target.fingerprint, None);
+        assert_eq!(target.token.unwrap().expose(), "obt_secret_agent-a");
+        // A fingerprint that is stored but damaged is an error, not a
+        // reason to ask the certificate authorities.
+        let damaged = Login {
+            fingerprint: Some("sha256:beef".into()),
+            ..trusted
+        };
+        let failure = resolve(&wanted(None, None), store(vec![damaged])).unwrap_err();
+        assert_eq!(failure.code, codes::LOGIN_FILE);
+    }
+
+    #[test]
+    fn a_token_in_the_environment_wins_and_needs_a_url() {
         let env = |url: Option<&str>, fingerprint: Option<String>| Wanted {
             url: url.map(str::to_owned),
             login: None,
@@ -430,11 +454,17 @@ mod tests {
         let target = resolve(&env(Some("https://b:1/"), Some(fp())), never).unwrap();
         assert_eq!(target.origin, Origin::Env);
         assert_eq!(target.url, "https://b:1");
+        assert_eq!(target.fingerprint, Some(fp()));
+        assert_eq!(target.token.unwrap().expose(), "obt_envtoken");
+        // Without a fingerprint the board is known by its host name.
+        let target = resolve(&env(Some("https://board.example"), None), never).unwrap();
+        assert!(target.is_network());
+        assert_eq!(target.fingerprint, None);
         assert_eq!(target.token.unwrap().expose(), "obt_envtoken");
 
         for wanted in [
             env(None, Some(fp())),
-            env(Some("https://b:1"), None),
+            // A fingerprint that is given must be one.
             env(Some("https://b:1"), Some("sha256:beef".into())),
             // A token is never sent over plain HTTP.
             env(Some("http://127.0.0.1:7878"), Some(fp())),

@@ -123,31 +123,58 @@ function sleep(ms, signal) {
  * Options, each falling back to the environment the CLI reads:
  * - `url` (`BOARD_URL`, else the local default `http://127.0.0.1:7878`)
  * - `name`, the board's name (`BOARD_NAME`, else `general`)
- * - `token` (`BOARD_TOKEN`) and `fingerprint` (`BOARD_FINGERPRINT`), for a
- *   network board: the certificate is pinned, and nothing is sent until
- *   the pin matches
+ * - `token` (`BOARD_TOKEN`), sent only once the board's certificate has
+ *   been checked
+ * - `fingerprint` (`BOARD_FINGERPRINT`), for a board with a self-signed
+ *   certificate: the certificate is pinned. Without one, an `https://`
+ *   board's certificate is checked against the certificate authorities and
+ *   the hostname. There is no fallback from one to the other.
  * - `profile` (`BOARD_AS`, else `BOARD_PROFILE`)
  * - `fetch`, to replace the transport entirely
  */
 export function board(options = {}) {
   const url = (options.url ?? env("BOARD_URL") ?? DEFAULT_URL).replace(/\/+$/, "");
   const fingerprint = options.fingerprint ?? env("BOARD_FINGERPRINT");
+  const https = url.startsWith("https://");
+  if (https && !options.fetch && typeof fingerprint === "string" && fingerprint.trim() === "") {
+    // An empty pin is a pin that went missing, not a request for the
+    // certificate authorities.
+    throw new BoardError({
+      code: "certificate_mismatch",
+      message: "the certificate fingerprint given is empty",
+      hint: "pass the `sha256:` pin from your invite as `fingerprint`, or leave `fingerprint` out for a board with a trusted certificate",
+      origin: "handle",
+    });
+  }
   const config = {
     url,
     name: options.name ?? env("BOARD_NAME") ?? DEFAULT_BOARD,
     token: options.token ?? env("BOARD_TOKEN"),
-    fetch: options.fetch ?? boardFetch(url.startsWith("https://") ? fingerprint : undefined),
+    fetch: options.fetch ?? boardFetch(https ? fingerprint : undefined),
   };
-  if (url.startsWith("https://") && !options.fetch && !fingerprint) {
-    throw new BoardError({
-      code: "certificate_mismatch",
-      message: "a network board is reached with its certificate pinned, and no fingerprint was given",
-      hint: "pass `fingerprint` or set BOARD_FINGERPRINT to the `sha256:` pin from your invite",
+  const profile = options.profile !== undefined ? options.profile : (env("BOARD_AS") ?? env("BOARD_PROFILE") ?? null);
+  return new Board(config, profile);
+}
+
+/** A failure to reach the board, or to trust it, as a `BoardError`. */
+function transportError(url, error) {
+  const message = `cannot reach the board at ${url}: ${error?.message ?? error}`;
+  if (error?.code === "certificate_untrusted") {
+    return new BoardError({
+      code: "certificate_untrusted",
+      message,
+      hint:
+        "the board's certificate is not trusted by this machine's certificate authorities; " +
+        "if the board uses a self-signed certificate, pass `fingerprint` (or set BOARD_FINGERPRINT) from your invite",
       origin: "handle",
     });
   }
-  const profile = options.profile !== undefined ? options.profile : (env("BOARD_AS") ?? env("BOARD_PROFILE") ?? null);
-  return new Board(config, profile);
+  return new BoardError({
+    code: error?.code === "certificate_mismatch" ? "certificate_mismatch" : "connection_failed",
+    message,
+    hint: "check that the board is running and BOARD_URL is right",
+    origin: "handle",
+  });
 }
 
 export class Board {
@@ -207,12 +234,7 @@ export class Board {
         if (signal?.aborted) {
           throw error;
         }
-        throw new BoardError({
-          code: error?.code === "certificate_mismatch" ? "certificate_mismatch" : "connection_failed",
-          message: `cannot reach the board at ${this.#config.url}: ${error?.message ?? error}`,
-          hint: "check that the board is running and BOARD_URL is right",
-          origin: "handle",
-        });
+        throw transportError(this.#config.url, error);
       }
       if (response.status === 204) {
         return null;

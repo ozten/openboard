@@ -436,7 +436,10 @@ async fn join_swaps_a_code_for_a_token_exactly_once() {
     assert_eq!(created.principal, "alice");
     let invite = created.invite;
     assert_eq!(invite.url, board.url);
-    assert_eq!(invite.fingerprint, board.fingerprint);
+    assert_eq!(
+        invite.fingerprint.as_deref(),
+        Some(board.fingerprint.as_str())
+    );
     assert_eq!(Invite::decode(&invite.encode()), Ok(invite.clone()));
 
     let response = board.join_raw(&invite.code).await;
@@ -1818,10 +1821,7 @@ async fn operator_functions_work_with_the_server_running_and_stopped() {
 
     // Stopped: everything still works on the directory alone.
     let offline = operator::create_invite(&data_dir, "carol", &InviteOptions::default()).unwrap();
-    assert_eq!(
-        offline.invite.fingerprint,
-        info.fingerprint.clone().unwrap()
-    );
+    assert_eq!(offline.invite.fingerprint, info.fingerprint);
     let revoked = operator::revoke_principal(&data_dir, "BOB").unwrap();
     assert_eq!(revoked.principal, "bob");
     assert_eq!(

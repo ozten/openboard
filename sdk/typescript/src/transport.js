@@ -1,7 +1,15 @@
 // How requests reach a board. A local board is plain HTTP on loopback. A
-// network board is HTTPS with its certificate pinned: the SHA-256 of the
-// certificate's DER encoding must match the pin before a single byte of the
-// request, and so the token, is written to the connection.
+// network board is HTTPS over TLS 1.3, checked one of two ways, fixed by
+// whether a fingerprint was given and never by what the server presents:
+//
+// - Pinned: the SHA-256 of the certificate's DER encoding must match the
+//   pin. The chain and the hostname are not consulted.
+// - Certificate authorities: the certificate must chain to an authority
+//   Node trusts and name the host, as a browser checks it.
+//
+// Either way the check happens on the handshake, before a single byte of the
+// request, and so the token, is written to the connection. There is no
+// fallback from one to the other.
 
 import { createHash } from "node:crypto";
 import http from "node:http";
@@ -20,25 +28,63 @@ export function parseFingerprint(text) {
 }
 
 /**
- * A `fetch`-shaped function for one board. With a fingerprint it opens a TLS
- * 1.3 connection, checks the pin on the handshake, and only then sends the
- * request over it. Without one it is the global `fetch`.
+ * A `fetch`-shaped function for one board.
+ *
+ * With a fingerprint, every request goes over a TLS 1.3 connection whose
+ * certificate matches the pin, and an `http://` URL is refused. Without one,
+ * an `https://` request goes over a TLS 1.3 connection verified against the
+ * certificate authorities and the hostname, and an `http://` request goes
+ * through the global `fetch`.
+ *
+ * `internal.ca` is for this package's tests only: it replaces Node's
+ * certificate authorities with the given ones, so a test can trust its own
+ * authority. It has no effect on a pinned connection. It is not part of the
+ * public API; this module is not exported from the package.
  */
-export function boardFetch(fingerprint) {
+export function boardFetch(fingerprint, internal = {}) {
   if (!fingerprint) {
-    return (url, init) => globalThis.fetch(url, init);
+    const ca = internal.ca;
+    return (url, init = {}) => {
+      const target = new URL(url);
+      if (target.protocol === "https:") {
+        return tlsRequest(target, init, { ca });
+      }
+      return globalThis.fetch(url, init);
+    };
   }
   const pin = parseFingerprint(fingerprint);
   if (!pin) {
     throw new TypeError("the certificate fingerprint is not `sha256:` and 64 hex digits");
   }
-  return (url, init = {}) => pinnedRequest(new URL(url), init, pin);
+  return (url, init = {}) => {
+    const target = new URL(url);
+    if (target.protocol !== "https:") {
+      return Promise.reject(new TypeError("a pinned board is reached over https://"));
+    }
+    return tlsRequest(target, init, { pin });
+  };
 }
 
-function pinnedRequest(url, init, pin) {
-  if (url.protocol !== "https:") {
-    return Promise.reject(new TypeError("a pinned board is reached over https://"));
+/** Checks a pinned connection's certificate. Returns an error, or null. */
+function checkPin(socket, pin) {
+  const cert = socket.getPeerCertificate(false);
+  const presented = cert?.raw ? createHash("sha256").update(cert.raw).digest("hex") : "";
+  if (presented === pin) {
+    return null;
   }
+  const error = new Error(
+    `the board presented a certificate with fingerprint ${PREFIX}${presented}, not the pinned one`,
+  );
+  error.code = "certificate_mismatch";
+  return error;
+}
+
+/**
+ * One request over a fresh TLS 1.3 connection, handed to `http.request` only
+ * once the certificate has passed: `{ pin }` checks the pin, `{ ca }` (or
+ * nothing) has Node verify the chain and the hostname.
+ */
+function tlsRequest(url, init, { pin, ca }) {
   const port = Number(url.port || 443);
   const host = url.hostname.replace(/^\[|\]$/g, "");
   return new Promise((resolve, reject) => {
@@ -48,29 +94,43 @@ function pinnedRequest(url, init, pin) {
       return;
     }
     const createConnection = (_options, done) => {
+      let settled = false;
+      const finish = (error, socket) => {
+        if (!settled) {
+          settled = true;
+          done(error, socket);
+        }
+      };
       const socket = tls.connect({
         host,
         port,
         servername: net.isIP(host) ? undefined : host,
         minVersion: "TLSv1.3",
-        // The chain is not what is trusted here; the pin is, below.
-        rejectUnauthorized: false,
+        ...(pin
+          ? // The chain is not what is trusted here; the pin is, below.
+            { rejectUnauthorized: false }
+          : // Node checks the chain and the hostname, and fails the
+            // handshake before `secureConnect` if either is wrong.
+            { rejectUnauthorized: true, ...(ca ? { ca } : {}) }),
       });
       socket.once("secureConnect", () => {
-        const cert = socket.getPeerCertificate(false);
-        const presented = cert?.raw ? createHash("sha256").update(cert.raw).digest("hex") : "";
-        if (presented !== pin) {
-          const error = new Error(
-            `the board presented a certificate with fingerprint ${PREFIX}${presented}, not the pinned one`,
-          );
-          error.code = "certificate_mismatch";
+        const error = pin ? checkPin(socket, pin) : socket.authorized ? null : untrusted(host, socket.authorizationError);
+        if (error) {
           socket.destroy();
-          done(error);
+          finish(error);
           return;
         }
-        done(null, socket);
+        finish(null, socket);
       });
-      socket.once("error", (error) => done(error));
+      socket.once("error", (error) => {
+        // A failed verification sets `authorizationError` before the socket
+        // is destroyed with it; anything else is a connection failure.
+        if (!pin && socket.authorizationError) {
+          finish(untrusted(host, socket.authorizationError, error));
+          return;
+        }
+        finish(error);
+      });
     };
     const headers = { ...(init.headers || {}), host: url.host };
     const request = http.request(
@@ -104,4 +164,15 @@ function pinnedRequest(url, init, pin) {
     }
     request.end();
   });
+}
+
+function untrusted(host, reason, cause) {
+  const why = cause?.message ?? String(reason ?? "unknown reason");
+  const code = reason && String(reason) !== why ? ` (${reason})` : "";
+  const error = new Error(`the certificate of ${host} is not trusted: ${why}${code}`);
+  error.code = "certificate_untrusted";
+  if (cause) {
+    error.cause = cause;
+  }
+  return error;
 }

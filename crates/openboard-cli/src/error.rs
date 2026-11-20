@@ -37,6 +37,9 @@ pub mod codes {
     /// The board did not prove it is the one this client pinned: it showed
     /// another certificate, or could not sign with the pinned one's key.
     pub const CERTIFICATE_MISMATCH: &str = "certificate_mismatch";
+    /// The board is known by its host name, and this machine's certificate
+    /// authorities do not vouch for the certificate the server presented.
+    pub const CERTIFICATE_UNTRUSTED: &str = "certificate_untrusted";
     /// Several stored logins match and none was chosen. Exit code 2.
     pub const AMBIGUOUS_LOGIN: &str = "ambiguous_login";
     /// The login file can be read by other users.

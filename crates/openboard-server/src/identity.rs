@@ -44,7 +44,14 @@ const CSRF_DOMAIN: &[u8] = b"openboard.csrf.v1\n";
 /// `meta` keys.
 pub(crate) const META_MODE: &str = "mode";
 pub(crate) const META_URL: &str = "public_url";
+/// The pin of the board's self-signed certificate. Absent on a board that
+/// serves a supplied certificate.
 pub(crate) const META_FINGERPRINT: &str = "fingerprint";
+/// How clients come to trust the board's certificate. Absent when they pin
+/// a self-signed one; [`TRUST_AUTHORITIES`] once a supplied certificate was
+/// served, after which the board never serves a self-signed one again.
+pub(crate) const META_TRUST: &str = "tls_trust";
+pub(crate) const TRUST_AUTHORITIES: &str = "authorities";
 /// The version, commit and time of the server that last started on the
 /// directory. Written on every start; a server older than 0.1.0 writes
 /// none of them and reads none of them.
@@ -62,6 +69,8 @@ pub mod log_kinds {
     /// its agents, while its recorded mode was missing or said local. The
     /// record was put right and the board served as a network one.
     pub const MODE_REPAIRED: &str = "mode.repaired";
+    /// The board began serving a certificate its operator supplied.
+    pub const CERTIFICATE_SUPPLIED: &str = "certificate.supplied";
     pub const INVITE_CREATED: &str = "invite.created";
     /// A pending invite was withdrawn when its principal was revoked.
     pub const INVITE_REVOKED: &str = "invite.revoked";
@@ -212,6 +221,11 @@ pub(crate) fn meta_set(conn: &Connection, key: &str, value: &str) -> rusqlite::R
          ON CONFLICT (key) DO UPDATE SET value = excluded.value",
         params![key, value],
     )?;
+    Ok(())
+}
+
+pub(crate) fn meta_delete(conn: &Connection, key: &str) -> rusqlite::Result<()> {
+    conn.execute("DELETE FROM meta WHERE key = ?1", [key])?;
     Ok(())
 }
 

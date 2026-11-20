@@ -5,11 +5,14 @@
 //!
 //! - **Local**: plain HTTP, no authentication, one principal, and a listener
 //!   that is refused unless it binds to loopback.
-//! - **Network**: TLS 1.3 on every listener, loopback included, with a
-//!   self-signed certificate that clients pin by fingerprint, and a bearer
+//! - **Network**: TLS 1.3 on every listener, loopback included, and a bearer
 //!   token or a browser session cookie on every request except the health
-//!   check, enrolment, sign-in and the web UI's static files. See
-//!   `openboard_api::auth` and `openboard_api::web` for the contract.
+//!   check, enrolment, sign-in and the web UI's static files. The
+//!   certificate is a self-signed one that clients pin by fingerprint, or
+//!   one the operator supplies for the board's host name
+//!   ([`Config::tls_cert`]), which clients check against their certificate
+//!   authorities. See `openboard_api::auth` and `openboard_api::web` for the
+//!   contract.
 //!
 //! In both modes a write that names an `Origin` other than the address it
 //! was sent to is refused, and a write made with a session cookie needs the
@@ -92,7 +95,9 @@
 //!   on the first network start and reused afterwards, so the fingerprint
 //!   clients pin stays the same. The key is readable only by its owner.
 //!   Removing the pair makes the next start create a new one, after which
-//!   every client must enrol again.
+//!   every client must enrol again. A board that serves a supplied
+//!   certificate reads it from where the operator keeps it and writes
+//!   neither file.
 //!
 //! One server at a time serves a data directory. A running server holds an
 //! exclusive lock on [`LOCK_FILE_NAME`] in it, and a second server started on
@@ -183,6 +188,16 @@ pub(crate) fn normalize_public_url(url: &str) -> Result<String, &'static str> {
     }
 }
 
+/// The host of a URL that [`normalize_public_url`] accepted, without its
+/// port and without the brackets of an IPv6 address.
+pub(crate) fn host_of(url: &str) -> &str {
+    let authority = url.strip_prefix("https://").unwrap_or(url);
+    if let Some(rest) = authority.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    authority.split(':').next().unwrap_or(authority)
+}
+
 /// Data directory used when none is given, relative to the working directory.
 pub const DEFAULT_DATA_DIR: &str = ".openboard";
 
@@ -224,6 +239,24 @@ pub struct Config {
     /// every board at start, for example after an upgrade, when nobody
     /// holds `grant.manage` yet.
     pub admin: Option<String>,
+    /// Network mode: a certificate for the host of [`Config::public_url`],
+    /// in PEM, with the board's certificate first and its intermediates
+    /// after it, served in place of the self-signed one. It goes with
+    /// [`Config::tls_key`] and needs [`Config::public_url`]. Clients of
+    /// such a board pin nothing: they check the chain against their
+    /// certificate authorities, and the host name.
+    ///
+    /// The board records that it is served this way, and from then on
+    /// refuses to start without a supplied certificate, so that it never
+    /// goes back to a self-signed one by accident. Supplying a certificate
+    /// to a board whose agents pinned its self-signed one makes them enrol
+    /// again.
+    pub tls_cert: Option<PathBuf>,
+    /// The private key of [`Config::tls_cert`], in PEM.
+    pub tls_key: Option<PathBuf>,
+    /// How often the supplied certificate and key are read again, so that
+    /// a renewed certificate is served without a restart.
+    pub tls_reload_interval: std::time::Duration,
 }
 
 impl Config {
@@ -252,6 +285,9 @@ impl Default for Config {
             security_log: LogRetention::default(),
             open: false,
             admin: None,
+            tls_cert: None,
+            tls_key: None,
+            tls_reload_interval: std::time::Duration::from_secs(10),
         }
     }
 }
@@ -341,6 +377,8 @@ pub struct Server {
     listener: TcpListener,
     /// Set on a network board, where every connection starts with TLS.
     tls: Option<Arc<rustls::ServerConfig>>,
+    /// Set when the certificate was supplied: puts a renewed one in service.
+    reloader: Option<tls::Reloader>,
     limits: Limits,
     maintenance: http::Maintenance,
     local_addr: SocketAddr,
@@ -391,8 +429,10 @@ impl Server {
         &self.url
     }
 
-    /// The certificate's pin, as `openboard_api::auth::fingerprint` formats
-    /// it. `None` on a local board.
+    /// The pin of a self-signed certificate, as
+    /// `openboard_api::auth::fingerprint` formats it. `None` on a local
+    /// board, and on a board that serves a supplied certificate, which
+    /// clients check against their certificate authorities instead.
     pub fn fingerprint(&self) -> Option<&str> {
         self.fingerprint.as_deref()
     }
@@ -411,6 +451,9 @@ impl Server {
         let mut released = self.released;
         let stopping = stop.subscribe();
         tokio::spawn(self.maintenance.run(stopping.clone()));
+        if let Some(reloader) = self.reloader {
+            tokio::spawn(reloader.run(stopping.clone()));
+        }
         let serving = serve::serve(
             self.listener,
             self.tls.map(tokio_rustls::TlsAcceptor::from),
@@ -485,6 +528,44 @@ async fn bind_inner(
         }
         _ => None,
     };
+    let supplied = match (&config.tls_cert, &config.tls_key) {
+        (None, None) => None,
+        (Some(cert_path), Some(key_path)) => {
+            // The certificate is for a name, and that name is the host of
+            // the public URL: an address the board happens to listen on is
+            // not something a certificate authority vouches for.
+            let Some(url) = &public_url else {
+                return Err(ServeError::Tls(
+                    "a supplied certificate needs a network board and its public URL, such as \
+                     https://board.example, whose host the certificate is for"
+                        .to_owned(),
+                ));
+            };
+            Some(tls::Supplied {
+                cert_path: cert_path.clone(),
+                key_path: key_path.clone(),
+                host: host_of(url).to_owned(),
+            })
+        }
+        _ => {
+            return Err(ServeError::Tls(
+                "a certificate file and its key file go together: give both or neither".to_owned(),
+            ))
+        }
+    };
+    let is_supplied = supplied.is_some();
+    // Read now, so that a certificate that cannot be served refuses the
+    // start before the data directory is created or changed.
+    let reload_interval = config.tls_reload_interval;
+    let supplied = match supplied {
+        None => None,
+        Some(supplied) => Some(
+            tokio::task::spawn_blocking(move || tls::load_supplied(supplied, reload_interval))
+                .await
+                .map_err(|error| ServeError::Tls(error.to_string()))?
+                .map_err(ServeError::Tls)?,
+        ),
+    };
 
     let (data_dir, bind_ip) = (config.data_dir.clone(), config.bind);
     let (open, admin) = (config.open, config.admin.clone());
@@ -500,6 +581,14 @@ async fn bind_inner(
         let plan = store.plan_mode(network).map_err(storage)?;
         if plan.mode == Mode::Local && !bind_ip.is_loopback() {
             return Err(ServeError::NonLoopbackBind(bind_ip));
+        }
+        if plan.trusted && !is_supplied {
+            return Err(ServeError::Tls(
+                "this board is served with a certificate from a certificate authority, and its \
+                 clients pin nothing, so it does not start with a self-signed one: give the \
+                 certificate and key files again"
+                    .to_owned(),
+            ));
         }
         // Before the default board, which starts with the grants of the
         // access mode.
@@ -544,9 +633,10 @@ async fn bind_inner(
     );
     let started = tokio::task::spawn_blocking(move || {
         let storage = |error: store::StoreError| ServeError::Storage(error.to_string());
-        let identity = match mode {
-            Mode::Local => None,
-            Mode::Network => Some(
+        let identity = match (mode, supplied) {
+            (Mode::Local, _) => None,
+            (Mode::Network, Some(supplied)) => Some(supplied),
+            (Mode::Network, None) => Some(
                 tls::load_or_create(&data_dir, bind_ip, plan.pinned).map_err(ServeError::Tls)?,
             ),
         };
@@ -554,9 +644,17 @@ async fn bind_inner(
             None => format!("http://{local_addr}"),
             Some(_) => public_url.unwrap_or_else(|| format!("https://{local_addr}")),
         };
-        let endpoint = identity
-            .as_ref()
-            .map(|identity| (url.as_str(), identity.fingerprint.as_str()));
+        let endpoint = identity.as_ref().map(|identity| store::Endpoint {
+            url: &url,
+            fingerprint: identity.fingerprint.as_deref(),
+        });
+        if plan.pinned && is_supplied {
+            eprintln!(
+                "openboard-server: this board had a self-signed certificate that its agents \
+                 pinned, and now serves a supplied one: every agent must join again with a new \
+                 invite"
+            );
+        }
         store.record_start(&plan, endpoint).map_err(storage)?;
         store.prune_log(&retention).map_err(storage)?;
         Ok((store, identity, url))
@@ -564,9 +662,13 @@ async fn bind_inner(
     .await
     .map_err(|error| ServeError::Storage(error.to_string()))?;
     let (store, identity, url) = started?;
-    let (tls, fingerprint) = match identity {
-        None => (None, None),
-        Some(identity) => (Some(identity.config), Some(identity.fingerprint)),
+    let (tls, fingerprint, reloader) = match identity {
+        None => (None, None, None),
+        Some(identity) => (
+            Some(identity.config),
+            identity.fingerprint,
+            identity.reloader,
+        ),
     };
 
     let policy = policy.unwrap_or_else(|| match mode {
@@ -589,6 +691,7 @@ async fn bind_inner(
         nobody_manages,
         listener,
         tls,
+        reloader,
         limits: config.limits,
         maintenance,
         local_addr,
@@ -613,7 +716,20 @@ pub async fn serve(
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_public_url;
+    use super::{host_of, normalize_public_url};
+
+    #[test]
+    fn hosts_of_public_urls() {
+        for (url, host) in [
+            ("https://board.example", "board.example"),
+            ("https://board.example:7878", "board.example"),
+            ("https://192.168.1.20:7878", "192.168.1.20"),
+            ("https://[2001:db8::1]:7878", "2001:db8::1"),
+            ("https://[::1]", "::1"),
+        ] {
+            assert_eq!(host_of(url), host);
+        }
+    }
 
     #[test]
     fn public_urls() {

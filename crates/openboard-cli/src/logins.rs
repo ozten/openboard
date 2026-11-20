@@ -65,8 +65,10 @@ impl fmt::Debug for Secret {
 pub struct Login {
     /// Base URL of the board, without a trailing slash.
     pub url: String,
-    /// The pinned certificate fingerprint.
-    pub fingerprint: String,
+    /// The pinned certificate fingerprint. Absent for a board whose
+    /// certificate is checked against the certificate authorities.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
     /// Handle of the principal the token authenticates.
     pub principal: String,
     pub credential_id: String,
@@ -350,7 +352,7 @@ mod tests {
     fn login(url: &str, principal: &str, token: &str) -> Login {
         Login {
             url: url.into(),
-            fingerprint: openboard_api::auth::fingerprint(&[1; 32]),
+            fingerprint: Some(openboard_api::auth::fingerprint(&[1; 32])),
             principal: principal.into(),
             credential_id: "crd_1".into(),
             token: Secret::new(token.into()),

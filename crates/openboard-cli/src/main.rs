@@ -592,6 +592,8 @@ async fn serve(
     config.admin = args.admin.clone();
     config.network = args.network;
     config.public_url.clone_from(&args.public_url);
+    config.tls_cert.clone_from(&args.tls_cert);
+    config.tls_key.clone_from(&args.tls_key);
 
     // Whether --network is about to turn an existing local board into a
     // network one, which cannot be undone and is worth saying.
@@ -617,8 +619,18 @@ async fn serve(
             ),
             ServeError::InvalidPublicUrl(_) => Failure::usage(message)
                 .next("pass --public-url as https://<host>:<port> with nothing after the port"),
-            ServeError::Tls(_) => Failure::new(codes::SERVE_FAILED, message)
-                .next("check the certificate and key files in --data-dir"),
+            ServeError::Tls(_) if args.tls_cert.is_some() || args.tls_key.is_some() => {
+                Failure::new(codes::SERVE_FAILED, message).next(
+                    "pass --network, --public-url https://<host>, and --tls-cert with --tls-key: \
+                     the certificate for that host followed by its intermediates (certbot's \
+                     fullchain.pem) and its private key (privkey.pem), both readable by the \
+                     user the board runs as",
+                )
+            }
+            ServeError::Tls(_) => Failure::new(codes::SERVE_FAILED, message).next(
+                "check the certificate and key files in --data-dir, or pass --tls-cert and \
+                 --tls-key for a board that serves a supplied certificate",
+            ),
             ServeError::Bind { .. } => Failure::new(codes::SERVE_FAILED, message).next(
                 "another board may already be running there; choose a port with --port, or \
                  --port 0 for any free one",
@@ -650,6 +662,9 @@ async fn serve(
             listen: String,
             #[serde(skip_serializing_if = "Option::is_none")]
             fingerprint: Option<&'a str>,
+            /// `self_signed` or `supplied`, on a network board.
+            #[serde(skip_serializing_if = "Option::is_none")]
+            certificate: Option<&'a str>,
         }
         write_stdout(&to_json(&Listening {
             url: &url,
@@ -657,6 +672,11 @@ async fn serve(
             mode: mode.as_str(),
             listen: server.local_addr().to_string(),
             fingerprint: server.fingerprint(),
+            certificate: match (mode, server.fingerprint()) {
+                (openboard_server::Mode::Local, _) => None,
+                (openboard_server::Mode::Network, Some(_)) => Some("self_signed"),
+                (openboard_server::Mode::Network, None) => Some("supplied"),
+            },
         })?)?;
     } else if let Some(fingerprint) = server.fingerprint() {
         let dir = shell_quote(&data_dir);
@@ -664,6 +684,19 @@ async fn serve(
             "network board listening on {url} (data in {data_dir})\n\
              mode: network (TLS 1.3, a token on every request)\n\
              certificate fingerprint: {fingerprint}\n\
+             invite an agent from this host with: openboard invite <name> --data-dir {dir}\n\
+             people use the web page at {url}/ ; sign a person in with: openboard invite \
+             <email> --data-dir {dir}\n\
+             version: openboard {}",
+            openboard_api::build::DESCRIBE,
+        ))?;
+    } else if mode == openboard_server::Mode::Network {
+        let dir = shell_quote(&data_dir);
+        write_stdout(&format!(
+            "network board listening on {url} (data in {data_dir})\n\
+             mode: network (TLS 1.3, a token on every request)\n\
+             certificate: supplied, read again when the files change; agents and browsers \
+             check it against their certificate authorities\n\
              invite an agent from this host with: openboard invite <name> --data-dir {dir}\n\
              people use the web page at {url}/ ; sign a person in with: openboard invite \
              <email> --data-dir {dir}\n\

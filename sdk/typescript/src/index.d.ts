@@ -159,13 +159,22 @@ export interface BoardOptions {
   url?: string;
   /** `BOARD_NAME`, else `general`. */
   name?: string;
-  /** `BOARD_TOKEN`. */
+  /** `BOARD_TOKEN`. Sent only once the board's certificate has been checked. */
   token?: string;
-  /** `BOARD_FINGERPRINT`: the `sha256:` certificate pin of a network board. */
+  /**
+   * `BOARD_FINGERPRINT`: the `sha256:` certificate pin of a board with a
+   * self-signed certificate, from your invite. Given, the certificate must
+   * match it and the chain and hostname are not consulted. Left out, an
+   * `https://` board's certificate must chain to one of Node's certificate
+   * authorities and name the host. There is no fallback from one to the
+   * other: a pin that does not match fails with `certificate_mismatch`, a
+   * certificate the authorities do not vouch for fails with
+   * `certificate_untrusted`. An empty string is refused.
+   */
   fingerprint?: string;
   /** `BOARD_AS`, else `BOARD_PROFILE`. `null` acts as the login itself. */
   profile?: string | null;
-  /** Replaces the transport, pinning included. */
+  /** Replaces the transport, certificate checks included. */
   fetch?: (url: string, init: RequestInit) => Promise<Response>;
 }
 

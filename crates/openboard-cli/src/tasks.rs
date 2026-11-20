@@ -822,9 +822,12 @@ pub async fn run_command(
         command.env("BOARD_AS", profile);
     }
     if ctx.target.is_network() {
-        if let Some(fingerprint) = &ctx.target.fingerprint {
-            command.env("BOARD_FINGERPRINT", fingerprint);
-        }
+        match &ctx.target.fingerprint {
+            Some(fingerprint) => command.env("BOARD_FINGERPRINT", fingerprint),
+            // One inherited from the environment would pin this board to
+            // another board's certificate.
+            None => command.env_remove("BOARD_FINGERPRINT"),
+        };
     }
     let mut child = match command.spawn() {
         Ok(child) => child,

@@ -547,7 +547,7 @@ fn a_wrong_fingerprint_in_an_invite_is_a_certificate_mismatch() {
     let agent = Agent::new();
     let good = board.invite("agent-a");
     let forged = altered(&good, |invite| {
-        invite.fingerprint = fingerprint(&[0x5a; 32])
+        invite.fingerprint = Some(fingerprint(&[0x5a; 32]))
     });
 
     let out = run(agent.cli().args(["--json", "join", &forged]));
@@ -927,11 +927,11 @@ fn a_token_in_the_environment_works_without_a_login_file() {
     .json();
     assert_eq!(me["actor"]["handle"], "agent-a");
 
-    // The token needs its URL and its fingerprint, and is never sent over
-    // plain HTTP. None of these complaints quotes it.
+    // The token needs its URL, a fingerprint that is given must be one,
+    // and the token is never sent over plain HTTP. None of these complaints
+    // quotes it.
     for (url, fingerprint) in [
         (None, Some(board.fingerprint.as_str())),
-        (Some(board.url.as_str()), None),
         (Some(board.url.as_str()), Some("sha256:1234")),
         (
             Some("http://127.0.0.1:7878"),
@@ -951,6 +951,18 @@ fn a_token_in_the_environment_works_without_a_login_file() {
         assert!(!out.stdout.contains(&token) && !out.stderr.contains(&token));
     }
 
+    // Without a fingerprint the board is taken for one with a certificate
+    // from a certificate authority. This one's is self-signed, so the
+    // handshake is refused and the token is never sent.
+    let out = run(bare
+        .cli()
+        .env("BOARD_TOKEN", &token)
+        .env("BOARD_URL", &board.url)
+        .args(["--json", "whoami"]));
+    let error = out.error(1, "certificate_untrusted");
+    assert!(error.next.unwrap().contains("BOARD_FINGERPRINT"), "{out:?}");
+    assert!(!out.stdout.contains(&token) && !out.stderr.contains(&token));
+
     // A token the board does not know is refused like any other.
     let out = run(bare
         .cli()
@@ -965,7 +977,7 @@ fn a_token_in_the_environment_works_without_a_login_file() {
 }
 
 #[test]
-fn an_https_url_without_a_fingerprint_is_a_usage_error() {
+fn an_https_url_without_a_login_is_a_usage_error() {
     let board = NetBoard::start();
     let nobody = Agent::new();
     for command in [&["channels"][..], &["whoami"], &["post", "notes", "hi"]] {
@@ -974,7 +986,7 @@ fn an_https_url_without_a_fingerprint_is_a_usage_error() {
             .args(["--url", &board.url, "--json"])
             .args(command));
         let error = out.error(2, "usage");
-        assert!(error.message.contains("fingerprint"), "{out:?}");
+        assert!(error.message.contains("no token to send"), "{out:?}");
         let next = error.next.unwrap();
         assert!(next.contains("openboard invite <name>"), "{next}");
         assert!(next.contains("openboard join <invite>"), "{next}");
@@ -992,7 +1004,7 @@ fn an_https_url_without_a_fingerprint_is_a_usage_error() {
         "BOARD_LOGIN",
         "OPENBOARD_CONFIG_DIR",
         "first match wins",
-        "there is no way to skip that check",
+        "Neither check can",
     ] {
         assert!(help.stdout.contains(expected), "{expected}");
     }

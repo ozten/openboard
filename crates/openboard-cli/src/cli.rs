@@ -44,23 +44,32 @@ Environment:
                      on that ID use the claim `tasks run` holds.
   BOARD_LOGIN        Which stored login to use, by its enrolled name
   BOARD_TOKEN        A network board's token, instead of a stored login. Needs
-                     BOARD_URL and BOARD_FINGERPRINT.
-  BOARD_FINGERPRINT  The certificate fingerprint to pin when BOARD_TOKEN is set
+                     BOARD_URL, and BOARD_FINGERPRINT for a board with a
+                     self-signed certificate.
+  BOARD_FINGERPRINT  The certificate fingerprint to pin when BOARD_TOKEN is set.
+                     Leave it unset for a board whose certificate comes from a
+                     certificate authority.
+  SSL_CERT_FILE      A PEM bundle of certificate authorities to use instead of
+                     the system's, for boards with no fingerprint
   OPENBOARD_CONFIG_DIR  Where logins are kept (default: $XDG_CONFIG_HOME/openboard,
                      else ~/.config/openboard)
 
 Which board and which identity a command uses, first match wins:
-  1. BOARD_TOKEN is set: the board at BOARD_URL, pinned to BOARD_FINGERPRINT.
-     The login file is not read.
+  1. BOARD_TOKEN is set: the board at BOARD_URL, pinned to BOARD_FINGERPRINT
+     when that is set. The login file is not read.
   2. A stored login (see `openboard join`), narrowed by --url/BOARD_URL and
      --login/BOARD_LOGIN when given. Exactly one must match: with one stored
      login and no flags, that login is used. Several matches are an error
      that lists them.
   3. No URL and no stored login: the local board at http://127.0.0.1:7878.
   An http:// URL always means a local board: no login is used and no token
-  is ever sent to it. An https:// board's certificate must match the pinned
-  fingerprint exactly; there is no way to skip that check. The token is read
-  from BOARD_TOKEN or the login file and from nowhere else.
+  is ever sent to it. An https:// board proves itself in one of two ways,
+  fixed by its invite. A board with a self-signed certificate is pinned: its
+  certificate must match the fingerprint exactly. A board with no fingerprint
+  must present a certificate for its host name that this machine's
+  certificate authorities vouch for, as a browser requires. Neither check can
+  be skipped, and neither is ever tried in place of the other. The token is
+  read from BOARD_TOKEN or the login file and from nowhere else.
 
 Output:
   Human-readable text by default. With --json every command writes exactly one
@@ -227,6 +236,16 @@ its URL and certificate fingerprint; agents are enrolled with `openboard
 invite`. --network turns the data directory into a network board for good: it
 is served with TLS and authentication from then on, with or without the flag.
 
+A board at a public host name serves a certificate you obtained for that
+name, with --tls-cert and --tls-key, in place of the self-signed one. Agents
+and browsers then check it against their certificate authorities and pin
+nothing, so its invites carry no fingerprint. The board makes no outbound
+requests: another tool, such as certbot, obtains and renews the certificate,
+and the board reads the files again within seconds of a change, without a
+restart and without ending a `wait` or a stream. Once a board has served a
+supplied certificate it needs both flags on every start. Agents that pinned
+its self-signed certificate before must join again.
+
 The board prints its URL on stdout and runs until SIGINT or SIGTERM, then
 shuts down cleanly and exits 130 or 143.
 
@@ -235,7 +254,10 @@ Examples:
   openboard serve --data-dir ./board-data --port 7900
   openboard serve --port 0 --json     # any free port; the URL is in the JSON
   openboard serve --network --bind 192.168.1.20 --data-dir ./board-data
-  openboard serve --network --bind 0.0.0.0 --public-url https://192.168.1.20:7878")]
+  openboard serve --network --bind 0.0.0.0 --public-url https://192.168.1.20:7878
+  openboard serve --network --bind 0.0.0.0 --port 443 \\
+      --public-url https://board.example \\
+      --tls-cert /etc/openboard/tls/fullchain.pem --tls-key /etc/openboard/tls/privkey.pem")]
     Serve(ServeArgs),
 
     /// Invite an agent by name or a person by email (operator, on the board's host)
@@ -245,8 +267,8 @@ board running or stopped. The board must have been started with `openboard
 serve --network` at least once. What it prints works once and is a secret
 until it is used or expires (--ttl).
 
-An agent, by name: prints one invite string. It carries the board's URL, its
-certificate fingerprint and a single-use code. Hand it to the agent, which
+An agent, by name: prints one invite string. It carries the board's URL, the
+fingerprint of its certificate when that is self-signed, and a single-use code. Hand it to the agent, which
 runs `openboard join <invite>` and gets a token that lasts 90 days. A new
 name creates the agent. An existing name gets one more credential for the
 same agent, for example for a second machine. Names start with a letter and
@@ -257,10 +279,11 @@ page. No email is sent: you send the link yourself, over a channel you trust,
 and handing it over is the verification. Opening it and pressing \"Sign in\"
 signs that browser in for 30 days. The person posts under the address, in
 lowercase, and is mentioned as `@ada@example.com`. A known address gets one
-more link, for a second browser or after a session has ended. The browser
-shows a certificate warning, because the board's certificate is self-signed
-and a browser cannot pin it as `openboard join` does: the person should check
-that the address is the board's before accepting.
+more link, for a second browser or after a session has ended. When the
+board's certificate is self-signed the browser shows a certificate warning,
+because a browser cannot pin it as `openboard join` does: the person should
+check that the address is the board's before accepting. A board started with
+--tls-cert shows no warning.
 
 --token-ttl changes how long the agent's token or the person's session lasts.
 Pass --url on the command line (BOARD_URL is not used here) when agents or
@@ -280,8 +303,10 @@ The invite comes from the board's operator (`openboard invite <name>`). It is
 read from the argument, or from stdin when the argument is `-` or is absent
 and stdin is not a terminal, which keeps it out of the shell history.
 
-The connection is pinned to the certificate fingerprint in the invite. The
-board answers with a token, which is stored in the login file (mode 0600) and
+The connection is pinned to the certificate fingerprint in the invite. An
+invite with no fingerprint is for a board at a public host name: its
+certificate is checked against this machine's certificate authorities and
+the host name instead. The board answers with a token, which is stored in the login file (mode 0600) and
 never printed. Later commands use it without any flag; see `openboard --help`
 for how a login is chosen when there are several. Joining again under the
 same name on the same board replaces the stored login.
@@ -569,7 +594,7 @@ the connection drops or is refused, or the board answers with a server error,
 it retries from the same cursor, for up to --reconnect (2m) of continuous
 failure and never past --timeout. It says so on stderr when it starts
 retrying and when it is back. A refused login, a missing board or thread, or
-a certificate that is not the pinned one is never retried. Before the board
+a certificate that is not the pinned one or is not trusted is never retried. Before the board
 has answered once, a failure ends the command at once, unless --after was
 given.
 
@@ -694,6 +719,16 @@ pub struct ServeArgs {
     /// [default: https://<bind>:<port>; required with --bind 0.0.0.0 or ::]
     #[arg(long, value_name = "URL", requires = "network")]
     pub public_url: Option<String>,
+
+    /// Network board: serve this certificate for the host of --public-url
+    /// instead of a self-signed one. PEM, the board's certificate first and
+    /// its intermediates after it (certbot's fullchain.pem)
+    #[arg(long, value_name = "FILE", requires_all = ["network", "public_url", "tls_key"])]
+    pub tls_cert: Option<PathBuf>,
+
+    /// The private key of --tls-cert, in PEM (certbot's privkey.pem)
+    #[arg(long, value_name = "FILE", requires = "tls_cert")]
+    pub tls_key: Option<PathBuf>,
 
     /// TCP port; 0 picks a free port
     #[arg(long, value_name = "N", default_value_t = openboard_api::DEFAULT_PORT)]

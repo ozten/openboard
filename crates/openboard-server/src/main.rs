@@ -13,11 +13,17 @@ Usage:
   obd verify-log [options]   Check every board's event hash chain offline
 
 A board is local or networked. A local board speaks plain HTTP on a loopback
-address and has no authentication. A network board speaks TLS 1.3 only, with
-a self-signed certificate that clients pin by its fingerprint, and needs a
-token on every request; agents are enrolled with invites created on this
-host. --network turns a data directory into a network board for good: it is
-served with TLS and authentication from then on, with or without the flag.
+address and has no authentication. A network board speaks TLS 1.3 only and
+needs a token on every request; agents are enrolled with invites created on
+this host. --network turns a data directory into a network board for good: it
+is served with TLS and authentication from then on, with or without the flag.
+
+A network board makes itself a self-signed certificate, which clients pin by
+its fingerprint. With --tls-cert and --tls-key it serves a certificate you
+obtained for its host name instead, and clients check that against their
+certificate authorities, as a browser does. The files are read again when
+they change, so a renewal needs no restart. Such a board needs both flags on
+every start from then on.
 
 Options:
   --data-dir <dir>             Data directory (default: .openboard)
@@ -27,7 +33,12 @@ Options:
   --network                    Run a network board
   --public-url <url>           Network board: the https:// URL clients use,
                                put into invites (default: https://<bind>:<port>;
-                               required with --bind 0.0.0.0 or ::)
+                               required with --bind 0.0.0.0 or ::, and
+                               with --tls-cert)
+  --tls-cert <file>            Network board: a certificate for the host of
+                               --public-url, in PEM, followed by its
+                               intermediates (certbot's fullchain.pem)
+  --tls-key <file>             The private key of --tls-cert, in PEM
   --max-message-chars <n>      Longest message, in characters (default: 10000)
   -h, --help                   Show this help
   -V, --version                Show the version, commit and build date
@@ -101,6 +112,8 @@ fn parse_args(args: Vec<String>) -> Result<Option<(Command, Config)>, String> {
             }
             "--network" => config.network = true,
             "--public-url" => config.public_url = Some(value()?),
+            "--tls-cert" => config.tls_cert = Some(PathBuf::from(value()?)),
+            "--tls-key" => config.tls_key = Some(PathBuf::from(value()?)),
             "--max-message-chars" => {
                 config.max_message_chars = value()?
                     .parse()
@@ -155,6 +168,12 @@ fn run_server(config: Config) -> ExitCode {
         // The fingerprint is public: it is what clients pin.
         if let Some(fingerprint) = server.fingerprint() {
             eprintln!("obd: certificate fingerprint {fingerprint}");
+        } else if let Some(cert) = &config.tls_cert {
+            eprintln!(
+                "obd: certificate from {}, checked by clients against their certificate \
+                 authorities",
+                cert.display()
+            );
         }
         server.run(shutdown_signal()).await
     });

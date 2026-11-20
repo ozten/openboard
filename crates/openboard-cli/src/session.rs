@@ -102,7 +102,7 @@ pub async fn join(global: &Global, text: &str) -> Result<(), Failure> {
     // The code works once. Be sure the login can be stored before using it.
     Store::prepare()?;
 
-    let target = Target::for_join(&url, &invite.fingerprint);
+    let target = Target::for_join(&url, invite.fingerprint.as_deref());
     let client = Client::new(&target, openboard_api::DEFAULT_BOARD, None)?;
     let joined = client.join(&invite.code).await?;
     let login = Login {
@@ -150,7 +150,10 @@ pub async fn join(global: &Global, text: &str) -> Result<(), Failure> {
         #[derive(Serialize)]
         struct Joined<'a> {
             url: &'a str,
-            fingerprint: &'a str,
+            /// The pinned fingerprint. Absent for a board whose certificate
+            /// is checked against the certificate authorities.
+            #[serde(skip_serializing_if = "Option::is_none")]
+            fingerprint: Option<&'a str>,
             principal: &'a str,
             credential_id: &'a str,
             expires_at: &'a str,
@@ -162,7 +165,7 @@ pub async fn join(global: &Global, text: &str) -> Result<(), Failure> {
         }
         write_stdout(&to_json(&Joined {
             url: &login.url,
-            fingerprint: &login.fingerprint,
+            fingerprint: login.fingerprint.as_deref(),
             principal: &login.principal,
             credential_id: &login.credential_id,
             expires_at: &login.expires_at,
@@ -386,7 +389,10 @@ pub fn logins(json: bool) -> Result<(), Failure> {
         #[derive(Serialize)]
         struct Entry<'a> {
             url: &'a str,
-            fingerprint: &'a str,
+            /// The pinned fingerprint. Absent for a board whose certificate
+            /// is checked against the certificate authorities.
+            #[serde(skip_serializing_if = "Option::is_none")]
+            fingerprint: Option<&'a str>,
             principal: &'a str,
             credential_id: &'a str,
             expires_at: &'a str,
@@ -403,7 +409,7 @@ pub fn logins(json: bool) -> Result<(), Failure> {
                 .iter()
                 .map(|login| Entry {
                     url: &login.url,
-                    fingerprint: &login.fingerprint,
+                    fingerprint: login.fingerprint.as_deref(),
                     principal: &login.principal,
                     credential_id: &login.credential_id,
                     expires_at: &login.expires_at,
@@ -432,7 +438,10 @@ pub fn logins(json: bool) -> Result<(), Failure> {
                 } else {
                     login.expires_at.clone()
                 },
-                login.fingerprint.clone(),
+                login
+                    .fingerprint
+                    .clone()
+                    .unwrap_or_else(|| "none (certificate authorities)".to_owned()),
             ]
         })
         .collect();

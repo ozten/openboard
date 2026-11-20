@@ -180,10 +180,14 @@ pub async fn invite(global: &Global, args: &InviteArgs) -> Result<(), Failure> {
             created.principal
         )
     };
+    let certificate = match &created.invite.fingerprint {
+        Some(fingerprint) => format!("certificate fingerprint: {fingerprint}"),
+        None => "certificate: checked against the agent's certificate authorities".to_owned(),
+    };
     write_stdout(&format!(
         "invite {} for {who}\n\
          board: {}\n\
-         certificate fingerprint: {}\n\
+         {certificate}\n\
          expires: {} (in {}); it works once and is a secret until then\n\
          \n\
          {invite}\n\
@@ -191,7 +195,6 @@ pub async fn invite(global: &Global, args: &InviteArgs) -> Result<(), Failure> {
          on the agent's machine, run:\n  {join}",
         created.id,
         created.invite.url,
-        created.invite.fingerprint,
         created.expires_at,
         cli::format_duration(args.ttl),
     ))
@@ -633,9 +636,17 @@ pub async fn run(json_output: bool, command: &AdminCommand) -> Result<(), Failur
             match info.mode {
                 Mode::Network => {
                     human.push_str(&format!(
-                        "\nurl: {}\ncertificate fingerprint: {}",
+                        "\nurl: {}\n{}",
                         info.url.as_deref().unwrap_or("(not recorded yet)"),
-                        info.fingerprint.as_deref().unwrap_or("(not recorded yet)")
+                        match (&info.fingerprint, info.trusted) {
+                            (_, true) => "certificate: supplied with --tls-cert; clients check it \
+                                          against their certificate authorities and pin nothing"
+                                .to_owned(),
+                            (Some(fingerprint), false) =>
+                                format!("certificate fingerprint: {fingerprint}"),
+                            (None, false) =>
+                                "certificate fingerprint: (not recorded yet)".to_owned(),
+                        }
                     ));
                 }
                 Mode::Local => human.push_str(
@@ -657,6 +668,11 @@ pub async fn run(json_output: bool, command: &AdminCommand) -> Result<(), Failur
                     "mode": info.mode.as_str(),
                     "url": info.url,
                     "fingerprint": info.fingerprint,
+                    "certificate": match (info.mode, info.trusted) {
+                        (Mode::Local, _) => None,
+                        (Mode::Network, true) => Some("supplied"),
+                        (Mode::Network, false) => Some("self_signed"),
+                    },
                     "data_dir": dir.display().to_string(),
                     "schema_version": check.schema_version,
                     "supported_schema_version": check.supported_schema_version,

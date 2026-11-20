@@ -490,6 +490,17 @@ pub(crate) struct ModePlan {
     /// Whether a certificate fingerprint was ever recorded, after which
     /// clients may have pinned it.
     pub pinned: bool,
+    /// Whether the board is recorded as serving a supplied certificate,
+    /// which its clients check against their certificate authorities.
+    pub trusted: bool,
+}
+
+/// Where a network board can be reached, as a start records it.
+pub(crate) struct Endpoint<'a> {
+    pub url: &'a str,
+    /// The pin of a self-signed certificate. `None` when the certificate
+    /// was supplied.
+    pub fingerprint: Option<&'a str>,
 }
 
 pub(crate) struct Store {
@@ -664,10 +675,13 @@ impl Store {
             (None, false, false) => (Mode::Local, ModeChange::First),
         };
         let pinned = identity::meta_get(&conn, identity::META_FINGERPRINT)?.is_some();
+        let trusted = identity::meta_get(&conn, identity::META_TRUST)?.as_deref()
+            == Some(identity::TRUST_AUTHORITIES);
         Ok(ModePlan {
             mode,
             change,
             pinned,
+            trusted,
         })
     }
 
@@ -679,7 +693,7 @@ impl Store {
     pub(crate) fn record_start(
         &self,
         plan: &ModePlan,
-        endpoint: Option<(&str, &str)>,
+        endpoint: Option<Endpoint<'_>>,
     ) -> Result<()> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -704,9 +718,34 @@ impl Store {
                 },
             )?;
         }
-        if let Some((url, fingerprint)) = endpoint {
-            identity::meta_set(&tx, identity::META_URL, url)?;
-            identity::meta_set(&tx, identity::META_FINGERPRINT, fingerprint)?;
+        if let Some(endpoint) = endpoint {
+            identity::meta_set(&tx, identity::META_URL, endpoint.url)?;
+            match endpoint.fingerprint {
+                Some(fingerprint) => {
+                    identity::meta_set(&tx, identity::META_FINGERPRINT, fingerprint)?;
+                }
+                // A supplied certificate. No fingerprint is kept, so that
+                // no invite can carry one: it would be wrong after the
+                // next renewal.
+                None => {
+                    identity::meta_delete(&tx, identity::META_FINGERPRINT)?;
+                    if !plan.trusted {
+                        identity::meta_set(&tx, identity::META_TRUST, identity::TRUST_AUTHORITIES)?;
+                        identity::log(
+                            &tx,
+                            &LogEntry {
+                                kind: log_kinds::CERTIFICATE_SUPPLIED,
+                                detail: Some(if plan.pinned {
+                                    "replaces a self-signed certificate that clients pinned"
+                                } else {
+                                    "clients check it against their certificate authorities"
+                                }),
+                                ..LogEntry::default()
+                            },
+                        )?;
+                    }
+                }
+            }
         }
         // Which build served the directory last, for a later version that
         // has to explain itself, or an earlier one that cannot open it.

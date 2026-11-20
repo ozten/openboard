@@ -117,15 +117,20 @@ impl From<rusqlite::Error> for OperatorError {
 
 type Result<T> = std::result::Result<T, OperatorError>;
 
-/// How a board is reached and pinned.
+/// How a board is reached, and how its clients know it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoardInfo {
     pub mode: Mode,
     /// The URL the last network start recorded. `None` on a local board.
     pub url: Option<String>,
-    /// The certificate's pin, as `openboard_api::auth::fingerprint` formats
-    /// it. `None` on a local board.
+    /// The pin of a self-signed certificate, as
+    /// `openboard_api::auth::fingerprint` formats it. `None` on a local
+    /// board and when `trusted`.
     pub fingerprint: Option<String>,
+    /// True for a network board that serves a certificate its operator
+    /// supplied: clients pin nothing and check it against their certificate
+    /// authorities and the host name in `url`.
+    pub trusted: bool,
 }
 
 /// Options of [`invite`], [`create_invite`] and [`create_person_invite`].
@@ -314,6 +319,7 @@ fn info_of(conn: &Connection, schema: &Schema, data_dir: &Path) -> Result<BoardI
             mode: Mode::Local,
             url: None,
             fingerprint: None,
+            trusted: false,
         });
     }
     // As the server reads it: a directory with a certificate or any agent
@@ -329,19 +335,24 @@ fn info_of(conn: &Connection, schema: &Schema, data_dir: &Path) -> Result<BoardI
         mode,
         url: network(identity::META_URL)?,
         fingerprint: network(identity::META_FINGERPRINT)?,
+        trusted: network(identity::META_TRUST)?.as_deref() == Some(identity::TRUST_AUTHORITIES),
     })
 }
 
 /// Opens for writing and requires a network board that has started once.
-/// Returns the connection with the board's recorded URL and fingerprint.
-fn open_network(data_dir: &Path) -> Result<(Connection, String, String)> {
+/// Returns the connection with the board's recorded URL and, for a board
+/// with a self-signed certificate, its fingerprint.
+fn open_network(data_dir: &Path) -> Result<(Connection, String, Option<String>)> {
     let (conn, schema) = open(data_dir, true)?;
     match info_of(&conn, &schema, data_dir)? {
         BoardInfo {
             mode: Mode::Network,
             url: Some(url),
-            fingerprint: Some(fingerprint),
-        } => Ok((conn, url, fingerprint)),
+            fingerprint,
+            trusted,
+            // One or the other: a pinned board has started once it has a
+            // fingerprint, and a trusted board never has one.
+        } if fingerprint.is_some() != trusted => Ok((conn, url, fingerprint)),
         _ => Err(OperatorError::NotNetwork),
     }
 }
@@ -446,15 +457,15 @@ pub fn invite(data_dir: &Path, name: &str, options: &InviteOptions) -> Result<In
     }
 }
 
-/// Writes the invite. Returns it with the board URL it is for and the
-/// board's fingerprint.
+/// Writes the invite. Returns it with the board URL it is for and, for a
+/// board with a self-signed certificate, the board's fingerprint.
 fn new_invite(
     data_dir: &Path,
     name: &str,
     kind: InviteKind,
     options: &InviteOptions,
     credential_ttl_secs: u64,
-) -> Result<(identity::NewInvite, String, String)> {
+) -> Result<(identity::NewInvite, String, Option<String>)> {
     let url_override = match &options.url {
         None => None,
         Some(url) => Some(crate::normalize_public_url(url).map_err(OperatorError::InvalidUrl)?),

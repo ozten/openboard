@@ -4,8 +4,11 @@
 //! no redirects, no other hosts.
 //!
 //! A local board is plain HTTP and gets no token, whatever the environment
-//! holds. A network board is HTTPS with its certificate pinned (see
-//! [`crate::tls`]) and gets the bearer token on every request.
+//! holds. A network board is HTTPS and gets the bearer token on every
+//! request, once it has proved it is the board: by its pinned certificate,
+//! or, when no fingerprint is known for it, by a certificate for its host
+//! name that this machine's certificate authorities vouch for (see
+//! [`crate::tls`]).
 
 use std::time::Duration;
 
@@ -29,7 +32,7 @@ use crate::compat::{self, Requirement, Seen, ServerInfo, GRANTS, TASKS};
 use crate::error::{codes, Failure};
 use crate::logins::Secret;
 use crate::target::{bad_url, Target};
-use crate::tls::{self, Refusal, Verdict};
+use crate::tls::{self, Distrust, Refusal, Trust, Verdict};
 
 /// What to do when a board no longer accepts a login.
 pub const NEW_INVITE_HINT: &str = "ask the board's operator for a new invite (`openboard invite \
@@ -50,7 +53,7 @@ pub struct Client {
     profile: Option<String>,
     /// Sent as a bearer token. Only ever set for an `https://` base.
     token: Option<Secret>,
-    /// The pinned fingerprint of an `https://` board.
+    /// The pinned fingerprint of an `https://` board, when it has one.
     fingerprint: Option<String>,
     /// What the certificate verifier decided, for error reports.
     verdict: Arc<Verdict>,
@@ -102,28 +105,32 @@ impl Client {
         if base.host_str().is_none() {
             return Err(bad_url(url, "names no host"));
         }
-        let (pin, token) = match base.scheme() {
+        let (trust, token) = match base.scheme() {
             // A local board. No token is ever sent over plain HTTP.
-            "http" => (None, None),
+            "http" => (Trust::Nothing, None),
             "https" => {
-                let pin = target
-                    .fingerprint
-                    .as_deref()
-                    .and_then(parse_fingerprint)
-                    .ok_or_else(|| {
-                        Failure::usage(format!(
-                            "no certificate fingerprint is known for {url}, so the connection \
-                             cannot be pinned"
-                        ))
-                        .next(format!(
-                            "{NEW_INVITE_HINT}; the invite carries the fingerprint"
-                        ))
-                    })?;
-                (Some(pin), target.token.clone())
+                let trust = match target.fingerprint.as_deref() {
+                    // A board with a certificate for its host name.
+                    None => Trust::Authorities,
+                    // A fingerprint that cannot be read is an error, never
+                    // a reason to ask the certificate authorities instead.
+                    Some(fingerprint) => {
+                        Trust::Pin(parse_fingerprint(fingerprint).ok_or_else(|| {
+                            Failure::usage(format!(
+                                "the certificate fingerprint known for {url} is not one, so the \
+                                 connection cannot be pinned"
+                            ))
+                            .next(format!(
+                                "{NEW_INVITE_HINT}; the invite carries the fingerprint"
+                            ))
+                        })?)
+                    }
+                };
+                (trust, target.token.clone())
             }
             _ => return Err(bad_url(url, "must start with http:// or https://")),
         };
-        let network = pin.is_some();
+        let network = trust != Trust::Nothing;
         let failed = |detail: String| {
             Failure::new(
                 codes::REQUEST_FAILED,
@@ -131,8 +138,9 @@ impl Client {
             )
         };
         // Every client gets this configuration, so TLS can only ever succeed
-        // against the pinned certificate. A local board's client pins none.
-        let (tls, verdict) = tls::client_config(pin).map_err(|error| failed(error.to_string()))?;
+        // the one way this board is trusted. A local board's client trusts
+        // no certificate at all.
+        let (tls, verdict) = tls::client_config(trust).map_err(failed)?;
         let http = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
@@ -431,8 +439,10 @@ impl Client {
             cause = inner;
         }
         let base = &self.base;
-        if let Some(refusal) = self.verdict.refusal() {
-            return self.certificate_mismatch(&refusal);
+        match self.verdict.refusal() {
+            Some(Refusal::Untrusted(distrust)) => return self.certificate_untrusted(&distrust),
+            Some(refusal) => return self.certificate_mismatch(&refusal),
+            None => {}
         }
         if error.is_connect() && self.is_network() {
             Failure::new(
@@ -486,12 +496,56 @@ impl Client {
                 "the server at {base} asked for TLS, but this client has no certificate pinned \
                  for it"
             ),
+            // Reported by `certificate_untrusted`.
+            Refusal::Untrusted(_) => format!("the server at {base} is not trusted"),
         };
         Failure::new(codes::CERTIFICATE_MISMATCH, message).next(
             "the board's identity changed or the connection is being intercepted; nothing was \
              sent. Do not retry: get a fresh invite from the board's operator (`openboard invite \
              <name>` on the board's host) and run `openboard join <invite>`",
         )
+    }
+
+    /// The board is known by its host name, and the certificate the server
+    /// presented for it does not check out. Nothing was sent to it.
+    fn certificate_untrusted(&self, distrust: &Distrust) -> Failure {
+        let base = &self.base;
+        let host = self.base.host_str().unwrap_or_default();
+        let (why, next) = match distrust {
+            Distrust::UnknownIssuer => (
+                "is not signed by a certificate authority this machine trusts".to_owned(),
+                "nothing was sent. If this board has a self-signed certificate, it is joined \
+                 with its fingerprint: run `openboard join <invite>` with an invite from its \
+                 operator, or set BOARD_FINGERPRINT beside BOARD_TOKEN. Otherwise the connection \
+                 is being intercepted, or this machine lacks the certificate authority (set \
+                 SSL_CERT_FILE to a PEM bundle that has it)"
+                    .to_owned(),
+            ),
+            Distrust::Expired => (
+                "has expired or is not valid yet".to_owned(),
+                "nothing was sent. Check this machine's clock; if it is right, the board's \
+                 certificate was not renewed, which its operator has to fix"
+                    .to_owned(),
+            ),
+            Distrust::WrongName => (
+                format!("is not for {host}"),
+                format!(
+                    "nothing was sent. Check that --url (or BOARD_URL) is the board's own \
+                     address; if it is, the board serves a certificate for another name, which \
+                     its operator has to fix, or the connection is being intercepted. This \
+                     client does not accept a certificate for any name but {host}"
+                ),
+            ),
+            Distrust::Other(detail) => (
+                format!("was refused: {detail}"),
+                "nothing was sent. Tell the board's operator; do not retry".to_owned(),
+            ),
+        };
+        Failure::new(
+            codes::CERTIFICATE_UNTRUSTED,
+            format!("the certificate the server at {base} presented {why}"),
+        )
+        .next(next)
     }
 
     /// Swaps a single-use enrolment code for a token. Sends no token.
@@ -1094,12 +1148,17 @@ mod tests {
     }
 
     #[test]
-    fn only_http_and_pinned_https_urls_are_accepted() {
+    fn only_http_and_https_urls_are_accepted() {
         assert!(local("http://localhost:7878", "general").is_ok());
-        for bad in ["https://127.0.0.1:7878", "127.0.0.1:7878", "", "ftp://x"] {
+        for bad in ["127.0.0.1:7878", "", "ftp://x"] {
             let failure = local(bad, "general").err().expect(bad);
             assert_eq!(failure.exit, crate::error::EXIT_USAGE, "{bad}");
         }
+        // A fingerprint that is no fingerprint is an error. It never turns
+        // a pinned board into one checked by certificate authorities.
+        let damaged = target("https://127.0.0.1:7878", Some("sha256:beef".into()), None);
+        let failure = Client::new(&damaged, "general", None).err().unwrap();
+        assert_eq!(failure.exit, crate::error::EXIT_USAGE);
         let pinned = target(
             "https://127.0.0.1:7878",
             Some(openboard_api::auth::fingerprint(&[3; 32])),

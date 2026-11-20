@@ -8,14 +8,27 @@
 //!   bearer token on every request except `GET /v1/health` and
 //!   `POST /v1/join`.
 //!
-//! # Certificate pinning
+//! # The board's certificate
 //!
-//! A network board generates a self-signed certificate on first start.
-//! Clients do not use a certificate authority or check host names. They
-//! trust exactly one certificate, identified by its [`fingerprint`], and
-//! must still verify the TLS handshake signature against that certificate's
-//! key, so that holding a copy of the certificate is not enough to
-//! impersonate the board.
+//! A network board has one of two kinds of certificate, and a client knows
+//! which from its invite, never from what a server presents:
+//!
+//! - **Pinned.** The board generates a self-signed certificate on first
+//!   start, and its invites carry the certificate's [`fingerprint`]. Clients
+//!   do not use a certificate authority or check host names. They trust
+//!   exactly one certificate, identified by that fingerprint, and must still
+//!   verify the TLS handshake signature against that certificate's key, so
+//!   that holding a copy of the certificate is not enough to impersonate
+//!   the board.
+//! - **Trusted.** The operator supplies a certificate for the board's host
+//!   name, and its invites carry no fingerprint. Clients verify the chain
+//!   against their certificate authorities and check the host name, as a
+//!   browser does, so a renewed certificate changes nothing for them.
+//!
+//! A client never falls back from one to the other. One that holds a
+//! fingerprint accepts only that certificate, whoever else vouches for the
+//! one presented, and one that holds none never accepts a certificate its
+//! certificate authorities do not vouch for.
 //!
 //! # Tokens
 //!
@@ -30,9 +43,9 @@
 //! The operator creates an invite on the board's host by acting on the data
 //! directory. No network API can create invites, list credentials or revoke
 //! them. The invite is one string (see [`Invite`]) that carries the board's
-//! URL, the certificate fingerprint and a single-use code. The new agent
-//! sends the code to `POST /v1/join` over the pinned connection and receives
-//! its token once.
+//! URL, the certificate fingerprint when the board is pinned, and a
+//! single-use code. The new agent sends the code to `POST /v1/join` over a
+//! connection verified as above and receives its token once.
 //!
 //! | Method | Path | Request | Response |
 //! | --- | --- | --- | --- |
@@ -90,15 +103,19 @@ pub fn parse_fingerprint(text: &str) -> Option<[u8; 32]> {
 /// Everything a new agent needs to enrol, carried in one string.
 ///
 /// The encoding is [`INVITE_PREFIX`] followed by unpadded URL-safe base64 of
-/// this struct as JSON. Because the fingerprint travels with the invite, the
-/// first connection is already pinned and there is no trust-on-first-use
-/// step. An invite is a secret until it is used or expires.
+/// this struct as JSON. Because the fingerprint of a pinned board travels
+/// with the invite, the first connection is already pinned and there is no
+/// trust-on-first-use step. An invite is a secret until it is used or
+/// expires.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Invite {
     /// Base URL of the board, for example `https://192.168.1.20:7878`.
     pub url: String,
-    /// The board certificate's pin, as produced by [`fingerprint`].
-    pub fingerprint: String,
+    /// The board certificate's pin, as produced by [`fingerprint`]. Absent
+    /// for a board whose certificate is checked against the client's
+    /// certificate authorities and the host name in `url`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
     /// Single-use enrolment code.
     pub code: String,
 }
@@ -110,7 +127,8 @@ pub enum InviteError {
     WrongPrefix,
     /// The part after the prefix is not base64 of the expected JSON.
     Malformed,
-    /// The URL is not `https://`, or the fingerprint does not parse.
+    /// The URL is not `https://`, or there is a fingerprint that does not
+    /// parse.
     Invalid,
 }
 
@@ -144,7 +162,10 @@ impl Invite {
             .map_err(|_| InviteError::Malformed)?;
         let invite: Invite = serde_json::from_slice(&json).map_err(|_| InviteError::Malformed)?;
         if !invite.url.starts_with("https://")
-            || parse_fingerprint(&invite.fingerprint).is_none()
+            || invite
+                .fingerprint
+                .as_deref()
+                .is_some_and(|pin| parse_fingerprint(pin).is_none())
             || invite.code.is_empty()
         {
             return Err(InviteError::Invalid);
@@ -230,7 +251,7 @@ mod tests {
     fn invite_round_trips_and_rejects_bad_input() {
         let invite = Invite {
             url: "https://192.168.1.20:7878".into(),
-            fingerprint: fingerprint(&[7u8; 32]),
+            fingerprint: Some(fingerprint(&[7u8; 32])),
             code: "code".into(),
         };
         let text = invite.encode();
@@ -242,5 +263,27 @@ mod tests {
             ..invite
         };
         assert_eq!(Invite::decode(&plain.encode()), Err(InviteError::Invalid));
+    }
+
+    #[test]
+    fn an_invite_to_a_trusted_board_has_no_fingerprint() {
+        let invite = Invite {
+            url: "https://board.example".into(),
+            fingerprint: None,
+            code: "code".into(),
+        };
+        let text = invite.encode();
+        let json = URL_SAFE_NO_PAD
+            .decode(&text[INVITE_PREFIX.len()..])
+            .unwrap();
+        assert!(!String::from_utf8(json).unwrap().contains("fingerprint"));
+        assert_eq!(Invite::decode(&text), Ok(invite.clone()));
+        // A fingerprint that is there must still be a fingerprint: a
+        // damaged one never turns a pinned invite into a trusted one.
+        let damaged = Invite {
+            fingerprint: Some("sha256:beef".into()),
+            ..invite
+        };
+        assert_eq!(Invite::decode(&damaged.encode()), Err(InviteError::Invalid));
     }
 }

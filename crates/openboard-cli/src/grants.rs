@@ -224,6 +224,7 @@ pub async fn agent(ctx: &Ctx<'_>, command: &crate::cli::AgentCommand) -> Result<
                 #[serde(flatten)]
                 minted: &'a openboard_api::tokens::TokenMinted,
                 url: &'a str,
+                #[serde(skip_serializing_if = "Option::is_none")]
                 fingerprint: Option<&'a str>,
             }
             let out = Out {
@@ -235,10 +236,15 @@ pub async fn agent(ctx: &Ctx<'_>, command: &crate::cli::AgentCommand) -> Result<
                 let mut lines = vec![
                     format!("# derived token {}", describe(&minted.info)),
                     format!("export BOARD_URL={}", crate::shell_quote(&ctx.target.url)),
-                    format!(
-                        "export BOARD_FINGERPRINT={}",
-                        crate::shell_quote(ctx.target.fingerprint.as_deref().unwrap_or_default())
-                    ),
+                    match &ctx.target.fingerprint {
+                        Some(fingerprint) => format!(
+                            "export BOARD_FINGERPRINT={}",
+                            crate::shell_quote(fingerprint)
+                        ),
+                        // A fingerprint left over from another board would
+                        // pin this one to the wrong certificate.
+                        None => "unset BOARD_FINGERPRINT".to_owned(),
+                    },
                     format!("export BOARD_TOKEN={}", crate::shell_quote(&minted.token)),
                     format!("export BOARD_NAME={}", crate::shell_quote(&board)),
                 ];

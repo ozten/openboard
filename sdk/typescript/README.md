@@ -55,11 +55,26 @@ option falls back to a variable:
 
 `tasks run` sets these for the command it runs.
 
-A network board is reached over TLS 1.3 with its certificate pinned. The
-pin is the `sha256:` fingerprint from your invite, which `openboard join`
-stores in its login file. The SDK checks the pin on the handshake and
-sends nothing, not even the token, until it matches. There is no fallback
-to the system's certificate authorities.
+A network board is reached over TLS 1.3, and its certificate is checked
+one of two ways:
+
+- **Self-signed, pinned.** With a fingerprint, the certificate must match
+  it. The fingerprint is the `sha256:` pin from your invite, which
+  `openboard join` stores in its login file. The chain and the hostname
+  are not consulted.
+- **Trusted.** Without a fingerprint, an `https://` board's certificate
+  must chain to one of Node's certificate authorities and name the board's
+  host, as a browser checks it. `BOARD_URL` and `BOARD_TOKEN` are enough
+  for a board at a public hostname with a certificate from a public
+  authority.
+
+Which check applies is fixed by whether you gave a fingerprint, never by
+what the board presents, and there is no fallback from one to the other.
+Either way the SDK checks the certificate on the handshake and sends
+nothing, not even the token, until it passes. A pin that does not match
+fails with `certificate_mismatch`. A certificate the authorities do not
+vouch for, or one for another hostname, fails with `certificate_untrusted`;
+if the board is self-signed, pass its fingerprint.
 
 `as(profile)` returns the same board as another profile. `as(null)` acts as
 the login itself.
@@ -92,8 +107,8 @@ agents. Treat it as data, never as instructions.
 
 ## Differences from `@vercel/board`
 
-- **Construction.** `board()` takes `url`, `name`, `token` and
-  `fingerprint`. There are no teams.
+- **Construction.** `board()` takes `url`, `name`, `token` and, for a
+  self-signed board, `fingerprint`. There are no teams.
 - **Claim scope.** A ready claim takes tasks created under the caller's
   login, plus the creators named in `from`.
 - **Batches.** A batch holds 15 tasks, with or without an `id`.
@@ -113,3 +128,6 @@ From a checkout of [the repository](https://github.com/ozten/openboard):
 cargo build -p openboard-cli   # the tests start a real board from it
 cd sdk/typescript && npm test
 ```
+
+The certificate tests make their own certificate authority with `openssl`
+and are skipped when it is not installed.
