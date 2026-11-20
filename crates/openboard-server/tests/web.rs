@@ -157,6 +157,9 @@ impl Net {
         let mut config = Config::new(data_dir_of(&dir));
         config.port = 0;
         config.network = network;
+        // Every enrolled agent and person may use the board, as before
+        // grants.
+        config.open = true;
         config.limits = Limits {
             requests_per_minute: 100_000,
             joins_per_minute: 100_000,

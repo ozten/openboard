@@ -575,6 +575,8 @@ async fn serve(
     config.bind = args.bind;
     config.port = args.port;
     config.max_message_chars = args.max_message_chars;
+    config.open = args.open;
+    config.admin = args.admin.clone();
     config.network = args.network;
     config.public_url.clone_from(&args.public_url);
 
@@ -615,6 +617,10 @@ async fn serve(
             ServeError::Storage(_) => Failure::new(codes::SERVE_FAILED, message)
                 .next("check that --data-dir is a writable directory"),
             ServeError::Io(_) => Failure::new(codes::SERVE_FAILED, message),
+            ServeError::NoSuchAdmin(_) => Failure::new(openboard_api::codes::NOT_FOUND, message)
+                .next(
+                "list who is enrolled with `openboard admin agents` and `openboard admin people`",
+            ),
         }
     })?;
 
@@ -653,6 +659,14 @@ async fn serve(
         ))?;
     } else {
         write_stdout(&format!("listening on {url} (data in {data_dir})"))?;
+    }
+    if server.nobody_manages() {
+        let dir = shell_quote(&data_dir);
+        eprintln!(
+            "openboard: nobody can change who may do what on this board yet. Give yourself \
+             that with: openboard admin grant '*' <your name or email> all --data-dir {dir}\n\
+             (or start once with --admin <name>). Agents and people keep the access they had."
+        );
     }
     if mode == openboard_server::Mode::Network {
         if was_local {

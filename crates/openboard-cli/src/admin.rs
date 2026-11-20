@@ -84,6 +84,15 @@ fn failure_of(error: OperatorError, data_dir: &Path) -> Failure {
                  with `openboard admin people --data-dir {dir}`; to revoke one credential, pass \
                  its ID, which starts with `{CREDENTIAL_ID_PREFIX}`"
             )),
+        OperatorError::NoSuchGrant(_) => Failure::new(openboard_api::codes::NOT_FOUND, message)
+            .next(format!(
+                "list the grants and their IDs with `openboard admin grants --data-dir {dir}`"
+            )),
+        OperatorError::InvalidGrant(_) => Failure::usage(message)
+            .next("see `openboard admin grant --help` for patterns, names and verbs"),
+        OperatorError::NotMigrated => Failure::new(codes::OPERATOR_FAILED, message).next(format!(
+            "run `openboard admin upgrade-check --data-dir {dir}`, then start the server once"
+        )),
         OperatorError::Storage(_) => Failure::new(codes::OPERATOR_FAILED, message)
             .next("check that you can read and write the data directory, then retry"),
     }
@@ -306,7 +315,43 @@ fn data_dir_of(command: &AdminCommand) -> PathBuf {
         AdminCommand::SecurityLog(args) => args.data.data_dir.clone(),
         AdminCommand::Backups(args) => args.data.data_dir.clone(),
         AdminCommand::VerifyLog(args) => args.data_dir.clone(),
+        AdminCommand::Grant(args) => args.data.data_dir.clone(),
+        AdminCommand::Grants(args) => args.data.data_dir.clone(),
+        AdminCommand::Ungrant(args) => args.data.data_dir.clone(),
+        AdminCommand::Explain(args) => args.data.data_dir.clone(),
+        AdminCommand::Access(args) => args.data.data_dir.clone(),
     }
+}
+
+fn grant_json(grant: &operator::GrantInfo) -> serde_json::Value {
+    json!({
+        "id": grant.id,
+        "board": grant.board,
+        "pattern": grant.pattern,
+        "grantee": grant.grantee,
+        "verbs": grant.verbs,
+        "expires_at": grant.expires_at,
+        "expired": grant.expired,
+        "created_by": grant.created_by,
+        "created_at": grant.created_at,
+    })
+}
+
+fn grant_line(grant: &operator::GrantInfo) -> String {
+    let mut line = format!(
+        "{}  {}  {}  {}  {}",
+        render::safe(&grant.id),
+        render::safe(&grant.board),
+        render::safe(&grant.pattern),
+        render::safe(&grant.grantee),
+        render::safe(&grant.verbs)
+    );
+    match (&grant.expires_at, grant.expired) {
+        (Some(at), true) => line.push_str(&format!("  expired {}", render::safe(at))),
+        (Some(at), false) => line.push_str(&format!("  until {}", render::safe(at))),
+        (None, _) => {}
+    }
+    line
 }
 
 /// A byte count for people: `512 B`, `3.4 MiB`.
@@ -863,6 +908,123 @@ pub async fn run(json_output: bool, command: &AdminCommand) -> Result<(), Failur
                 )
             };
             print(document, human)
+        }
+        AdminCommand::Grant(args) => {
+            let (board, pattern, who, verbs, ttl) = (
+                args.board.clone(),
+                args.pattern.clone(),
+                args.who.clone(),
+                args.verbs.clone(),
+                args.expires,
+            );
+            let grant = operate(&dir, move |dir| {
+                operator::grant(dir, &board, &pattern, &who, &verbs, ttl)
+            })
+            .await?;
+            print(
+                grant_json(&grant),
+                format!(
+                    "granted {}\na running board applies it on its next request",
+                    grant_line(&grant)
+                ),
+            )
+        }
+        AdminCommand::Grants(args) => {
+            let board = args.board.clone();
+            let grants = operate(&dir, move |dir| {
+                operator::list_grants(dir, board.as_deref())
+            })
+            .await?;
+            let rows: Vec<Vec<String>> = grants
+                .iter()
+                .map(|grant| {
+                    vec![
+                        grant.id.clone(),
+                        grant.board.clone(),
+                        grant.pattern.clone(),
+                        grant.grantee.clone(),
+                        grant.verbs.clone(),
+                        match (&grant.expires_at, grant.expired) {
+                            (Some(at), true) => format!("expired {at}"),
+                            (Some(at), false) => at.clone(),
+                            (None, _) => "-".to_owned(),
+                        },
+                        grant.created_by.clone(),
+                    ]
+                })
+                .collect();
+            let human = if rows.is_empty() {
+                "no grants: nobody but the operator can use this board".to_owned()
+            } else {
+                render::table(
+                    &["ID", "BOARD", "PATTERN", "WHO", "VERBS", "EXPIRES", "BY"],
+                    &rows,
+                )
+            };
+            print(
+                json!({ "grants": grants.iter().map(grant_json).collect::<Vec<_>>() }),
+                human,
+            )
+        }
+        AdminCommand::Ungrant(args) => {
+            let id = args.id.clone();
+            let grant = operate(&dir, move |dir| operator::ungrant(dir, &id)).await?;
+            print(
+                grant_json(&grant),
+                format!(
+                    "removed {}\na running board applies it on its next request",
+                    grant_line(&grant)
+                ),
+            )
+        }
+        AdminCommand::Explain(args) => {
+            let (board, who, channel) =
+                (args.board.clone(), args.who.clone(), args.channel.clone());
+            let explained = operate(&dir, move |dir| {
+                operator::explain(dir, &board, &who, &channel)
+            })
+            .await?;
+            let who = render::safe(&args.who);
+            let channel = render::safe(&args.channel);
+            let mut human = format!("{who} at {channel}: {}", explained.verbs);
+            if explained.deciding.is_empty() {
+                human.push_str("\nno grant applies, so no access");
+            } else {
+                human.push_str("\ndecided by:");
+                for grant in &explained.deciding {
+                    human.push_str(&format!("\n  {}", grant_line(grant)));
+                }
+            }
+            print(
+                json!({
+                    "verbs": explained.verbs,
+                    "deciding": explained.deciding.iter().map(grant_json).collect::<Vec<_>>(),
+                }),
+                human,
+            )
+        }
+        AdminCommand::Access(args) => {
+            let access = match args.mode.as_deref() {
+                None => operate(&dir, operator::access).await?,
+                Some(mode) => {
+                    let access = if mode == "open" {
+                        openboard_server::Access::Open
+                    } else {
+                        openboard_server::Access::Closed
+                    };
+                    operate(&dir, move |dir| operator::set_access(dir, access)).await?;
+                    access
+                }
+            };
+            let human = match access {
+                openboard_server::Access::Open => {
+                    "access: open (any agent or person may create boards; new boards admit them all)"
+                }
+                openboard_server::Access::Closed => {
+                    "access: closed (only the operator creates boards; new boards admit their creator)"
+                }
+            };
+            print(json!({ "access": access.as_str() }), human.to_owned())
         }
         // Handled before this is reached; see `dispatch`.
         AdminCommand::VerifyLog(_) => Ok(()),

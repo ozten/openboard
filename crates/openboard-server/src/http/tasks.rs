@@ -289,7 +289,7 @@ pub(super) async fn create_task(
     board: Result<Path<String>, PathRejection>,
     body: Result<Bytes, BytesRejection>,
 ) -> ApiResult<(StatusCode, Json<CreateTaskResponse>)> {
-    let caller = Caller::new(&identity, &headers)?;
+    let caller = state.caller(&identity, &headers).await?;
     let Path(board_name) = board.map_err(|_| bad_path())?;
     names::validate_board(&board_name)
         .map_err(|reason| AppError::new(codes::INVALID_BOARD, reason))?;
@@ -404,7 +404,7 @@ pub(super) async fn create_tasks(
     board: Result<Path<String>, PathRejection>,
     body: Result<Bytes, BytesRejection>,
 ) -> ApiResult<(StatusCode, Json<CreateTasksResponse>)> {
-    let caller = Caller::new(&identity, &headers)?;
+    let caller = state.caller(&identity, &headers).await?;
     let Path(board_name) = board.map_err(|_| bad_path())?;
     names::validate_board(&board_name)
         .map_err(|reason| AppError::new(codes::INVALID_BOARD, reason))?;
@@ -508,7 +508,7 @@ pub(super) async fn list_tasks(
     query: Result<Query<TasksQuery>, QueryRejection>,
 ) -> ApiResult<Json<TaskList>> {
     use openboard_api::tasks::states;
-    let caller = Caller::new(&identity, &headers)?;
+    let caller = state.caller(&identity, &headers).await?;
     let board = state.board(&caller, board).await?;
     let Query(query) = query.map_err(bad_query)?;
     let channel = match &query.channel {
@@ -595,7 +595,7 @@ pub(super) async fn get_task(
     headers: HeaderMap,
     path: Result<Path<(String, String)>, PathRejection>,
 ) -> ApiResult<Json<TaskView>> {
-    let caller = Caller::new(&identity, &headers)?;
+    let caller = state.caller(&identity, &headers).await?;
     let Path((board_name, id)) = path.map_err(|_| bad_path())?;
     let (board, _channel) = state.task_place(&caller, &board_name, &id).await?;
     let (thread, trust) = state
@@ -616,7 +616,7 @@ pub(super) async fn claim_ready(
     board: Result<Path<String>, PathRejection>,
     body: Result<Bytes, BytesRejection>,
 ) -> ApiResult<Json<ClaimReadyResponse>> {
-    let caller = Caller::new(&identity, &headers)?;
+    let caller = state.caller(&identity, &headers).await?;
     let board = state.board(&caller, board).await?;
     let request: ClaimReadyRequest = read_json(&headers, body, "claim request", || {
         AppError::invalid("the request body is too large for a claim request")
@@ -724,7 +724,7 @@ pub(super) async fn task_action(
     body: Result<Bytes, BytesRejection>,
 ) -> ApiResult<axum::response::Response> {
     use axum::response::IntoResponse;
-    let caller = Caller::new(&identity, &headers)?;
+    let caller = state.caller(&identity, &headers).await?;
     let Path((board_name, id, action)) = path.map_err(|_| bad_path())?;
     let limit = state.max_message_chars;
     let request: TaskActionRequest = if body.as_ref().is_ok_and(Bytes::is_empty) {
@@ -859,6 +859,7 @@ pub(super) async fn task_action(
         principal: caller.principal.clone(),
         profile: caller.profile.clone(),
         credential_id: caller.credential_id.clone(),
+        authority: caller.authority.clone(),
     };
     let on = board.clone();
     let (changed, head) = state

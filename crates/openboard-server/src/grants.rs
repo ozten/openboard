@@ -485,6 +485,34 @@ pub fn effective(
     access
 }
 
+/// Whether a request holds `verb` in at least one channel, existing or
+/// not. Exact: access is the same everywhere in a region that no grant or
+/// ceiling pattern divides, so one probe per pattern covers every region.
+pub fn holds_somewhere(
+    grants: &[Grant],
+    subject: &Subject,
+    ceilings: &[&Ceiling],
+    verb: Verb,
+    now: i64,
+) -> bool {
+    let patterns = grants
+        .iter()
+        .filter(|grant| grant.is_active(now))
+        .map(|grant| &grant.pattern)
+        .chain(
+            ceilings
+                .iter()
+                .flat_map(|ceiling| ceiling.entries.iter().map(|(pattern, _)| pattern)),
+        );
+    std::iter::once(&Pattern::Board)
+        .chain(patterns)
+        .any(|pattern| {
+            effective(grants, subject, ceilings, &probe(pattern), now)
+                .verbs
+                .contains(verb)
+        })
+}
+
 /// A request that wants to change grants.
 #[derive(Debug, Clone, Copy)]
 pub struct Issuer<'a> {
@@ -1176,6 +1204,39 @@ mod tests {
             ("x".into(), "y".into())
         )
         .is_err());
+    }
+
+    #[test]
+    fn holding_a_verb_somewhere_sees_through_narrower_grants_and_ceilings() {
+        let grants = table(
+            "
+            *        a          read
+            hr/      everyone   none
+            ops/x    b          read
+            ",
+        );
+        assert!(holds_somewhere(&grants, &agent("a"), &[], Verb::Read, 0));
+        assert!(holds_somewhere(&grants, &agent("b"), &[], Verb::Read, 0));
+        assert!(!holds_somewhere(&grants, &agent("c"), &[], Verb::Read, 0));
+        assert!(!holds_somewhere(&grants, &agent("a"), &[], Verb::Post, 0));
+        let wide = table("* w all");
+        let narrow = Ceiling {
+            entries: vec![(pattern("build/"), verbs("read"))],
+        };
+        assert!(holds_somewhere(
+            &wide,
+            &agent("w"),
+            &[&narrow],
+            Verb::Read,
+            0
+        ));
+        assert!(!holds_somewhere(
+            &wide,
+            &agent("w"),
+            &[&narrow],
+            Verb::Post,
+            0
+        ));
     }
 
     #[test]

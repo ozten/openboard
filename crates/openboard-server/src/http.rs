@@ -51,6 +51,7 @@ use tokio::time::Instant;
 
 use crate::authz::{Action, Authorizer, Principal};
 use crate::chain::hex;
+use crate::grants;
 use crate::identity::{
     self, log_kinds, session_lookup_hash, token_lookup_hash, AuthOutcome, Credential, InviteKind,
     LogEntry,
@@ -67,6 +68,7 @@ use crate::store::{
 };
 use crate::Mode;
 
+mod access;
 mod tasks;
 
 /// Longest idempotency key, in bytes.
@@ -1120,6 +1122,11 @@ struct Caller {
     profile: Option<String>,
     /// The credential the caller authenticated with, on a network board.
     credential_id: Option<String>,
+    /// What the caller may do, on a network board: the grants and ceilings
+    /// read when the request was authenticated. `None` on a local board,
+    /// where the policy alone decides, and before [`AppState::caller`] has
+    /// loaded it, when a network board allows nothing.
+    authority: Option<Arc<access::Authority>>,
 }
 
 impl Caller {
@@ -1139,6 +1146,7 @@ impl Caller {
             principal: identity.principal.clone(),
             profile,
             credential_id: identity.credential.as_ref().map(|c| c.id.clone()),
+            authority: None,
         })
     }
 
@@ -1174,11 +1182,40 @@ impl AppState {
         }
     }
 
-    /// The one place handlers ask whether the caller may do something.
+    /// The caller behind a request, with its authority on a network board.
+    async fn caller(
+        self: &Arc<Self>,
+        identity: &Identity,
+        headers: &HeaderMap,
+    ) -> ApiResult<Caller> {
+        let mut caller = Caller::new(identity, headers)?;
+        if self.mode == Mode::Network && !caller.principal.is_anonymous() {
+            let snapshot = self.db(|state| state.store.grants_snapshot()).await?;
+            let subject = grants::Subject {
+                id: caller.principal.id.clone(),
+                kind: caller.principal.kind,
+            };
+            caller.authority = Some(Arc::new(access::Authority::new(snapshot, subject)));
+        }
+        Ok(caller)
+    }
+
+    /// The one place handlers ask whether the caller may do something. The
+    /// policy decides first; on a network board the caller's grants then
+    /// decide what it may do in the board and channel.
     fn allows(&self, caller: &Caller, action: Action, board: &str, channel: Option<&str>) -> bool {
-        self.authz
+        if !self
+            .authz
             .authorize(&caller.principal, action, Some(board), channel)
             .is_allowed()
+        {
+            return false;
+        }
+        match (self.mode, &caller.authority) {
+            (Mode::Local, _) => true,
+            (Mode::Network, Some(authority)) => authority.allows(action, board, channel),
+            (Mode::Network, None) => false,
+        }
     }
 
     fn require(
@@ -1437,7 +1474,7 @@ async fn health(
     Extension(identity): Extension<Identity>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Health>> {
-    let caller = Caller::new(&identity, &headers)?;
+    let caller = state.caller(&identity, &headers).await?;
     state.require_global(&caller.principal, Action::Health)?;
     Ok(Json(Health {
         status: "ok".to_owned(),
@@ -1586,7 +1623,7 @@ async fn whoami(
     Extension(identity): Extension<Identity>,
     headers: HeaderMap,
 ) -> ApiResult<Json<WhoAmI>> {
-    let caller = Caller::new(&identity, &headers)?;
+    let caller = state.caller(&identity, &headers).await?;
     state.require_global(&caller.principal, Action::Session)?;
     Ok(Json(WhoAmI {
         actor: caller.actor(),
@@ -1722,7 +1759,7 @@ async fn web_session(
     Extension(identity): Extension<Identity>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Session>> {
-    let caller = Caller::new(&identity, &headers)?;
+    let caller = state.caller(&identity, &headers).await?;
     state.require_global(&caller.principal, Action::Session)?;
     Ok(Json(Session {
         actor: caller.actor(),
@@ -1739,7 +1776,7 @@ async fn post_message(
     board: Result<Path<String>, PathRejection>,
     body: Result<Bytes, BytesRejection>,
 ) -> ApiResult<(StatusCode, Json<PostMessageResponse>)> {
-    let caller = Caller::new(&identity, &headers)?;
+    let caller = state.caller(&identity, &headers).await?;
     let Path(board_name) = board.map_err(|_| bad_path())?;
     names::validate_board(&board_name)
         .map_err(|reason| AppError::new(codes::INVALID_BOARD, reason))?;
@@ -1899,7 +1936,7 @@ async fn edit_message(
     path: Result<Path<(String, String)>, PathRejection>,
     body: Result<Bytes, BytesRejection>,
 ) -> ApiResult<Json<Message>> {
-    let caller = Caller::new(&identity, &headers)?;
+    let caller = state.caller(&identity, &headers).await?;
     let Path((board_name, message_id)) = path.map_err(|_| bad_path())?;
     let limit = state.max_message_chars;
     let request: EditMessageRequest = read_json(&headers, body, "edit request", || {
@@ -1940,7 +1977,7 @@ async fn delete_message(
     path: Result<Path<(String, String)>, PathRejection>,
     query: Result<Query<DeleteMessageQuery>, QueryRejection>,
 ) -> ApiResult<Json<Message>> {
-    let caller = Caller::new(&identity, &headers)?;
+    let caller = state.caller(&identity, &headers).await?;
     let Path((board_name, message_id)) = path.map_err(|_| bad_path())?;
     let Query(query) = query.map_err(bad_query)?;
     let (board, meta) = state
@@ -1968,7 +2005,7 @@ async fn label_message(
     path: Result<Path<(String, String)>, PathRejection>,
     body: Result<Bytes, BytesRejection>,
 ) -> ApiResult<Json<Message>> {
-    let caller = Caller::new(&identity, &headers)?;
+    let caller = state.caller(&identity, &headers).await?;
     let Path((board_name, message_id)) = path.map_err(|_| bad_path())?;
     let request: LabelsRequest = read_json(&headers, body, "labels request", || {
         AppError::invalid("the request body is too large for a labels request")
@@ -2063,7 +2100,7 @@ async fn react(
     path: Result<Path<(String, String, String)>, PathRejection>,
     add: bool,
 ) -> ApiResult<Json<Message>> {
-    let caller = Caller::new(&identity, &headers)?;
+    let caller = state.caller(&identity, &headers).await?;
     let Path((board_name, message_id, name)) = path.map_err(|_| bad_path())?;
     names::validate_reaction(&name)
         .map_err(|reason| AppError::new(codes::INVALID_REACTION, reason))?;
@@ -2091,7 +2128,7 @@ async fn list_boards(
     Extension(identity): Extension<Identity>,
     headers: HeaderMap,
 ) -> ApiResult<Json<BoardList>> {
-    let caller = Caller::new(&identity, &headers)?;
+    let caller = state.caller(&identity, &headers).await?;
     let mut boards = state.db(|state| state.store.boards()).await?;
     boards.retain(|board| state.allows(&caller, Action::Read, &board.name, None));
     Ok(Json(BoardList { boards }))
@@ -2139,7 +2176,7 @@ async fn list_channels(
     headers: HeaderMap,
     board: Result<Path<String>, PathRejection>,
 ) -> ApiResult<Json<ChannelList>> {
-    let caller = Caller::new(&identity, &headers)?;
+    let caller = state.caller(&identity, &headers).await?;
     let board = state.board(&caller, board).await?;
     state.require(&caller, Action::Read, &board.name, None)?;
     let board_id = board.id;
@@ -2158,7 +2195,7 @@ async fn list_threads(
     board: Result<Path<String>, PathRejection>,
     query: Result<Query<ThreadsQuery>, QueryRejection>,
 ) -> ApiResult<Json<ThreadList>> {
-    let caller = Caller::new(&identity, &headers)?;
+    let caller = state.caller(&identity, &headers).await?;
     let board = state.board(&caller, board).await?;
     let Query(query) = query.map_err(bad_query)?;
     let channel = names::parse_channel_sel(&query.channel).map_err(invalid_channel)?;
@@ -2227,7 +2264,7 @@ async fn get_thread(
     path: Result<Path<(String, String)>, PathRejection>,
     options: Result<Query<ReadOptions>, QueryRejection>,
 ) -> ApiResult<Json<Thread>> {
-    let caller = Caller::new(&identity, &headers)?;
+    let caller = state.caller(&identity, &headers).await?;
     let Path((board, thread_id)) = path.map_err(|_| bad_path())?;
     let Query(options) = options.map_err(bad_query)?;
     let html = options.html == Some(true);
@@ -2301,7 +2338,7 @@ impl EventScan {
     ) -> ApiResult<Self> {
         // The gate authenticated the request before it got here.
         let checked_at = Instant::now();
-        let caller = Caller::new(identity, headers)?;
+        let caller = state.caller(identity, headers).await?;
         let board = state.board(&caller, board).await?;
         let channel = match &query.channel {
             None => None,

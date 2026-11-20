@@ -154,6 +154,10 @@ impl Net {
         let mut config = Config::new(data_dir_of(&dir));
         config.port = 0;
         config.network = true;
+        // These tests are about authentication; the board admits every
+        // enrolled agent and person, as before grants. The grant tests
+        // close it.
+        config.open = true;
         roomy(&mut config);
         tweak(&mut config);
         let server = openboard_server::bind(config).await.unwrap();
@@ -3390,7 +3394,7 @@ async fn an_m1_data_directory_migrates_verifies_and_takes_the_new_features() {
 // ---------------------------------------------------------------------------
 
 /// The schema version this build writes.
-const CURRENT_SCHEMA: i64 = 4;
+const CURRENT_SCHEMA: i64 = 5;
 
 fn schema_of(path: &Path) -> i64 {
     rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)

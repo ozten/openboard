@@ -30,8 +30,10 @@ use crate::time::{now_ms, now_rfc3339, rfc3339_from_ms};
 use crate::tls::{CERT_FILE_NAME, KEY_FILE_NAME};
 use crate::Mode;
 
+pub mod grants;
 mod tasks;
 
+pub(crate) use grants::{Access, Snapshot};
 pub(crate) use tasks::{
     Act, AssigneeSpec, BatchEntry, Brief, ClaimOut, ClaimProof, CreatorSel, Need, NewTask,
     TaskError, TaskQuery,
@@ -42,7 +44,7 @@ pub const DB_FILE_NAME: &str = "openboard.db";
 /// File name of the lock a running server holds on the data directory.
 pub const LOCK_FILE_NAME: &str = "openboard.lock";
 
-pub(crate) const SCHEMA_VERSION: i64 = 4;
+pub(crate) const SCHEMA_VERSION: i64 = 5;
 /// The oldest schema that has the identity tables the operator functions
 /// use. A database between this and [`SCHEMA_VERSION`] can be read and
 /// written by them before a newer server has migrated it.
@@ -543,6 +545,9 @@ impl Store {
                 tx.execute_batch(MIGRATE_V1_TO_V2)?;
                 tx.execute_batch(MIGRATE_V2_TO_V3)?;
                 tx.execute_batch(MIGRATE_V3_TO_V4)?;
+                // No boards yet, and the access mode is decided by the
+                // first start, like the mode.
+                tx.execute_batch(grants::MIGRATE_V4_TO_V5)?;
             }
             1 => {
                 // Milestone M0 knew only local mode.
@@ -550,14 +555,21 @@ impl Store {
                 identity::meta_set(&tx, identity::META_MODE, Mode::Local.as_str())?;
                 tx.execute_batch(MIGRATE_V2_TO_V3)?;
                 tx.execute_batch(MIGRATE_V3_TO_V4)?;
+                grants::migrate_v4_to_v5(&tx)?;
             }
             // Milestone M1.
             2 => {
                 tx.execute_batch(MIGRATE_V2_TO_V3)?;
                 tx.execute_batch(MIGRATE_V3_TO_V4)?;
+                grants::migrate_v4_to_v5(&tx)?;
             }
             // Milestones M2 and M2.5.
-            3 => tx.execute_batch(MIGRATE_V3_TO_V4)?,
+            3 => {
+                tx.execute_batch(MIGRATE_V3_TO_V4)?;
+                grants::migrate_v4_to_v5(&tx)?;
+            }
+            // Milestone M3: today's access is kept.
+            4 => grants::migrate_v4_to_v5(&tx)?,
             SCHEMA_VERSION => {}
             other => return Err(StoreError::Other(unsupported_schema(&tx, other))),
         }
@@ -884,9 +896,86 @@ impl Store {
     pub(crate) fn ensure_board(&self, name: &str) -> Result<BoardRef> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let board = ensure_board(&tx, name)?;
+        let board = ensure_board(&tx, name, None)?;
         tx.commit()?;
         Ok(board)
+    }
+
+    /// Records the instance's access mode on its first start: closed for a
+    /// fresh network board unless `open`, and open for a local one, whose
+    /// single principal can do everything anyway, so that a later upgrade to
+    /// network mode keeps what agents could do. `open` on a later start opens
+    /// a closed instance; nothing here closes one.
+    pub(crate) fn settle_access(&self, network: bool, open: bool) -> Result<Access> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let access = if !grants::access_recorded(&tx)? {
+            let access = if open || !network {
+                Access::Open
+            } else {
+                Access::Closed
+            };
+            grants::set_access(&tx, access)?;
+            access
+        } else if open {
+            grants::set_access(&tx, Access::Open)?;
+            Access::Open
+        } else {
+            grants::access(&tx)?
+        };
+        tx.commit()?;
+        Ok(access)
+    }
+
+    /// Gives the principal named `handle` `all` at `*` on every board where
+    /// it does not already hold that. Returns the boards it was given on.
+    pub(crate) fn make_admin(&self, handle: &str) -> Result<Option<Vec<String>>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some((principal_id, _, handle)) = grants::principal_by_handle(&tx, handle)? else {
+            return Ok(None);
+        };
+        let held = grants::list(&tx, None)?;
+        let boards: Vec<(i64, String)> = tx
+            .prepare("SELECT id, name FROM boards ORDER BY id")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let me = crate::grants::Grantee::Principal(principal_id);
+        let mut given = Vec::new();
+        for (board_id, name) in boards {
+            let already = held.iter().any(|stored| {
+                stored.board == name
+                    && stored.grant.grantee == me
+                    && stored.grant.pattern == crate::grants::Pattern::Board
+                    && stored.grant.verbs == crate::grants::Verbs::all()
+                    && stored.grant.expires_at.is_none()
+            });
+            if !already {
+                grants::insert(
+                    &tx,
+                    board_id,
+                    &crate::grants::Pattern::Board,
+                    &me,
+                    crate::grants::Verbs::all(),
+                    None,
+                    grants::OPERATOR,
+                )?;
+                given.push(name);
+            }
+        }
+        let _ = handle;
+        tx.commit()?;
+        Ok(Some(given))
+    }
+
+    /// Whether any principal holds `grant.manage` on any board.
+    pub(crate) fn anyone_manages(&self) -> Result<bool> {
+        Ok(grants::anyone_manages(&self.conn())?)
+    }
+
+    /// Every board's grants and the access mode, for authorizing requests.
+    pub(crate) fn grants_snapshot(&self) -> Result<Snapshot> {
+        Ok(grants::snapshot(&self.conn())?)
     }
 
     pub(crate) fn channel_exists(&self, board_id: i64, path: &str) -> Result<bool> {
@@ -942,7 +1031,9 @@ impl Store {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let board = match target {
             PostTarget::Board(board) => board,
-            PostTarget::NewBoard(name) => ensure_board(&tx, &name)?,
+            PostTarget::NewBoard(name) => {
+                ensure_board(&tx, &name, Some((&post.principal_id, &post.actor.handle)))?
+            }
         };
         let board = &board;
 
@@ -1819,16 +1910,28 @@ fn find_board(conn: &Connection, name: &str) -> Result<Option<BoardRef>> {
 }
 
 /// Inserts the board unless one with this name, compared without regard to
-/// case, already exists. Returns the board either way.
-fn ensure_board(conn: &Connection, name: &str) -> Result<BoardRef> {
+/// case, already exists. Returns the board either way. A board inserted
+/// now gets the grants a new board starts with, in the same transaction:
+/// `creator`, a principal ID and the handle it acts as, gets `all`.
+fn ensure_board(conn: &Connection, name: &str, creator: Option<(&str, &str)>) -> Result<BoardRef> {
     let tag = random_hex(conn, 8)?;
-    conn.execute(
+    let inserted = conn.execute(
         "INSERT OR IGNORE INTO boards (name, name_key, tag, created_at, head_hash)
          VALUES (?1, ?2, ?3, ?4, ?5)",
         params![name, board_key(name), tag, now_rfc3339(), GENESIS_HASH],
-    )?;
-    find_board(conn, name)?
-        .ok_or_else(|| StoreError::Other("board vanished after creation".to_owned()))
+    )? == 1;
+    let board = find_board(conn, name)?
+        .ok_or_else(|| StoreError::Other("board vanished after creation".to_owned()))?;
+    if inserted {
+        grants::board_created(conn, board.id, creator)?;
+    }
+    Ok(board)
+}
+
+/// [`ensure_board`] for an operator command: a board it creates has no
+/// creator. Returns the board's ID.
+pub(crate) fn ensure_board_for_operator(conn: &Connection, name: &str) -> Result<i64> {
+    Ok(ensure_board(conn, name, None)?.id)
 }
 
 fn head(conn: &Connection, board_id: i64) -> Result<i64> {

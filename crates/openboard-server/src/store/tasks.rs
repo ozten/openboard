@@ -855,7 +855,9 @@ impl Store {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let board = match target {
             PostTarget::Board(board) => board,
-            PostTarget::NewBoard(name) => ensure_board(&tx, &name)?,
+            PostTarget::NewBoard(name) => {
+                ensure_board(&tx, &name, Some((&by.principal_id, &by.actor.handle)))?
+            }
         };
         expire_due(&tx, &board, now_ms())?;
         if let Some(key) = &task.idempotency {
@@ -967,7 +969,9 @@ impl Store {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let board = match target {
             PostTarget::Board(board) => board,
-            PostTarget::NewBoard(name) => ensure_board(&tx, &name)?,
+            PostTarget::NewBoard(name) => {
+                ensure_board(&tx, &name, Some((&by.principal_id, &by.actor.handle)))?
+            }
         };
         expire_due(&tx, &board, now_ms())?;
         if let Some(key) = &idempotency {

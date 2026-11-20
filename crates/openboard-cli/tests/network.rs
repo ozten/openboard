@@ -39,6 +39,9 @@ impl NetBoard {
         let mut config = Config::new(dir.path().join("data"));
         config.port = 0;
         config.network = true;
+        // Every enrolled agent and person may use the board, as before
+        // grants.
+        config.open = true;
         // Out of the way, and quick to notice a revocation.
         config.limits = Limits {
             requests_per_minute: 100_000,
@@ -1907,6 +1910,23 @@ mod serve {
             .cli()
             .args(["join", invited["invite"].as_str().unwrap()]))
         .ok();
+        // A new network board admits nobody the operator has not granted.
+        run(agent.cli().args(["--json", "post", "notes", "kept"])).error(1, "forbidden");
+        let granted: Value = run(openboard()
+            .args([
+                "--json",
+                "admin",
+                "grant",
+                "*",
+                "agent-a",
+                "read,post,create",
+                "--data-dir",
+            ])
+            .arg(&data_dir))
+        .ok()
+        .json();
+        assert_eq!(granted["grantee"], "agent-a");
+        assert_eq!(granted["verbs"], "read,post,create");
         let posted = agent.post("notes", "kept");
         assert_eq!(posted.message.by.handle, "agent-a");
 
@@ -1914,6 +1934,11 @@ mod serve {
         let (code, stderr) = exit_of(serve);
         assert_eq!(code, Some(143), "{stderr}");
         assert!(stderr.contains("board stopped by SIGTERM"), "{stderr}");
+        // The operator was told how to become an admin.
+        assert!(
+            stderr.contains("nobody can change who may do what on this board yet"),
+            "{stderr}"
+        );
         assert!(lines.recv_timeout(Duration::from_secs(5)).is_err());
 
         // Started again without --network, the directory is still a network

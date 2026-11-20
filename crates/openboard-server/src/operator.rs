@@ -69,6 +69,13 @@ pub enum OperatorError {
     NoSuchCredential(String),
     /// No principal has this name.
     NoSuchPrincipal(String),
+    /// No grant has this ID.
+    NoSuchGrant(String),
+    /// The grant, its pattern or its verbs are not valid. Holds the reason.
+    InvalidGrant(String),
+    /// The database is older than this version: start the server on it once
+    /// to migrate it first.
+    NotMigrated,
     /// The database could not be read or written.
     Storage(String),
 }
@@ -87,6 +94,12 @@ impl fmt::Display for OperatorError {
             OperatorError::InvalidUrl(reason) => write!(f, "invalid board URL: {reason}"),
             OperatorError::NoSuchCredential(id) => write!(f, "no credential has the ID {id}"),
             OperatorError::NoSuchPrincipal(name) => write!(f, "no agent or person is named {name}"),
+            OperatorError::NoSuchGrant(id) => write!(f, "no grant has the ID {id}"),
+            OperatorError::InvalidGrant(reason) => write!(f, "invalid grant: {reason}"),
+            OperatorError::NotMigrated => f.write_str(
+                "this data directory has no grants yet: start this version of the server on it \
+                 once, which migrates it",
+            ),
             OperatorError::Storage(detail) => {
                 write!(f, "cannot use the board database: {detail}")
             }
@@ -853,4 +866,204 @@ pub fn prune_backups(data_dir: &Path) -> Result<Vec<Backup>> {
         })?;
     }
     Ok(backups)
+}
+
+/// One grant, as the operator commands show it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantInfo {
+    pub id: String,
+    pub board: String,
+    /// `*`, `build/` or `build/api`.
+    pub pattern: String,
+    /// The handle of a principal, a group (`agents`, `people`, `services`)
+    /// or `everyone`.
+    pub grantee: String,
+    pub verbs: String,
+    pub expires_at: Option<String>,
+    /// Expired: it no longer applies.
+    pub expired: bool,
+    /// The handle that made it, or `operator`.
+    pub created_by: String,
+    pub created_at: String,
+}
+
+/// A principal's access to one channel, and the grants that decide it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Explained {
+    pub verbs: String,
+    /// Empty when no grant applies, which means no access.
+    pub deciding: Vec<GrantInfo>,
+}
+
+fn open_grants(data_dir: &Path, write: bool) -> Result<Connection> {
+    let (conn, _) = open(data_dir, write)?;
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version < SCHEMA_VERSION {
+        return Err(OperatorError::NotMigrated);
+    }
+    Ok(conn)
+}
+
+fn grant_info(stored: &crate::store::grants::StoredGrant, now: i64) -> GrantInfo {
+    use crate::grants::Grantee;
+    let grant = &stored.grant;
+    GrantInfo {
+        id: grant.id.clone(),
+        board: stored.board.clone(),
+        pattern: grant.pattern.to_string(),
+        grantee: match &grant.grantee {
+            Grantee::Principal(id) => stored.grantee_handle.clone().unwrap_or_else(|| id.clone()),
+            Grantee::Group(group) => group.name().to_owned(),
+            Grantee::Everyone => "everyone".to_owned(),
+        },
+        verbs: grant.verbs.to_string(),
+        expires_at: grant.expires_at.map(rfc3339_from_ms),
+        expired: !grant.is_active(now),
+        created_by: stored.created_by.clone(),
+        created_at: rfc3339_from_ms(stored.created_ms),
+    }
+}
+
+fn grantee_of(conn: &Connection, name: &str) -> Result<crate::grants::Grantee> {
+    use crate::grants::{Grantee, Group};
+    if name == "everyone" {
+        return Ok(Grantee::Everyone);
+    }
+    if let Some(group) = Group::parse(name) {
+        return Ok(Grantee::Group(group));
+    }
+    match crate::store::grants::principal_by_handle(conn, name)? {
+        Some((id, _, _)) => Ok(Grantee::Principal(id)),
+        None => Err(OperatorError::NoSuchPrincipal(name.to_owned())),
+    }
+}
+
+/// Gives `grantee` (a handle, `agents`, `people`, `services` or `everyone`)
+/// `verbs` on `pattern` of `board`, optionally for `ttl`. The operator's
+/// grants need no authorizing grant: whoever can write the data directory
+/// already controls the board. Creates the board when it does not exist.
+pub fn grant(
+    data_dir: &Path,
+    board: &str,
+    pattern: &str,
+    grantee: &str,
+    verbs: &str,
+    ttl: Option<Duration>,
+) -> Result<GrantInfo> {
+    use crate::grants::{Grant, Pattern, Verbs};
+    names::validate_board(board).map_err(OperatorError::InvalidName)?;
+    let pattern = Pattern::parse(pattern, names::validate_channel)
+        .map_err(|error| OperatorError::InvalidGrant(error.to_string()))?;
+    let verbs =
+        Verbs::parse(verbs).map_err(|error| OperatorError::InvalidGrant(error.to_string()))?;
+    let mut conn = open_grants(data_dir, true)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let grantee = grantee_of(&tx, grantee)?;
+    let now = now_ms();
+    let expires_at =
+        ttl.map(|ttl| now.saturating_add(i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX)));
+    Grant {
+        id: String::new(),
+        pattern: pattern.clone(),
+        grantee: grantee.clone(),
+        verbs,
+        expires_at,
+    }
+    .validate()
+    .map_err(|error| OperatorError::InvalidGrant(error.to_string()))?;
+    let board_id = crate::store::ensure_board_for_operator(&tx, board)
+        .map_err(|error| OperatorError::Storage(error.to_string()))?;
+    let id = crate::store::grants::insert(
+        &tx,
+        board_id,
+        &pattern,
+        &grantee,
+        verbs,
+        expires_at,
+        crate::store::grants::OPERATOR,
+    )?;
+    let stored = crate::store::grants::list(&tx, Some(board_id))?
+        .into_iter()
+        .find(|stored| stored.grant.id == id)
+        .ok_or_else(|| OperatorError::Storage("the new grant vanished".to_owned()))?;
+    tx.commit()?;
+    Ok(grant_info(&stored, now))
+}
+
+/// Removes a grant. Removing one can widen access: removing a grant to
+/// `everyone` reopens what it closed to the broader grants.
+pub fn ungrant(data_dir: &Path, id: &str) -> Result<GrantInfo> {
+    let mut conn = open_grants(data_dir, true)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let now = now_ms();
+    let Some(stored) = crate::store::grants::list(&tx, None)?
+        .into_iter()
+        .find(|stored| stored.grant.id == id)
+    else {
+        return Err(OperatorError::NoSuchGrant(id.to_owned()));
+    };
+    let board_id: i64 = tx.query_row("SELECT board_id FROM grants WHERE id = ?1", [id], |row| {
+        row.get(0)
+    })?;
+    crate::store::grants::remove(&tx, board_id, id, crate::store::grants::OPERATOR)?;
+    tx.commit()?;
+    Ok(grant_info(&stored, now))
+}
+
+/// The grants of one board, or of every board, oldest first.
+pub fn list_grants(data_dir: &Path, board: Option<&str>) -> Result<Vec<GrantInfo>> {
+    let conn = open_grants(data_dir, false)?;
+    let now = now_ms();
+    let key = board.map(names::board_key);
+    Ok(crate::store::grants::list(&conn, None)?
+        .iter()
+        .filter(|stored| {
+            key.as_ref()
+                .is_none_or(|key| names::board_key(&stored.board) == *key)
+        })
+        .map(|stored| grant_info(stored, now))
+        .collect())
+}
+
+/// What the principal named `handle` may do in `channel` of `board` by its
+/// grants, and which grants decide it.
+pub fn explain(data_dir: &Path, board: &str, handle: &str, channel: &str) -> Result<Explained> {
+    names::validate_channel(channel).map_err(OperatorError::InvalidName)?;
+    let conn = open_grants(data_dir, false)?;
+    let Some((id, kind, _)) = crate::store::grants::principal_by_handle(&conn, handle)? else {
+        return Err(OperatorError::NoSuchPrincipal(handle.to_owned()));
+    };
+    let now = now_ms();
+    let key = names::board_key(board);
+    let stored: Vec<_> = crate::store::grants::list(&conn, None)?
+        .into_iter()
+        .filter(|stored| names::board_key(&stored.board) == key)
+        .collect();
+    let grants: Vec<_> = stored.iter().map(|stored| stored.grant.clone()).collect();
+    let access =
+        crate::grants::evaluate(&grants, &crate::grants::Subject { id, kind }, channel, now);
+    Ok(Explained {
+        verbs: access.verbs.to_string(),
+        deciding: stored
+            .iter()
+            .filter(|stored| access.deciding.contains(&stored.grant.id))
+            .map(|stored| grant_info(stored, now))
+            .collect(),
+    })
+}
+
+/// The instance's access mode: whether any enrolled agent or person may
+/// create boards, and new boards admit all agents and people.
+pub fn access(data_dir: &Path) -> Result<crate::store::Access> {
+    let conn = open_grants(data_dir, false)?;
+    Ok(crate::store::grants::access(&conn)?)
+}
+
+/// Sets the instance's access mode. Closing it changes no existing grant:
+/// it only stops new boards admitting everyone, and principals creating
+/// boards.
+pub fn set_access(data_dir: &Path, access: crate::store::Access) -> Result<()> {
+    let conn = open_grants(data_dir, true)?;
+    crate::store::grants::set_access(&conn, access)?;
+    Ok(())
 }

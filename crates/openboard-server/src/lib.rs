@@ -129,6 +129,7 @@ mod tls;
 
 pub use chain::{verify_log, BoardReport, BrokenEntry, VerifyError, VerifyReport};
 pub use limits::{Limits, LogRetention};
+pub use store::grants::Access;
 pub use store::{DB_FILE_NAME, LOCK_FILE_NAME};
 pub use tls::{CERT_FILE_NAME, KEY_FILE_NAME};
 
@@ -214,6 +215,15 @@ pub struct Config {
     pub limits: Limits,
     /// How long the security log is kept, in both modes.
     pub security_log: LogRetention,
+    /// Open the instance: any enrolled agent or person may create boards,
+    /// and every board admits all agents and people. A fresh network board
+    /// is closed without it (default deny). Setting it on a closed instance
+    /// opens it; leaving it unset never closes one.
+    pub open: bool,
+    /// The handle of an enrolled agent or person to give `all` at `*` on
+    /// every board at start, for example after an upgrade, when nobody
+    /// holds `grant.manage` yet.
+    pub admin: Option<String>,
 }
 
 impl Config {
@@ -240,6 +250,8 @@ impl Default for Config {
             public_url: None,
             limits: Limits::default(),
             security_log: LogRetention::default(),
+            open: false,
+            admin: None,
         }
     }
 }
@@ -263,6 +275,8 @@ pub enum ServeError {
     DataDirInUse(PathBuf),
     /// The data directory or its database could not be opened.
     Storage(String),
+    /// [`Config::admin`] names no enrolled agent or person.
+    NoSuchAdmin(String),
     /// The listener could not bind, for example because the port is taken.
     Bind {
         addr: SocketAddr,
@@ -294,6 +308,11 @@ impl fmt::Display for ServeError {
                 dir.display()
             ),
             ServeError::Storage(detail) => write!(f, "cannot open the board database: {detail}"),
+            ServeError::NoSuchAdmin(name) => write!(
+                f,
+                "no agent or person is named {name}, so they cannot be made an admin; invite \
+                 them first with `openboard invite {name}`"
+            ),
             ServeError::Bind { addr, source } => write!(f, "cannot listen on {addr}: {source}"),
             ServeError::Io(source) => write!(f, "the listener failed: {source}"),
         }
@@ -309,6 +328,7 @@ impl std::error::Error for ServeError {
             | ServeError::InvalidPublicUrl(_)
             | ServeError::Tls(_)
             | ServeError::DataDirInUse(_)
+            | ServeError::NoSuchAdmin(_)
             | ServeError::Storage(_) => None,
         }
     }
@@ -316,6 +336,8 @@ impl std::error::Error for ServeError {
 
 /// A bound server that has not started answering requests yet.
 pub struct Server {
+    /// A network board on which no principal holds `grant.manage`.
+    nobody_manages: bool,
     listener: TcpListener,
     /// Set on a network board, where every connection starts with TLS.
     tls: Option<Arc<rustls::ServerConfig>>,
@@ -350,6 +372,13 @@ impl Server {
 
     /// The mode the board runs in. This is [`Mode::Network`] for a network
     /// data directory even when the configuration did not ask for it.
+    /// True for a network board on which nobody can change grants yet: no
+    /// principal holds `grant.manage` on any board. The operator gives it
+    /// with `openboard admin grant`, or with [`Config::admin`].
+    pub fn nobody_manages(&self) -> bool {
+        self.nobody_manages
+    }
+
     pub fn mode(&self) -> Mode {
         self.mode
     }
@@ -458,6 +487,7 @@ async fn bind_inner(
     };
 
     let (data_dir, bind_ip) = (config.data_dir.clone(), config.bind);
+    let (open, admin) = (config.open, config.admin.clone());
     let opened = tokio::task::spawn_blocking(move || {
         let store = store::Store::open(&data_dir).map_err(|error| match error {
             store::StoreError::DataDirInUse => ServeError::DataDirInUse(data_dir.clone()),
@@ -471,16 +501,32 @@ async fn bind_inner(
         if plan.mode == Mode::Local && !bind_ip.is_loopback() {
             return Err(ServeError::NonLoopbackBind(bind_ip));
         }
+        // Before the default board, which starts with the grants of the
+        // access mode.
+        store
+            .settle_access(plan.mode == Mode::Network, open)
+            .map_err(storage)?;
+        if let Some(handle) = &admin {
+            if store.make_admin(handle).map_err(storage)?.is_none() {
+                return Err(ServeError::NoSuchAdmin(handle.clone()));
+            }
+        }
         // The default board always exists, so a fresh board can be read and
         // waited on before anything is posted.
         store
             .ensure_board(openboard_api::DEFAULT_BOARD)
             .map_err(storage)?;
-        Ok((store, plan))
+        if let Some(handle) = &admin {
+            // Again, for a default board created just now.
+            store.make_admin(handle).map_err(storage)?;
+        }
+        let nobody_manages =
+            plan.mode == Mode::Network && !store.anyone_manages().map_err(storage)?;
+        Ok((store, plan, nobody_manages))
     })
     .await
     .map_err(|error| ServeError::Storage(error.to_string()))?;
-    let (store, plan) = opened?;
+    let (store, plan, nobody_manages) = opened?;
     let mode = plan.mode;
 
     // The port comes before anything that makes the directory a network
@@ -540,6 +586,7 @@ async fn bind_inner(
         in_use,
     });
     Ok(Server {
+        nobody_manages,
         listener,
         tls,
         limits: config.limits,

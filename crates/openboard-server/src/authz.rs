@@ -183,11 +183,10 @@ impl Policy for LocalPolicy {
     }
 }
 
-/// The network policy until milestone M4: every authenticated principal may
-/// do everything except manage tasks it does not own, and an
-/// unauthenticated caller may only check health, enrol, sign in and fetch
-/// the web UI's static files. Nobody holds [`Action::ManageTasks`] until
-/// grants exist to give it, so only a task's creator changes it.
+/// The network policy: an unauthenticated caller may only check health,
+/// enrol, sign in and fetch the web UI's static files, and an enrolled
+/// principal passes on to its grants, which decide what it may do in each
+/// board and channel (`crate::grants`).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NetworkPolicy;
 
@@ -205,8 +204,10 @@ impl Policy for NetworkPolicy {
                 Action::Health | Action::Enrol | Action::SignIn | Action::Page
             )
         } else {
-            // The local principal does not exist on a network board.
-            principal.kind != ActorKind::Local && action != Action::ManageTasks
+            // The local principal does not exist on a network board. What
+            // an enrolled principal may do in a board is decided by its
+            // grants, on top of this.
+            principal.kind != ActorKind::Local
         };
         if allowed {
             Decision::Allow
@@ -279,12 +280,7 @@ mod tests {
         for action in ACTIONS {
             for enrolled in [&agent, &person] {
                 let decision = authz.authorize(enrolled, action, Some("general"), Some("a"));
-                let expected = if action == Action::ManageTasks {
-                    Decision::Deny
-                } else {
-                    Decision::Allow
-                };
-                assert_eq!(decision, expected, "{action:?}");
+                assert_eq!(decision, Decision::Allow, "{action:?}");
             }
             let decision = authz.authorize(&Principal::local(), action, Some("general"), None);
             assert_eq!(decision, Decision::Deny, "{action:?}");

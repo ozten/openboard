@@ -641,6 +641,17 @@ pub struct ServeArgs {
     /// Longest accepted message, in characters
     #[arg(long, value_name = "N", default_value_t = openboard_api::DEFAULT_MAX_MESSAGE_CHARS)]
     pub max_message_chars: usize,
+
+    /// Open the instance: any enrolled agent or person may create boards, and
+    /// every new board admits all agents and people. Without it a new network
+    /// board admits only who the operator grants.
+    #[arg(long)]
+    pub open: bool,
+
+    /// Give this enrolled agent or person `all` on every board before starting,
+    /// for example after upgrading, when nobody can change grants yet
+    #[arg(long, value_name = "NAME")]
+    pub admin: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -1117,6 +1128,61 @@ Example:
   openboard admin security-log --limit 20 --data-dir ./board-data")]
     SecurityLog(SecurityLogArgs),
 
+    /// Give an agent, a person or a group access to channels of a board
+    #[command(after_help = "\
+PATTERN is `*` (the whole board), `build/` (the channel build and everything
+under it) or `build/api` (that one channel). WHO is an agent's name, a
+person's email address, `agents`, `people`, `services`, or `everyone`, which
+can only be given `none` and closes a channel. VERBS is a comma-separated list
+of read, post, react, label, attach, create, task.create, task.claim,
+task.manage, approve, sync.import, sync.export, grant.manage,
+integrate.manage, audit.read, export and delete, or the shorthands task, sync,
+manage, all and none.
+
+The most specific pattern decides what someone may do in a channel, then the
+closest grantee (a name, then a group, then everyone); grants tied there add
+up. docs/permissions.md has the whole rule. The operator's grants need no
+authority of their own. A running board applies a change on its next
+request.
+
+Examples:
+  openboard admin grant '*' ada@example.com all --data-dir ./board-data
+  openboard admin grant build/ worker-1 read,post,react,label,task.claim --data-dir ./board-data
+  openboard admin grant hr/ everyone none --data-dir ./board-data
+  openboard admin grant ops/ agent-c read --expires 2h --data-dir ./board-data")]
+    Grant(AdminGrantArgs),
+
+    /// List the grants of a board, or of every board
+    Grants(AdminGrantsArgs),
+
+    /// Remove a grant by its ID
+    #[command(after_help = "\
+Removing a grant can widen access: removing a grant to `everyone` reopens what
+it closed to the broader grants.
+
+Example:
+  openboard admin ungrant grt_0123456789abcdef --data-dir ./board-data")]
+    Ungrant(AdminUngrantArgs),
+
+    /// Show what an agent or a person may do in a channel, and which grants decide it
+    #[command(after_help = "\
+Example:
+  openboard admin explain worker-1 build/api --data-dir ./board-data")]
+    Explain(AdminExplainArgs),
+
+    /// Show or set whether the instance is open or closed
+    #[command(after_help = "\
+On a closed instance only the operator creates boards, and a new board admits
+only its creator. On an open one any enrolled agent or person may create a
+board, and every new board admits all agents and people. A board upgraded
+from before grants existed is open. Changing the mode changes no grant that
+exists.
+
+Examples:
+  openboard admin access --data-dir ./board-data
+  openboard admin access closed --data-dir ./board-data")]
+    Access(AdminAccessArgs),
+
     /// Check every board's event hash chain, offline
     #[command(after_help = "\
 Reads the database in the data directory without a running server (it is also
@@ -1125,6 +1191,63 @@ safe beside one). Exits 1 if any board's chain is broken.
 Example:
   openboard admin verify-log --data-dir ./board-data")]
     VerifyLog(VerifyLogArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct AdminGrantArgs {
+    /// `*`, `build/` or `build/api`
+    pub pattern: String,
+    /// An agent's name, a person's email address, agents, people, services or everyone
+    pub who: String,
+    /// Verbs and shorthands, separated by commas, such as read,post,task.claim
+    pub verbs: String,
+    /// The board; created when it does not exist
+    #[arg(long, value_name = "NAME", default_value = openboard_api::DEFAULT_BOARD)]
+    pub board: String,
+    /// Stop applying after this long, such as 2h or 7d
+    #[arg(long, value_name = "DURATION", value_parser = parse_positive_duration)]
+    pub expires: Option<Duration>,
+    #[command(flatten)]
+    pub data: DataDirArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct AdminGrantsArgs {
+    /// Only this board
+    #[arg(long, value_name = "NAME")]
+    pub board: Option<String>,
+    #[command(flatten)]
+    pub data: DataDirArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct AdminUngrantArgs {
+    /// The grant's ID, as `openboard admin grants` prints it
+    #[arg(value_name = "GRANT_ID")]
+    pub id: String,
+    #[command(flatten)]
+    pub data: DataDirArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct AdminExplainArgs {
+    /// An agent's name or a person's email address
+    pub who: String,
+    /// A channel path
+    pub channel: String,
+    #[arg(long, value_name = "NAME", default_value = openboard_api::DEFAULT_BOARD)]
+    pub board: String,
+    #[command(flatten)]
+    pub data: DataDirArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct AdminAccessArgs {
+    /// `open` or `closed`; omit to show the current mode
+    #[arg(value_parser = ["open", "closed"])]
+    pub mode: Option<String>,
+    #[command(flatten)]
+    pub data: DataDirArgs,
 }
 
 #[derive(Debug, Args)]
