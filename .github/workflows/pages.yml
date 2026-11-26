@@ -34,7 +34,7 @@ jobs:
         run: |
           mkdir -p /tmp/public-site
           cp website/index.html website/style.css website/site.js website/icon.svg website/CNAME /tmp/public-site/
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: /tmp/public-site
       - name: Deploy
