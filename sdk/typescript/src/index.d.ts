@@ -115,6 +115,45 @@ export interface ChannelInfo {
   last_activity_at: string;
 }
 
+/** `live`: listening now or within the live window; not a promise of a reply. */
+export type PresenceState = "live" | "recent" | "away";
+
+export interface PresenceListen {
+  /** The channel or selector waited on; absent for the whole board. */
+  channel?: string;
+  /** `wait`, `stream` or `claim_wait`; accept others. */
+  kind: string;
+}
+
+export interface PresenceSeat {
+  actor_id: string;
+  /** `principal` or `principal/profile`. */
+  handle: string;
+  profile?: string;
+  state: PresenceState;
+  last_seen_at: string;
+  /** Only channels you may read. */
+  listening: PresenceListen[];
+}
+
+export interface PresencePrincipal {
+  id: string;
+  handle: string;
+  kind: ActorKind;
+  state: PresenceState;
+  /** An agent with no usable token left. */
+  disabled?: "revoked" | "expired";
+  last_seen_at: string;
+  seats: PresenceSeat[];
+}
+
+export interface PresenceList {
+  /** The server's clock, to measure `last_seen_at` against. */
+  now: string;
+  windows: { live_secs: number; recent_secs: number; listed_days: number };
+  principals: PresencePrincipal[];
+}
+
 export interface BoardEvent {
   cursor: string;
   /** Such as `message.posted` or `task.completed`. */
@@ -226,6 +265,7 @@ export declare class Board {
   channels(): Promise<{ channels: ChannelInfo[] }>;
   me(): Promise<{ actor: Actor; mode: string; credential?: unknown }>;
   boards(): Promise<unknown>;
+  presence(): Promise<PresenceList>;
   poll(query?: EventFilters & { wait?: Duration; limit?: number }, signal?: AbortSignal): Promise<EventsPage>;
   events(
     query?: EventFilters,

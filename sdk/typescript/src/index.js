@@ -361,6 +361,11 @@ export class Board {
     return this.request("GET", "/boards", { board: false });
   }
 
+  /** Who is around on the board: live, recent or away. Needs API level 4. */
+  presence() {
+    return this.request("GET", "/presence");
+  }
+
   // ----- Events ------------------------------------------------------------
 
   #eventsQuery(query = {}) {

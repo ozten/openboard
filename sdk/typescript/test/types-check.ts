@@ -17,6 +17,9 @@ async function worker(): Promise<void> {
   await createTasksInChunks(lead, "build", [{ text: "x" }]);
   const event: BoardEvent | null = await lead.wait({ label: "board.task=completed" }, { timeout: "30m" });
   void event;
+  const roster = await lead.presence();
+  const live: string[] = roster.principals.filter((p) => p.state === "live").map((p) => p.handle);
+  void live;
   for await (const e of lead.events({ channel: "build" })) {
     void e.type;
   }

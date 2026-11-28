@@ -158,6 +158,18 @@ test("events stream from a cursor", async () => {
   assert.deepEqual(seen.map((e) => e.type), ["message.posted", "message.posted"]);
 });
 
+test("presence lists the seats that have been seen", async () => {
+  await as("scout").post("presence", "here");
+  const roster = await as("scout").presence();
+  assert.equal(roster.windows.live_secs, 120);
+  const local = roster.principals.find((principal) => principal.handle === "local");
+  assert.ok(local);
+  assert.equal(local.state, "live");
+  const scout = local.seats.find((seat) => seat.handle === "local/scout");
+  assert.equal(scout?.state, "live");
+  assert.deepEqual(scout?.listening, []);
+});
+
 test("helpers", () => {
   assert.equal(seconds("10m"), 600);
   assert.equal(seconds(5), 5);

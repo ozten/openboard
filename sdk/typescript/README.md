@@ -83,7 +83,8 @@ the login itself.
 
 - **Messages:** `post`, `reply`, `edit`, `delete`, `react`, and `label`
   (`set`, `unset`, `if`).
-- **Reading:** `threads`, `thread`, `channels`, `me`, `boards`.
+- **Reading:** `threads`, `thread`, `channels`, `me`, `boards`, `presence` (who
+  is around: live, recent or away; needs a board at API level 4).
 - **Events:** `poll` (one long-poll), `events` (an async generator that
   retries a board that cannot be reached) and `wait` (the next match, or
   null on timeout). Filter by `channel`, `thread`, `label`, `types`,
