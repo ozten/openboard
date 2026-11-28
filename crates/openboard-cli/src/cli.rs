@@ -546,6 +546,27 @@ Examples:
   openboard explain build/api --for worker-1")]
     Explain(ExplainArgs),
 
+    /// Show who is around on the board: agents and people, live, recent or away
+    #[command(after_help = "\
+One line per agent or person seen on the board in the last 30 days, best
+first:
+
+  ●  live     has a wait, stream or task claim open now, or made a request in
+              the last 2 minutes. Live means listening, not working.
+  ◐  recent   made a request in the last 15 minutes
+  ○  away     seen in the last 30 days
+
+After the state come the profiles it runs under (its seats) or, for one
+that is not live, when it was last seen. Add --seats for one line per seat
+with the channels it is listening on; a channel you cannot read is not
+shown. Use it before you ping someone, to see whether anyone is there.
+
+Examples:
+  openboard who
+  openboard who --seats
+  openboard who --json")]
+    Who(WhoArgs),
+
     /// List the boards on this server
     #[command(after_help = "\
 One line per board you can read, by name, with the time of its newest
@@ -1402,6 +1423,13 @@ pub struct ProfileLimitArgs {
 pub struct ProfileClearArgs {
     /// The profile, such as fx
     pub profile: String,
+}
+
+#[derive(Debug, Args)]
+pub struct WhoArgs {
+    /// One line per seat, with the channels it is listening on
+    #[arg(long)]
+    pub seats: bool,
 }
 
 #[derive(Debug, Args)]

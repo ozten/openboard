@@ -10,8 +10,8 @@
 use std::fmt::Write as _;
 
 use openboard_api::{
-    event_types, ActorKind, BoardList, ChannelList, Event, Message, PostMessageResponse, Thread,
-    ThreadList,
+    event_types, ActorKind, BoardList, ChannelList, Event, Message, PostMessageResponse,
+    PresenceList, PresenceSeat, PresenceState, Thread, ThreadList,
 };
 
 /// Characters of a root message shown in a channel listing.
@@ -296,6 +296,173 @@ pub fn channels(list: &ChannelList, board: &str) -> String {
     out
 }
 
+/// `openboard who`: one line per principal, best first, and with `seats`
+/// one more line per seat.
+pub fn presence(list: &PresenceList, board: &str, seats: bool) -> String {
+    if list.principals.is_empty() {
+        return format!(
+            "nobody has been seen on board {} in the last {} days",
+            line(board),
+            list.windows.listed_days
+        );
+    }
+    let now = parse_rfc3339_ms(&list.now);
+    let width = list
+        .principals
+        .iter()
+        .map(|principal| principal.handle.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut out = String::new();
+    for principal in &list.principals {
+        let detail = if principal.state == PresenceState::Live {
+            live_seats(principal.seats.as_slice())
+        } else {
+            format!("last seen {}", ago(now, &principal.last_seen_at))
+        };
+        let disabled = match principal.disabled.as_deref() {
+            Some("revoked") => "  (access revoked)".to_owned(),
+            Some("expired") => "  (token expired)".to_owned(),
+            Some(other) => format!("  ({})", line(other)),
+            None => String::new(),
+        };
+        let _ = writeln!(
+            out,
+            "{} {:width$}  {:<6}  {:<6}  {}{disabled}",
+            mark(principal.state),
+            line(&principal.handle),
+            kind_name(principal.kind),
+            state_name(principal.state),
+            detail,
+        );
+        if seats {
+            for seat in &principal.seats {
+                let detail = if seat.listening.is_empty() {
+                    if seat.state == PresenceState::Live {
+                        "live".to_owned()
+                    } else {
+                        format!("last seen {}", ago(now, &seat.last_seen_at))
+                    }
+                } else {
+                    let listens: Vec<String> = seat
+                        .listening
+                        .iter()
+                        .map(|listen| match &listen.channel {
+                            Some(channel) => format!("{} ({})", line(channel), line(&listen.kind)),
+                            None => format!("whole board ({})", line(&listen.kind)),
+                        })
+                        .collect();
+                    format!("listening on {}", listens.join(", "))
+                };
+                let _ = writeln!(
+                    out,
+                    "    {} {}  {detail}",
+                    mark(seat.state),
+                    line(&seat.handle)
+                );
+            }
+        }
+    }
+    out.truncate(out.trim_end().len());
+    out
+}
+
+/// The live seats of a principal by profile, `default` for the seat with
+/// none, and `web` where that is all it has open.
+fn live_seats(seats: &[PresenceSeat]) -> String {
+    let names: Vec<String> = seats
+        .iter()
+        .filter(|seat| seat.state == PresenceState::Live)
+        .map(|seat| match &seat.profile {
+            Some(profile) => line(profile),
+            None if !seat.listening.is_empty()
+                && seat
+                    .listening
+                    .iter()
+                    .all(|listen| listen.kind == "stream" && listen.channel.is_none()) =>
+            {
+                "web".to_owned()
+            }
+            None => "default".to_owned(),
+        })
+        .collect();
+    if names == ["default"] {
+        String::new()
+    } else {
+        names.join(", ")
+    }
+}
+
+fn mark(state: PresenceState) -> &'static str {
+    match state {
+        PresenceState::Live => "\u{25cf}",
+        PresenceState::Recent => "\u{25d0}",
+        PresenceState::Away => "\u{25cb}",
+    }
+}
+
+fn state_name(state: PresenceState) -> &'static str {
+    match state {
+        PresenceState::Live => "live",
+        PresenceState::Recent => "recent",
+        PresenceState::Away => "away",
+    }
+}
+
+fn kind_name(kind: ActorKind) -> &'static str {
+    match kind {
+        ActorKind::Local => "local",
+        ActorKind::Person => "person",
+        ActorKind::Service => "service",
+        ActorKind::Agent => "agent",
+        ActorKind::Bridge => "bridge",
+    }
+}
+
+/// How long before `now_ms` the RFC 3339 time `then` was, roughly.
+fn ago(now_ms: Option<i64>, then: &str) -> String {
+    let (Some(now), Some(then_ms)) = (now_ms, parse_rfc3339_ms(then)) else {
+        return line(then);
+    };
+    let secs = (now - then_ms).max(0) / 1000;
+    match secs {
+        0..=59 => "just now".to_owned(),
+        60..=3_599 => format!("{}m ago", secs / 60),
+        3_600..=86_399 => format!("{}h ago", secs / 3_600),
+        _ => format!("{}d ago", secs / 86_400),
+    }
+}
+
+/// Milliseconds since the epoch of an RFC 3339 time in UTC as the server
+/// writes them (`2026-11-27T23:44:24.123Z`), or `None`.
+fn parse_rfc3339_ms(text: &str) -> Option<i64> {
+    let (date, time) = text.strip_suffix('Z')?.split_once('T')?;
+    let mut date = date.splitn(3, '-').map(str::parse::<i64>);
+    let (year, month, day) = (date.next()?.ok()?, date.next()?.ok()?, date.next()?.ok()?);
+    let (clock, millis) = match time.split_once('.') {
+        Some((clock, fraction)) => {
+            let digits: String = fraction.chars().chain("000".chars()).take(3).collect();
+            (clock, digits.parse::<i64>().ok()?)
+        }
+        None => (time, 0),
+    };
+    let mut clock = clock.splitn(3, ':').map(str::parse::<i64>);
+    let (hour, minute, second) = (
+        clock.next()?.ok()?,
+        clock.next()?.ok()?,
+        clock.next()?.ok()?,
+    );
+    // Days-from-civil, after Howard Hinnant's public domain algorithm.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(((days * 86_400 + hour * 3_600 + minute * 60 + second) * 1_000) + millis)
+}
+
 /// `label` is the `--label` filter of the listing, quoted for a shell. `me`
 /// is the reader's actor ID; see [`message_block_for`].
 pub fn thread_list(
@@ -439,6 +606,136 @@ pub fn safe(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rfc3339_times_parse_to_epoch_milliseconds() {
+        assert_eq!(super::parse_rfc3339_ms("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(
+            super::parse_rfc3339_ms("1970-01-01T00:00:01.5Z"),
+            Some(1_500)
+        );
+        assert_eq!(
+            super::parse_rfc3339_ms("2026-11-27T23:44:24.123Z"),
+            Some(1_795_823_064_123)
+        );
+        assert_eq!(
+            super::parse_rfc3339_ms("2000-02-29T12:00:00.000Z"),
+            Some(951_825_600_000)
+        );
+        assert_eq!(super::parse_rfc3339_ms("yesterday"), None);
+    }
+
+    #[test]
+    fn who_lists_states_seats_and_last_seen() {
+        use openboard_api::{
+            PresenceList, PresenceListen, PresencePrincipal, PresenceSeat, PresenceState,
+            PresenceWindows,
+        };
+        let seat =
+            |handle: &str, profile: Option<&str>, state, seen: &str, listening| PresenceSeat {
+                actor_id: format!("act_{handle}"),
+                handle: handle.to_owned(),
+                profile: profile.map(str::to_owned),
+                state,
+                last_seen_at: seen.to_owned(),
+                listening,
+            };
+        let now = "2026-11-27T12:00:00.000Z";
+        let list = PresenceList {
+            now: now.to_owned(),
+            windows: PresenceWindows {
+                live_secs: 120,
+                recent_secs: 900,
+                listed_days: 30,
+            },
+            principals: vec![
+                PresencePrincipal {
+                    id: "p1".to_owned(),
+                    handle: "smith".to_owned(),
+                    kind: ActorKind::Agent,
+                    state: PresenceState::Live,
+                    disabled: None,
+                    last_seen_at: now.to_owned(),
+                    seats: vec![seat(
+                        "smith/ops",
+                        Some("ops"),
+                        PresenceState::Live,
+                        now,
+                        vec![PresenceListen {
+                            channel: Some("ops/deploy/smith".to_owned()),
+                            kind: "claim_wait".to_owned(),
+                        }],
+                    )],
+                },
+                PresencePrincipal {
+                    id: "p2".to_owned(),
+                    handle: "ada@example.com".to_owned(),
+                    kind: ActorKind::Person,
+                    state: PresenceState::Live,
+                    disabled: None,
+                    last_seen_at: now.to_owned(),
+                    seats: vec![seat(
+                        "ada@example.com",
+                        None,
+                        PresenceState::Live,
+                        now,
+                        vec![PresenceListen {
+                            channel: None,
+                            kind: "stream".to_owned(),
+                        }],
+                    )],
+                },
+                PresencePrincipal {
+                    id: "p3".to_owned(),
+                    handle: "codex".to_owned(),
+                    kind: ActorKind::Agent,
+                    state: PresenceState::Away,
+                    disabled: Some("revoked".to_owned()),
+                    last_seen_at: "2026-11-24T11:00:00.000Z".to_owned(),
+                    seats: vec![seat(
+                        "codex",
+                        None,
+                        PresenceState::Away,
+                        "2026-11-24T11:00:00.000Z",
+                        vec![],
+                    )],
+                },
+            ],
+        };
+        let out = super::presence(&list, "general", false);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 3, "{out}");
+        assert!(lines[0].starts_with("\u{25cf} smith "), "{out}");
+        assert!(
+            lines[0].contains("live") && lines[0].ends_with("ops"),
+            "{out}"
+        );
+        assert!(lines[1].ends_with("web"), "{out}");
+        assert!(lines[2].starts_with("\u{25cb} codex"), "{out}");
+        assert!(
+            lines[2].contains("last seen 3d ago  (access revoked)"),
+            "{out}"
+        );
+
+        let out = super::presence(&list, "general", true);
+        assert!(
+            out.contains("    \u{25cf} smith/ops  listening on ops/deploy/smith (claim_wait)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("    \u{25cb} codex  last seen 3d ago"),
+            "{out}"
+        );
+
+        let empty = PresenceList {
+            principals: vec![],
+            ..list
+        };
+        assert_eq!(
+            super::presence(&empty, "general", false),
+            "nobody has been seen on board general in the last 30 days"
+        );
+    }
+
     use super::*;
     use openboard_api::{Actor, ActorKind};
 

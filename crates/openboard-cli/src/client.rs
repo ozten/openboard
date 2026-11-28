@@ -28,7 +28,7 @@ use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER};
 use reqwest::{Method, RequestBuilder, Response, Url};
 use serde::de::DeserializeOwned;
 
-use crate::compat::{self, Requirement, Seen, ServerInfo, GRANTS, TASKS};
+use crate::compat::{self, Requirement, Seen, ServerInfo, GRANTS, PRESENCE, TASKS};
 use crate::error::{codes, Failure};
 use crate::logins::Secret;
 use crate::target::{bad_url, Target};
@@ -621,6 +621,17 @@ impl Client {
         ))
         .await
         .map_err(|failure| self.board_missing(failure))
+    }
+
+    /// `GET /v1/boards/{board}/presence`.
+    pub async fn presence(&self) -> Result<openboard_api::PresenceList, Failure> {
+        self.json(self.request(
+            Method::GET,
+            self.endpoint(&["presence"]),
+            Some(REQUEST_TIMEOUT),
+        ))
+        .await
+        .map_err(|failure| self.needs(PRESENCE, self.board_missing(failure)))
     }
 
     pub async fn threads(&self, query: &ThreadsQuery) -> Result<ThreadList, Failure> {

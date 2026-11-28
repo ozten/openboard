@@ -158,6 +158,10 @@ pub const REQUIREMENTS: &[Requirement] = &[
         what: "`openboard grant`, `grants`, `ungrant`, `explain` and `channels create`",
         min_api_level: 3,
     },
+    Requirement {
+        what: "`openboard who`",
+        min_api_level: 4,
+    },
 ];
 
 /// The row for the board's own build information.
@@ -166,6 +170,8 @@ pub const SERVER_BUILD_INFO: &Requirement = &REQUIREMENTS[0];
 pub const TASKS: &Requirement = &REQUIREMENTS[1];
 /// Grants, `explain` and channel creation: API level 3.
 pub const GRANTS: &Requirement = &REQUIREMENTS[2];
+/// Presence: API level 4.
+pub const PRESENCE: &Requirement = &REQUIREMENTS[3];
 
 /// Whether `server` is too old for `requirement`.
 pub fn too_old(server: &ServerInfo, requirement: &Requirement) -> bool {

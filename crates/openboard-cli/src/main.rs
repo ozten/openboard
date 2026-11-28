@@ -539,6 +539,12 @@ async fn dispatch(
             Command::Profiles(args) => grants::profiles(&ctx, args).await,
             Command::Ungrant(args) => grants::ungrant(&ctx, args).await,
             Command::Explain(args) => grants::explain(&ctx, args).await,
+            Command::Who(args) => {
+                let list = ctx.client.presence().await?;
+                ctx.print(&list, || {
+                    render::presence(&list, global.board(), args.seats)
+                })
+            }
             Command::Boards => {
                 let list = ctx.client.boards().await?;
                 ctx.print(&list, || render::boards(&list))
