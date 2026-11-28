@@ -3394,7 +3394,7 @@ async fn an_m1_data_directory_migrates_verifies_and_takes_the_new_features() {
 // ---------------------------------------------------------------------------
 
 /// The schema version this build writes.
-const CURRENT_SCHEMA: i64 = 5;
+const CURRENT_SCHEMA: i64 = 6;
 
 fn schema_of(path: &Path) -> i64 {
     rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)

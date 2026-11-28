@@ -33,6 +33,7 @@ use super::{
 use crate::authz::Action;
 use crate::chain::hex;
 use crate::names::{self, ChannelSel};
+use crate::presence::ListenKind;
 use crate::store::{
     event_cursor, parse_cursor, Act, AssigneeSpec, BatchEntry, BoardRef, Brief, ClaimOut,
     ClaimProof, CreatorSel, LabelFilter, Need, NewTask, PostTarget, TaskError, TaskQuery,
@@ -253,6 +254,7 @@ impl AppState {
         names::validate_channel(channel).map_err(invalid_channel)?;
         match self.find_board(board_name).await? {
             Some(board) => {
+                self.seen(caller, &board);
                 self.require(caller, Action::Post, &board.name, Some(channel))?;
                 self.require(caller, Action::CreateTask, &board.name, Some(channel))?;
                 match self.intake(board.id, channel).await? {
@@ -755,10 +757,18 @@ pub(super) async fn claim_ready(
     let lease = lease_ms(request.lease_secs)?;
     let wait = Duration::from_secs(request.wait.unwrap_or(0).min(MAX_WAIT_SECS));
     let deadline = Instant::now() + wait;
-    let _place = if wait.is_zero() {
-        None
+    let (_place, _listening) = if wait.is_zero() {
+        (None, None)
     } else {
-        state.waiter(&caller)?
+        (
+            state.waiter(&caller)?,
+            state.listening(
+                &caller,
+                &board,
+                Some(request.channel.clone()),
+                ListenKind::ClaimWait,
+            ),
+        )
     };
     let mut shutdown = state.shutdown.clone();
     let mut wake = state.hub.subscribe(board.id);

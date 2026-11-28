@@ -31,6 +31,7 @@ use crate::tls::{CERT_FILE_NAME, KEY_FILE_NAME};
 use crate::Mode;
 
 pub mod grants;
+mod presence;
 mod tasks;
 
 pub(crate) use grants::{Access, Snapshot};
@@ -44,7 +45,7 @@ pub const DB_FILE_NAME: &str = "openboard.db";
 /// File name of the lock a running server holds on the data directory.
 pub const LOCK_FILE_NAME: &str = "openboard.lock";
 
-pub(crate) const SCHEMA_VERSION: i64 = 5;
+pub(crate) const SCHEMA_VERSION: i64 = 6;
 /// The oldest schema that has the identity tables the operator functions
 /// use. A database between this and [`SCHEMA_VERSION`] can be read and
 /// written by them before a newer server has migrated it.
@@ -566,6 +567,7 @@ impl Store {
                 // No boards yet, and the access mode is decided by the
                 // first start, like the mode.
                 tx.execute_batch(grants::MIGRATE_V4_TO_V5)?;
+                tx.execute_batch(presence::MIGRATE_V5_TO_V6)?;
             }
             1 => {
                 // Milestone M0 knew only local mode.
@@ -574,20 +576,28 @@ impl Store {
                 tx.execute_batch(MIGRATE_V2_TO_V3)?;
                 tx.execute_batch(MIGRATE_V3_TO_V4)?;
                 grants::migrate_v4_to_v5(&tx)?;
+                tx.execute_batch(presence::MIGRATE_V5_TO_V6)?;
             }
             // Milestone M1.
             2 => {
                 tx.execute_batch(MIGRATE_V2_TO_V3)?;
                 tx.execute_batch(MIGRATE_V3_TO_V4)?;
                 grants::migrate_v4_to_v5(&tx)?;
+                tx.execute_batch(presence::MIGRATE_V5_TO_V6)?;
             }
             // Milestones M2 and M2.5.
             3 => {
                 tx.execute_batch(MIGRATE_V3_TO_V4)?;
                 grants::migrate_v4_to_v5(&tx)?;
+                tx.execute_batch(presence::MIGRATE_V5_TO_V6)?;
             }
             // Milestone M3: today's access is kept.
-            4 => grants::migrate_v4_to_v5(&tx)?,
+            4 => {
+                grants::migrate_v4_to_v5(&tx)?;
+                tx.execute_batch(presence::MIGRATE_V5_TO_V6)?;
+            }
+            // Milestones M4 and M5 (v0.4.0).
+            5 => tx.execute_batch(presence::MIGRATE_V5_TO_V6)?,
             SCHEMA_VERSION => {}
             other => return Err(StoreError::Other(unsupported_schema(&tx, other))),
         }

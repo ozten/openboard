@@ -46,8 +46,18 @@ pub struct Limits {
     /// the revocation while its stream was catching up on a backlog, and
     /// the few frames that had already been handed to the connection.
     pub credential_recheck: Duration,
-    /// A credential's last-used time is rewritten at most this often.
+    /// A credential's last-used time is rewritten at most this often, and
+    /// so is a seat's last-seen time on a board.
     pub last_used_interval: Duration,
+    /// Presence: a seat with no request open is live for this long after
+    /// its last request.
+    pub presence_live: Duration,
+    /// Presence: after that, it is recent for this long after its last
+    /// request, and away from then on.
+    pub presence_recent: Duration,
+    /// Presence: a seat not seen for this long leaves the roster, and its
+    /// last-seen time is deleted.
+    pub presence_listed: Duration,
     /// Connections open at once, over all clients, from the moment they
     /// are accepted. Further connections are closed at once.
     /// The default stays under the common 256 open-file limit, which the
@@ -85,7 +95,8 @@ impl Default for Limits {
     /// 1200 requests a minute per credential, 10 failed enrolments and 30
     /// failed authentications a minute per client address, 32 open
     /// long-polls and streams per credential, re-checked every 5 seconds,
-    /// last-used times a minute apart; 200 connections, 128 per client
+    /// last-used times a minute apart; presence live for 2 minutes after a
+    /// request, recent for 15 and listed for 30 days; 200 connections, 128 per client
     /// address of which 48 in their handshake, 3 seconds for a handshake
     /// and 10 for a request head; 240 logged failures a minute, 20 per
     /// client address.
@@ -97,6 +108,9 @@ impl Default for Limits {
             max_waiters: 32,
             credential_recheck: Duration::from_secs(5),
             last_used_interval: Duration::from_secs(60),
+            presence_live: Duration::from_secs(120),
+            presence_recent: Duration::from_secs(15 * 60),
+            presence_listed: Duration::from_secs(30 * 24 * 60 * 60),
             max_connections: 200,
             max_connections_per_address: 128,
             max_handshakes_per_address: 48,

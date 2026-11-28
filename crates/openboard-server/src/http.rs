@@ -60,6 +60,7 @@ use crate::limits::{address_key, Hit, Limits, LogRetention, RateTable, WaiterGua
 use crate::markdown;
 use crate::names::{self, ChannelSel};
 use crate::pages;
+use crate::presence::{Listen, ListenGuard, ListenKind, Presence, SeatId};
 use crate::serve::ClientAddr;
 use crate::store::{
     event_cursor, parse_cursor, thread_cursor, BoardRef, Changed, EventFilter, LabelFilter,
@@ -70,6 +71,7 @@ use crate::Mode;
 
 mod access;
 mod grants_routes;
+mod presence_routes;
 mod tasks;
 mod tokens_routes;
 
@@ -142,6 +144,8 @@ pub(crate) struct AppState {
     failure_log_by_address: RateTable<IpAddr>,
     /// Open long-polls and streams per credential.
     waiters: Arc<Waiters>,
+    /// Who is around on each board.
+    presence: Arc<Presence>,
     /// Turns true when the server starts shutting down.
     shutdown: watch::Receiver<bool>,
     /// Dropped with the state, after the store above it has closed. The
@@ -197,6 +201,15 @@ impl Maintenance {
                 if pruned.is_err() {
                     eprintln!("openboard-server: could not trim the security log");
                 }
+                let listed = duration_ms(state.limits.presence_listed);
+                let before = crate::time::now_ms().saturating_sub(listed);
+                if state
+                    .db(move |state| state.store.prune_presence(before))
+                    .await
+                    .is_err()
+                {
+                    eprintln!("openboard-server: could not remove old last-seen times");
+                }
             } else {
                 // Leases that ran out return their tasks to the queue, and
                 // whoever waits on the board hears of it.
@@ -235,6 +248,7 @@ pub(crate) fn router(parts: Parts) -> (Router, Maintenance) {
         failure_log: RateTable::new(),
         failure_log_by_address: RateTable::new(),
         waiters: Arc::new(Waiters::default()),
+        presence: Arc::new(Presence::default()),
         shutdown: parts.shutdown,
         _in_use: parts.in_use,
     });
@@ -300,6 +314,7 @@ pub(crate) fn router(parts: Parts) -> (Router, Maintenance) {
         .route("/v1/boards/{board}/threads/{thread_id}", get(get_thread))
         .route("/v1/boards/{board}/events", get(get_events))
         .route("/v1/boards/{board}/events/stream", get(stream_events))
+        .route("/v1/boards/{board}/presence", get(presence_routes::list))
         .route(
             "/v1/boards/{board}/tasks",
             post(tasks::create_task).get(tasks::list_tasks),
@@ -1408,9 +1423,68 @@ impl AppState {
 
     async fn board_named(self: &Arc<Self>, caller: &Caller, name: &str) -> ApiResult<BoardRef> {
         match self.find_board(name).await? {
-            Some(board) => Ok(board),
+            Some(board) => {
+                self.seen(caller, &board);
+                Ok(board)
+            }
             None => Err(self.missing_board(caller, name)),
         }
+    }
+
+    /// The caller's seat on a board, for presence. Only a caller who may
+    /// read the board has one: the roster of a board is shown to its
+    /// readers, and lists only its readers.
+    fn seat(&self, caller: &Caller, board: &BoardRef) -> Option<SeatId> {
+        if caller.principal.is_anonymous() || !self.allows(caller, Action::Read, &board.name, None)
+        {
+            return None;
+        }
+        Some(SeatId {
+            board_id: board.id,
+            actor_id: caller.actor().id,
+            principal_id: caller.principal.id.clone(),
+            profile: caller.profile.clone(),
+        })
+    }
+
+    /// Records a request by the caller on a board. The last-seen time is
+    /// written in the background, at most once a minute per seat; presence
+    /// never holds up or fails a request.
+    fn seen(self: &Arc<Self>, caller: &Caller, board: &BoardRef) {
+        let Some(seat) = self.seat(caller, board) else {
+            return;
+        };
+        let now = crate::time::now_ms();
+        let every = duration_ms(self.limits.last_used_interval);
+        if !self.presence.touch(&seat, now, every) {
+            return;
+        }
+        let (state, by, board_id) = (Arc::clone(self), caller.writer(), board.id);
+        tokio::spawn(async move {
+            if state
+                .db(move |state| state.store.record_presence(board_id, &by, now))
+                .await
+                .is_err()
+            {
+                eprintln!("openboard-server: could not record a last-seen time");
+            }
+        });
+    }
+
+    /// Holds the caller's open request in the presence registry until the
+    /// guard is dropped.
+    fn listening(
+        self: &Arc<Self>,
+        caller: &Caller,
+        board: &BoardRef,
+        channel: Option<String>,
+        kind: ListenKind,
+    ) -> Option<ListenGuard> {
+        let seat = self.seat(caller, board)?;
+        Some(
+            self.presence
+                .listen(&seat, Listen { channel, kind }, crate::time::now_ms()),
+        )
     }
 
     /// The error for a request addressed to a board that does not exist. A
@@ -1982,6 +2056,9 @@ async fn post_message(
     // The request is well-formed. Only now is the board looked at, and it is
     // created, with the message, only if everything below allows the post.
     let found = state.find_board(&board_name).await?;
+    if let Some(board) = &found {
+        state.seen(&caller, board);
+    }
     let (target, channel, thread_id) = match (&request.channel, &request.thread_id) {
         (Some(channel), None) => {
             names::validate_channel(channel).map_err(invalid_channel)?;
@@ -2500,6 +2577,11 @@ async fn get_thread(
     Ok(Json(thread))
 }
 
+/// A duration in whole milliseconds, saturating.
+fn duration_ms(duration: Duration) -> i64 {
+    i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+}
+
 fn page_size(requested: Option<u32>, default: u32, max: u32) -> ApiResult<u32> {
     match requested {
         None => Ok(default),
@@ -2786,10 +2868,18 @@ async fn get_events(
     )
     .await?;
     // Only a request that may be held open counts as a long-poll.
-    let _place = if wait.is_zero() {
-        None
+    let (_place, _listening) = if wait.is_zero() {
+        (None, None)
     } else {
-        scan.state.waiter(&scan.caller)?
+        (
+            scan.state.waiter(&scan.caller)?,
+            scan.state.listening(
+                &scan.caller,
+                &scan.board,
+                query.channel.clone(),
+                ListenKind::Wait,
+            ),
+        )
     };
     let has_credential = scan.caller.credential_id.is_some();
     let mut recheck = scan.recheck_timer();
@@ -2868,6 +2958,12 @@ async fn stream_events(
     let mut shutdown = state.shutdown.clone();
     let mut scan = EventScan::open(state, &identity, &headers, board, &query, resume).await?;
     let place = scan.state.waiter(&scan.caller)?;
+    let listening = scan.state.listening(
+        &scan.caller,
+        &scan.board,
+        query.channel.clone(),
+        ListenKind::Stream,
+    );
     let has_credential = scan.caller.credential_id.is_some();
 
     let (tx, frames) = mpsc::channel::<SseEvent>(STREAM_BUFFER);
@@ -2876,6 +2972,7 @@ async fn stream_events(
     tokio::spawn(async move {
         // Held until the stream ends.
         let _place = place;
+        let _listening = listening;
         let mut recheck = scan.recheck_timer();
         // Ends the stream of a credential that is no longer usable, and
         // takes back what was not written yet.

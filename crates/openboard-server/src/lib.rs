@@ -127,6 +127,7 @@ mod markdown;
 mod names;
 pub mod operator;
 mod pages;
+mod presence;
 mod serve;
 mod store;
 mod time;

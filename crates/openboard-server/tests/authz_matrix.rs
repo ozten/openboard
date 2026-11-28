@@ -1173,6 +1173,15 @@ async fn check(seeded: &mut Seeded, scenario: &Scenario, index: usize) -> Outcom
         run.want("channels", &channels, FORBIDDEN);
     }
 
+    // The roster: for the board's readers only, and it names no channel the
+    // subject cannot read (the leak check below covers every response).
+    let presence = run.get("presence", "/v1/boards/general/presence").await;
+    if board_readable {
+        run.want("presence", &presence, Expect::Ok);
+    } else {
+        run.want("presence", &presence, FORBIDDEN);
+    }
+
     // A board that does not exist answers as one the subject cannot read.
     let ghost_board = run
         .get("ghost board", "/v1/boards/ghostboard/channels")

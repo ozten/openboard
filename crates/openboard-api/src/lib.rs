@@ -151,7 +151,10 @@ pub const CURSOR_START: &str = "start";
 ///
 /// Level 3 is milestone M4: grants, `explain` and channel creation (see
 /// [`grants`]), and access decided per channel on network boards.
-pub const API_LEVEL: u32 = 3;
+///
+/// Level 4 adds presence: `GET /v1/boards/{board}/presence` and
+/// [`PresenceList`].
+pub const API_LEVEL: u32 = 4;
 /// Response header, on every response: the server's version, as
 /// [`build::VERSION`].
 pub const VERSION_HEADER: &str = "x-openboard-version";
@@ -490,6 +493,87 @@ pub struct BoardInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BoardList {
     pub boards: Vec<BoardInfo>,
+}
+
+/// A seat's or a principal's presence on a board.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PresenceState {
+    /// Has a long-poll or a stream open on the board now, or made a request
+    /// within [`PresenceWindows::live_secs`]. Live means listening; it does
+    /// not mean working, or that a reply will come.
+    Live,
+    /// Made a request within [`PresenceWindows::recent_secs`].
+    Recent,
+    /// Seen within [`PresenceWindows::listed_days`].
+    Away,
+}
+
+/// The windows the server decides presence by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PresenceWindows {
+    pub live_secs: u64,
+    pub recent_secs: u64,
+    pub listed_days: u64,
+}
+
+/// One open request of a seat.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PresenceListen {
+    /// The channel or channel selector (`proj/x/`) waited on; absent for a
+    /// request on the whole board, such as the web UI's stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    /// `wait` (a held events request), `stream` (an event stream) or
+    /// `claim_wait` (a task claim waiting for a ready task). Clients must
+    /// accept kinds they do not know.
+    pub kind: String,
+}
+
+/// One seat: a principal under one profile, or under none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PresenceSeat {
+    pub actor_id: String,
+    /// The principal's handle, or `principal/profile`.
+    pub handle: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    pub state: PresenceState,
+    /// RFC 3339 timestamp: now, for a seat with a request open.
+    pub last_seen_at: String,
+    /// Open requests in channels the caller may read. A request in a
+    /// channel the caller may not read is left out, though it still counts
+    /// toward [`PresenceSeat::state`].
+    #[serde(default)]
+    pub listening: Vec<PresenceListen>,
+}
+
+/// One principal and its seats.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PresencePrincipal {
+    pub id: String,
+    pub handle: String,
+    pub kind: ActorKind,
+    /// The best state among its seats.
+    pub state: PresenceState,
+    /// `revoked` or `expired` for an agent with no usable token left.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled: Option<String>,
+    /// RFC 3339 timestamp: the newest among its seats.
+    pub last_seen_at: String,
+    /// Ordered best state first, then by handle.
+    pub seats: Vec<PresenceSeat>,
+}
+
+/// Response of `GET /v1/boards/{board}/presence`: who has been seen on the
+/// board within [`PresenceWindows::listed_days`], best state first, then by
+/// handle. The caller is included.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PresenceList {
+    /// The server's clock, RFC 3339, to measure `last_seen_at` against.
+    pub now: String,
+    pub windows: PresenceWindows,
+    pub principals: Vec<PresencePrincipal>,
 }
 
 /// Body of `POST /v1/boards/{board}/messages`.
