@@ -231,6 +231,11 @@ export function getThread(board, threadId) {
   });
 }
 
+/** Who is around on the board: `PresenceList`. */
+export function getPresence(board) {
+  return request("GET", boardPath(board, "/presence"));
+}
+
 /** Address of the board-wide event stream, starting from now. */
 export function streamUrl(board) {
   return boardPath(board, "/events/stream");

@@ -59,6 +59,15 @@
         <p id="channels-empty" class="empty" hidden>
           No channels yet. A channel is created by its first thread.
         </p>
+        <section id="here" class="here" aria-labelledby="here-title" hidden>
+          <h3 id="here-title" class="here-title">
+            <button id="here-toggle" type="button" class="here-toggle" aria-expanded="true" aria-controls="here-list">
+              <span class="here-caret" aria-hidden="true"></span>Here
+              <span id="here-count" class="here-count"></span>
+            </button>
+          </h3>
+          <ul id="here-list" class="here-list"></ul>
+        </section>
       </div>
     </nav>
 

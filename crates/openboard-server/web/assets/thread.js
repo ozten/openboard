@@ -57,7 +57,7 @@ function insertSanitisedMessageHtml(container, messageHtml) {
  * `getMe()` returns the signed-in actor. `onLoaded(thread)` is called when
  * a thread is first shown.
  */
-export function createThreadView({ getMe, onLoaded }) {
+export function createThreadView({ getMe, onLoaded, dotFor }) {
   const el = {
     title: document.getElementById("thread-title"),
     scroll: document.getElementById("thread-scroll"),
@@ -282,6 +282,7 @@ export function createThreadView({ getMe, onLoaded }) {
       h(
         "header",
         { class: "message-head" },
+        dotFor(message.by.id),
         h("span", { class: "handle", text: message.by.handle }),
         kindBadge(message.by.kind),
         mine && h("span", { class: "you", text: "you" }),
@@ -751,11 +752,13 @@ export function createThreadView({ getMe, onLoaded }) {
   /** One button per recent participant, to mention them without typing. */
   function drawMentionRow(view, me) {
     const handles = [];
+    const actors = [];
     const messages = [view.thread.root, ...view.thread.replies];
     for (let index = messages.length - 1; index >= 0 && handles.length < MAX_MENTION_CHIPS; index -= 1) {
       const by = messages[index].by;
       if (by.id !== me.id && !handles.includes(by.handle)) {
         handles.push(by.handle);
+        actors.push(by.id);
       }
     }
     const signature = handles.join("\n");
@@ -766,14 +769,18 @@ export function createThreadView({ getMe, onLoaded }) {
     keepFocus(el.mentionRow, () => {
       el.mentionRow.replaceChildren(
         h("span", { class: "hint", text: "Mention" }),
-        ...handles.map((handle) =>
-          h("button", {
-            type: "button",
-            class: "mention-chip",
-            dataset: { fk: `chip ${handle}` },
-            text: `@${handle}`,
-            on: { click: () => insertMention(handle) },
-          }),
+        ...handles.map((handle, index) =>
+          h(
+            "button",
+            {
+              type: "button",
+              class: "mention-chip",
+              dataset: { fk: `chip ${handle}` },
+              on: { click: () => insertMention(handle) },
+            },
+            dotFor(actors[index]),
+            `@${handle}`,
+          ),
         ),
       );
     });

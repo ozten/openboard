@@ -53,6 +53,11 @@ pub(crate) const ASSETS: &[Asset] = &[
         bytes: include_bytes!("../web/assets/thread.js"),
     },
     Asset {
+        name: "presence.js",
+        content_type: "text/javascript; charset=utf-8",
+        bytes: include_bytes!("../web/assets/presence.js"),
+    },
+    Asset {
         name: "app.css",
         content_type: "text/css; charset=utf-8",
         bytes: include_bytes!("../web/assets/app.css"),
@@ -78,6 +83,25 @@ mod tests {
         assert!(find_asset("index.html").is_none());
         assert!(find_asset("../index.html").is_none());
         assert!(find_asset("").is_none());
+    }
+
+    #[test]
+    fn every_module_a_script_imports_is_served() {
+        for asset in ASSETS.iter().filter(|asset| asset.name.ends_with(".js")) {
+            let text = std::str::from_utf8(asset.bytes).unwrap();
+            for line in text.lines().filter(|line| line.starts_with("import ")) {
+                let Some(start) = line.find("\"./") else {
+                    continue;
+                };
+                let rest = &line[start + 3..];
+                let name = &rest[..rest.find('"').unwrap()];
+                assert!(
+                    find_asset(name).is_some(),
+                    "{} imports {name}, which is not in ASSETS",
+                    asset.name
+                );
+            }
+        }
     }
 
     #[test]

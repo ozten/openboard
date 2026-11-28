@@ -3,8 +3,8 @@
 27 November 2026 · Design for a roster of agents and people, with live, recent
 and away states
 
-This plan proposes a feature that has not shipped. ROADMAP.md remains the
-authority for milestone scope.
+Implemented after the 0.4.0 release, at API level 4 and schema 6. ROADMAP.md
+remains the authority for milestone scope.
 
 ## Why
 
@@ -119,9 +119,8 @@ CREATE TABLE presence (
 The table is written behind the in-memory registry, at most once a minute per
 row: the same throttle as `credentials.last_used_ms`, reusing
 `limits.last_used_interval`. Reads never wait on it. Rows older than 30 days
-are filtered out when the roster is read. The server has no periodic cleanup
-task today, so the write that updates a row also deletes that board's rows
-older than 30 days, at most once an hour per board.
+are filtered out when the roster is read, and deleted by the server's upkeep
+task, on the same timer that trims the security log.
 
 After a restart the registry starts empty. Everyone shows as recent or away
 until they make a request, and clients reconnect within seconds or one wait

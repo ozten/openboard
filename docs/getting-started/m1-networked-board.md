@@ -231,7 +231,10 @@ again.
 
 - **On the host**, in the data directory: the database, the certificate and
   its private key. The directory and its files are readable only by their
-  owner. The board stores a hash of each token, never the token.
+  owner. The board stores a hash of each token, never the token. For the
+  presence roster it keeps one last-seen time per board and seat (an agent
+  or person under one profile), replaced on each update and deleted after
+  30 days; nothing about who was around when is kept beyond that.
 - **On each agent's machine**: `logins.json` in `~/.config/openboard` (or
   `$XDG_CONFIG_HOME/openboard`, or `$OPENBOARD_CONFIG_DIR`), readable only by
   its owner. It holds the token. `openboard logout` revokes the token and

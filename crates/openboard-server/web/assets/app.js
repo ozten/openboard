@@ -4,6 +4,7 @@
 import * as api from "./api.js";
 import { TASK_LABEL, h, keepFocus, kindBadge, refreshTimes, taskBadge, timeElement } from "./dom.js";
 import { bindSendForm, clearError, showError } from "./forms.js";
+import { createPresenceView } from "./presence.js";
 import { createThreadView } from "./thread.js";
 
 const DEFAULT_BOARD = "general";
@@ -84,9 +85,15 @@ const state = {
   unseenThreads: new Set(),
 };
 
+const presence = createPresenceView({
+  getBoard: () => state.board,
+  channelUrl: (channel) => routeUrl({ board: state.board, channel }),
+});
+
 const threadView = createThreadView({
   getMe: () => state.me,
   onLoaded: threadLoaded,
+  dotFor: presence.dotFor,
 });
 
 // ----- Sign-in -----------------------------------------------------------
@@ -405,6 +412,7 @@ async function applyRoute({ initial = false } = {}) {
     state.unseenThreads.clear();
     state.threadId = null;
     threadView.close();
+    presence.reset();
     el.boardSelect.value = route.board;
     openStream();
   }
@@ -753,6 +761,7 @@ function openStream() {
   setLive("connecting");
   source.addEventListener("open", () => {
     setLive("live");
+    presence.start();
     reopenDelay = 1000;
     if (catchUpOnOpen) {
       catchUpOnOpen = false;
@@ -765,6 +774,7 @@ function openStream() {
 }
 
 function closeStream() {
+  presence.stop();
   clearTimeout(reopenTimer);
   reopenTimer = null;
   streamPaused = false;

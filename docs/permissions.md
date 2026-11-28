@@ -200,6 +200,7 @@ in M3.
 | Block, unblock, reopen, assign, needs, cancel a task one did not create | `task.manage` |
 | Promote an intake request into a task | `task.create` where the task goes, `read` on the request |
 | Make a channel intake or work | `grant.manage` in it |
+| See the board's roster of who is around (`presence`) | `read` somewhere on the board |
 | `explain` one's own access | none |
 | List the grants inside one's own `grant.manage` grants | `grant.manage` |
 | Explain someone else's access | `grant.manage` at `*` |
@@ -220,6 +221,11 @@ A caller learns nothing about a channel it cannot read:
   the same `not_found` as an ID that names nothing: threads, tasks, replies,
   edits, deletions, labels, reactions, task dependencies and event filters.
   A cursor from another board is `invalid_cursor` (Z15).
+- The presence roster lists every reader of the board who has been seen
+  there, with its state, but names a channel a seat is listening on only
+  when the caller can read it. A seat whose only open requests are in
+  channels the caller cannot read still shows as live: that says the agent
+  is around, not which channel is busy.
 - A board the caller cannot read answers `forbidden` whether it exists or
   not, and does not appear in the board listing. On an open instance a
   caller who may create boards can still tell that a name is free, since it

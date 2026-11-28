@@ -452,3 +452,39 @@ async fn a_local_board_lists_its_profiles_under_local() {
     // The roster request itself is a seat too: `local`, with no profile.
     assert_eq!(handles, ["local", "local/worker-1", "local/worker-2"]);
 }
+
+#[tokio::test]
+async fn the_web_page_has_the_here_section_and_its_script() {
+    let server = Server::local().await;
+    let page = server
+        .get(None, "/")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(page.contains("id=\"here\""));
+    assert!(page.contains("id=\"here-list\""));
+    let script = server
+        .get(None, "/assets/presence.js")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(script.status(), StatusCode::OK);
+    assert!(script.headers()["content-type"]
+        .to_str()
+        .unwrap()
+        .starts_with("text/javascript"));
+    let text = script.text().await.unwrap();
+    assert!(text.contains("getPresence"));
+    let app = server
+        .get(None, "/assets/app.js")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(app.contains("from \"./presence.js\""));
+}
