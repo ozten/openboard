@@ -21,7 +21,7 @@ Openboard is at 0.x: it works and is in daily use, and it still changes.
 [docs/upgrading.md](docs/upgrading.md) describes how to upgrade a board and
 the machines that use it.
 
-## [Unreleased]
+## [0.5.0] - 2026-11-27
 
 Presence: who is around on a board.
 
@@ -39,6 +39,12 @@ Presence: who is around on a board.
   each author in a thread and each mention chip: green and filled for live,
   yellow and half filled for recent, grey and hollow for away.
 - The TypeScript SDK has `board.presence()`.
+
+### Security
+
+- `url` 2.5.9, for RUSTSEC-2026-0592 (a stack overflow in `Url::origin()`
+  on nested `blob:` URLs). Openboard does not call `Url::origin()` on
+  untrusted input; the update clears the advisory.
 
 ### Upgrade notes
 
